@@ -5,6 +5,7 @@ const { appConfig } = require('./config.js');
 
 const privateVideosRoot = path.join(process.cwd(), 'private_uploads', 'videos');
 const privateHlsRoot = path.join(process.cwd(), 'private_uploads', 'hls');
+const HLS_ACCESS_COOKIE_NAME = 'edumaster_hls';
 
 const ensurePrivateVideoRoot = () => {
   if (!fs.existsSync(privateVideosRoot)) {
@@ -22,6 +23,10 @@ const getSigningSecret = () => appConfig.privateVideoTokenSecret || appConfig.jw
 const signEncodedPayload = (encodedPayload) => crypto
   .createHmac('sha256', getSigningSecret())
   .update(encodedPayload)
+  .digest('base64url');
+const signCompactAssetPayload = (payload) => crypto
+  .createHmac('sha256', getSigningSecret())
+  .update(String(payload || ''))
   .digest('base64url');
 
 const createStorageFileName = (lessonId, originalName = '') => {
@@ -80,8 +85,12 @@ const ensureStorageDirectory = (filePath) => {
   }
 };
 
-const issuePlaybackToken = (payload) => {
-  const expiresAt = Date.now() + (appConfig.privateVideoTokenTtlSeconds * 1000);
+const issuePlaybackToken = (payload, options = {}) => {
+  const ttlSeconds = Number(options.ttlSeconds || appConfig.privateVideoTokenTtlSeconds);
+  const requestedExpiresAt = Number(options.expiresAtMs || 0);
+  const expiresAt = Number.isFinite(requestedExpiresAt) && requestedExpiresAt > Date.now()
+    ? requestedExpiresAt
+    : Date.now() + (ttlSeconds * 1000);
   const tokenPayload = {
     ...payload,
     exp: expiresAt,
@@ -92,6 +101,127 @@ const issuePlaybackToken = (payload) => {
   return {
     token: `${encodedPayload}.${signature}`,
     expiresAt: new Date(expiresAt).toISOString(),
+  };
+};
+
+const buildCompactAssetSignaturePayload = ({
+  storageProvider,
+  storagePath,
+  cacheScope,
+  exp,
+}) => [
+  'v1',
+  String(storageProvider || ''),
+  String(storagePath || ''),
+  String(cacheScope || ''),
+  String(exp || ''),
+].join('|');
+
+const issueCompactAssetSignature = (payload, options = {}) => {
+  const ttlSeconds = Number(options.ttlSeconds || appConfig.privateVideoTokenTtlSeconds);
+  const requestedExpiresAt = Number(options.expiresAtMs || 0);
+  const expiresAt = Number.isFinite(requestedExpiresAt) && requestedExpiresAt > Date.now()
+    ? requestedExpiresAt
+    : Date.now() + (ttlSeconds * 1000);
+  const signaturePayload = buildCompactAssetSignaturePayload({
+    ...payload,
+    exp: expiresAt,
+  });
+
+  return {
+    exp: expiresAt,
+    sig: signCompactAssetPayload(signaturePayload),
+    expiresAt: new Date(expiresAt).toISOString(),
+  };
+};
+
+const buildManifestBundleSignaturePayload = ({
+  storageProvider,
+  bundlePath,
+  version,
+  exp,
+}) => [
+  'v2-manifest-bundle',
+  String(storageProvider || ''),
+  String(bundlePath || ''),
+  String(version || ''),
+  String(exp || ''),
+].join('|');
+
+const issueManifestBundleSignature = (payload, options = {}) => {
+  const ttlSeconds = Number(options.ttlSeconds || appConfig.privateVideoHlsSegmentTokenTtlSeconds || appConfig.privateVideoTokenTtlSeconds);
+  const requestedExpiresAt = Number(options.expiresAtMs || 0);
+  const expiresAt = Number.isFinite(requestedExpiresAt) && requestedExpiresAt > Date.now()
+    ? requestedExpiresAt
+    : Date.now() + (ttlSeconds * 1000);
+  const signaturePayload = buildManifestBundleSignaturePayload({
+    ...payload,
+    exp: expiresAt,
+  });
+
+  return {
+    exp: expiresAt,
+    sig: signCompactAssetPayload(signaturePayload),
+    expiresAt: new Date(expiresAt).toISOString(),
+  };
+};
+
+const encodeCompactAssetPath = (assetPath) => String(assetPath || '')
+  .split('/')
+  .filter(Boolean)
+  .map((segment) => encodeURIComponent(segment))
+  .join('/');
+
+const decodeCompactAssetPath = (assetPath) => String(assetPath || '')
+  .split('/')
+  .filter(Boolean)
+  .map((segment) => decodeURIComponent(segment))
+  .join('/');
+
+const getSharedCompactAssetExpiresAt = (ttlSeconds = appConfig.privateVideoHlsSegmentTokenTtlSeconds) => {
+  const ttlMs = Math.max(Number(ttlSeconds || 3600), 300) * 1000;
+  return Math.ceil((Date.now() + 1000) / ttlMs) * ttlMs;
+};
+
+const buildCompactAssetUrl = (payload, options = {}) => {
+  const routeBase = String(options.routeBase || '/backend/api/courses/h').replace(/\/+$/, '');
+  const issued = issueCompactAssetSignature(payload, {
+    ttlSeconds: options.ttlSeconds,
+    expiresAtMs: options.expiresAtMs || getSharedCompactAssetExpiresAt(options.ttlSeconds),
+  });
+  const params = new URLSearchParams({
+    e: String(issued.exp),
+    s: issued.sig,
+  });
+  if (payload.storageProvider) {
+    params.set('p', String(payload.storageProvider));
+  }
+
+  return {
+    url: `${routeBase}/${encodeCompactAssetPath(payload.storagePath)}?${params.toString()}`,
+    expiresAt: issued.expiresAt,
+    exp: issued.exp,
+    sig: issued.sig,
+  };
+};
+
+const buildManifestBundleUrl = (payload, options = {}) => {
+  const routeBase = String(options.routeBase || '/backend/api/course-manifests/b').replace(/\/+$/, '');
+  const assetPath = String(options.assetPath || payload.assetPath || 'master.m3u8');
+  const issued = issueManifestBundleSignature(payload, {
+    ttlSeconds: options.ttlSeconds,
+    expiresAtMs: options.expiresAtMs || getSharedCompactAssetExpiresAt(options.ttlSeconds),
+  });
+  const encodedBundlePath = encodeCompactAssetPath(payload.bundlePath);
+  const encodedAssetPath = encodeCompactAssetPath(assetPath);
+  const encodedVersion = encodeURIComponent(String(payload.version || 'v1'));
+  const encodedProvider = encodeURIComponent(String(payload.storageProvider || 'local'));
+
+  return {
+    url: `${routeBase}/${encodedBundlePath}/_p/${encodedProvider}/_v/${encodedVersion}/_e/${issued.exp}/_s/${issued.sig}/${encodedAssetPath}`,
+    expiresAt: issued.expiresAt,
+    exp: issued.exp,
+    sig: issued.sig,
   };
 };
 
@@ -127,6 +257,48 @@ const verifyPlaybackToken = (token) => {
   }
 };
 
+const verifyCompactAssetSignature = (payload, exp, sig) => {
+  const expiresAt = Number(exp || 0);
+  if (!Number.isFinite(expiresAt) || expiresAt < Date.now() || !sig) {
+    return false;
+  }
+
+  const expectedSignature = signCompactAssetPayload(buildCompactAssetSignaturePayload({
+    ...payload,
+    exp: expiresAt,
+  }));
+
+  if (String(sig).length !== expectedSignature.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(
+    Buffer.from(String(sig)),
+    Buffer.from(expectedSignature),
+  );
+};
+
+const verifyManifestBundleSignature = (payload, exp, sig) => {
+  const expiresAt = Number(exp || 0);
+  if (!Number.isFinite(expiresAt) || expiresAt < Date.now() || !sig) {
+    return false;
+  }
+
+  const expectedSignature = signCompactAssetPayload(buildManifestBundleSignaturePayload({
+    ...payload,
+    exp: expiresAt,
+  }));
+
+  if (String(sig).length !== expectedSignature.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(
+    Buffer.from(String(sig)),
+    Buffer.from(expectedSignature),
+  );
+};
+
 const resolvePrivateVideoPath = (storagePath) => {
   if (!storagePath) {
     return null;
@@ -146,7 +318,14 @@ const resolvePrivateVideoPath = (storagePath) => {
   return resolved;
 };
 
+const getProtectedAssetStorageRoot = (assetPath) => String(assetPath || '')
+  .split('/')
+  .filter(Boolean)
+  .slice(0, 3)
+  .join('/');
+
 module.exports = {
+  HLS_ACCESS_COOKIE_NAME,
   privateVideosRoot,
   privateHlsRoot,
   ensurePrivateVideoRoot,
@@ -155,7 +334,16 @@ module.exports = {
   buildPrivateHlsAssetKey,
   ensureStorageDirectory,
   issuePlaybackToken,
+  issueCompactAssetSignature,
+  issueManifestBundleSignature,
+  buildCompactAssetUrl,
+  buildManifestBundleUrl,
   verifyPlaybackToken,
+  verifyCompactAssetSignature,
+  verifyManifestBundleSignature,
+  encodeCompactAssetPath,
+  decodeCompactAssetPath,
+  getProtectedAssetStorageRoot,
   resolvePrivateVideoPath,
   resolvePrivateHlsPath,
 };

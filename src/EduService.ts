@@ -1,12 +1,12 @@
 import {
   AiResponse,
-  AuthOtpChallenge,
   AuthResponse,
   AuthUser,
   CourseCard,
   CourseLesson,
   DailyQuizResult,
   GeneratedAssessmentDraft,
+  LessonDoubtThread,
   LiveClass,
   LiveClassAccess,
   LiveClassChatMessage,
@@ -18,8 +18,6 @@ import {
   PlatformOverview,
   ProtectedLessonPlayback,
   RegisterPayload,
-  RegisterOtpResponse,
-  SubscriptionPlan,
   TestAttemptResult,
 } from './types';
 
@@ -41,11 +39,17 @@ const runtimeHttpOrigin = (() => {
 const APP_ORIGIN = configuredAppOrigin || runtimeHttpOrigin;
 const API_BASE = configuredApiBase || (APP_ORIGIN ? `${APP_ORIGIN}/backend/api` : '/backend/api');
 const ROOT_BASE = APP_ORIGIN || '';
+const VIDEO_UPLOAD_CHUNK_SIZE_BYTES = 20 * 1024 * 1024;
+const DIRECT_VIDEO_UPLOAD_LIMIT_BYTES = 90 * 1024 * 1024;
 const TOKEN_KEY = 'edumaster.jwt';
 const AUTH_EVENT_KEY = 'edumaster.auth.event';
+const DEVICE_ID_KEY = 'edumaster.device.id';
 
 let authToken: string | null = null;
 const authRequestInflight = new Map<string, Promise<unknown>>();
+const protectedLessonPlaybackCache = new Map<string, { expiresAt: number; value: ProtectedLessonPlayback }>();
+const protectedLessonPlaybackInflight = new Map<string, Promise<ProtectedLessonPlayback>>();
+const PROTECTED_LESSON_PLAYBACK_CACHE_TTL_MS = 20_000;
 
 type RequestOptions = RequestInit & {
   includeAuth?: boolean;
@@ -56,9 +60,7 @@ type LoginOptions = {
   forceLogoutOtherSessions?: boolean;
 };
 
-type OtpChannel = 'email' | 'sms';
-
-export type CoursePaymentProvider = 'stripe' | 'phonepe';
+type FirebaseAuthProvider = 'password' | 'google' | 'apple';
 
 export class ApiRequestError extends Error {
   status: number;
@@ -100,6 +102,189 @@ const resolveRootPath = (path: string) => {
 };
 
 const getCheckoutOrigin = () => ROOT_BASE || runtimeHttpOrigin || 'https://app.varoonenglish.com';
+const buildVideoUploadId = () => {
+  const randomUuid = globalThis.crypto?.randomUUID?.();
+  if (randomUuid) {
+    return `upload_${randomUuid.replace(/-/g, '')}`;
+  }
+  return `upload_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+};
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+type VideoUploadProgress = {
+  uploadedBytes: number;
+  totalBytes: number;
+  chunkIndex: number;
+  totalChunks: number;
+};
+
+type CloudflareStreamUploadSession = {
+  upload: {
+    uid: string;
+    uploadURL: string;
+    method: 'direct-post' | 'tus' | string;
+    expiresAt?: string | null;
+  };
+  video: CourseLesson;
+  message?: string;
+};
+
+const extractUploadErrorMessage = (responseText: string, fallbackMessage: string) => {
+  const normalizedText = String(responseText || '').trim();
+  if (!normalizedText) {
+    return fallbackMessage;
+  }
+
+  try {
+    const payload = JSON.parse(normalizedText);
+    const message = payload?.errors?.[0]?.message
+      || payload?.messages?.[0]
+      || payload?.message
+      || payload?.error;
+    if (message) {
+      return String(message);
+    }
+  } catch {
+    // Non-JSON response bodies fall back to plain text when available.
+  }
+
+  return normalizedText || fallbackMessage;
+};
+
+const uploadDirectPostToCloudflare = (
+  uploadURL: string,
+  file: File,
+  onProgress?: (progress: VideoUploadProgress) => void,
+) => new Promise<void>((resolve, reject) => {
+  const xhr = new XMLHttpRequest();
+  const formData = new FormData();
+  formData.append('file', file, file.name);
+
+  xhr.upload.onprogress = (event) => {
+    if (!event.lengthComputable) {
+      return;
+    }
+    onProgress?.({
+      uploadedBytes: event.loaded,
+      totalBytes: event.total || file.size,
+      chunkIndex: 0,
+      totalChunks: 1,
+    });
+  };
+
+  xhr.onload = () => {
+    if (xhr.status >= 200 && xhr.status < 300) {
+      onProgress?.({
+        uploadedBytes: file.size,
+        totalBytes: file.size,
+        chunkIndex: 0,
+        totalChunks: 1,
+      });
+      resolve();
+      return;
+    }
+    reject(new Error(extractUploadErrorMessage(
+      xhr.responseText,
+      `Cloudflare Stream upload failed (${xhr.status})`,
+    )));
+  };
+  xhr.onerror = () => reject(new Error('Cloudflare Stream upload failed'));
+  xhr.open('POST', uploadURL);
+  xhr.send(formData);
+});
+
+const patchTusChunk = (
+  uploadURL: string,
+  chunk: Blob,
+  offset: number,
+) => new Promise<number>((resolve, reject) => {
+  const xhr = new XMLHttpRequest();
+  xhr.onload = () => {
+    if (xhr.status === 204 || (xhr.status >= 200 && xhr.status < 300)) {
+      const nextOffset = Number(xhr.getResponseHeader('Upload-Offset') || offset + chunk.size);
+      resolve(Number.isFinite(nextOffset) ? nextOffset : offset + chunk.size);
+      return;
+    }
+    const error = new Error(`Cloudflare Stream resumable upload failed (${xhr.status})`) as Error & {
+      status?: number;
+      uploadOffset?: number;
+    };
+    error.status = xhr.status;
+    const responseOffset = Number(xhr.getResponseHeader('Upload-Offset'));
+    if (Number.isFinite(responseOffset)) {
+      error.uploadOffset = responseOffset;
+    }
+    reject(error);
+  };
+  xhr.onerror = () => reject(new Error('Cloudflare Stream resumable upload failed'));
+  xhr.open('PATCH', uploadURL);
+  xhr.setRequestHeader('Tus-Resumable', '1.0.0');
+  xhr.setRequestHeader('Upload-Offset', String(offset));
+  xhr.setRequestHeader('Content-Type', 'application/offset+octet-stream');
+  xhr.send(chunk);
+});
+
+const getTusUploadOffset = (uploadURL: string) => new Promise<number | null>((resolve) => {
+  const xhr = new XMLHttpRequest();
+  xhr.onload = () => {
+    const offset = Number(xhr.getResponseHeader('Upload-Offset'));
+    resolve(Number.isFinite(offset) ? offset : null);
+  };
+  xhr.onerror = () => resolve(null);
+  xhr.open('HEAD', uploadURL);
+  xhr.setRequestHeader('Tus-Resumable', '1.0.0');
+  xhr.send();
+});
+
+const uploadTusToCloudflare = async (
+  uploadURL: string,
+  file: File,
+  onProgress?: (progress: VideoUploadProgress) => void,
+) => {
+  const totalChunks = Math.ceil(file.size / VIDEO_UPLOAD_CHUNK_SIZE_BYTES);
+  let offset = 0;
+
+  for (let chunkIndex = 0; offset < file.size; chunkIndex += 1) {
+    const end = Math.min(offset + VIDEO_UPLOAD_CHUNK_SIZE_BYTES, file.size);
+    const chunk = file.slice(offset, end, file.type || 'application/octet-stream');
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        offset = await patchTusChunk(uploadURL, chunk, offset);
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error('Cloudflare Stream resumable upload failed');
+        const uploadError = lastError as Error & { status?: number; uploadOffset?: number };
+        if (uploadError.status === 409) {
+          const remoteOffset = Number.isFinite(uploadError.uploadOffset)
+            ? Number(uploadError.uploadOffset)
+            : await getTusUploadOffset(uploadURL);
+          if (Number.isFinite(remoteOffset) && remoteOffset !== offset) {
+            offset = Math.min(Math.max(Number(remoteOffset), 0), file.size);
+            lastError = null;
+            break;
+          }
+        }
+        if (attempt < 2) {
+          await delay(900 * (attempt + 1));
+        }
+      }
+    }
+
+    if (lastError) {
+      throw lastError;
+    }
+
+    onProgress?.({
+      uploadedBytes: Math.min(offset, file.size),
+      totalBytes: file.size,
+      chunkIndex,
+      totalChunks,
+    });
+  }
+};
 
 const normalizeCourseLesson = (lesson: CourseLesson): CourseLesson => ({
   ...lesson,
@@ -109,6 +294,7 @@ const normalizeCourseLesson = (lesson: CourseLesson): CourseLesson => ({
 
 const normalizeCourseCard = (course: CourseCard): CourseCard => ({
   ...course,
+  offerPercentage: Number(course.offerPercentage || 0),
   thumbnailUrl: resolveAbsoluteUrl(course.thumbnailUrl),
   officialChannelUrl: resolveAbsoluteUrl(course.officialChannelUrl || null) || course.officialChannelUrl || null,
   continueLesson: course.continueLesson ? normalizeCourseLesson(course.continueLesson) : course.continueLesson,
@@ -137,6 +323,13 @@ const normalizeLiveClassResource = (resource: LiveClassResource): LiveClassResou
 
 const isPresent = <T,>(value: T | null | undefined): value is T => value != null;
 
+const getDiscountedCoursePrice = (course: CourseCard) => {
+  const basePrice = Math.max(Number(course.price || 0), 0);
+  const offerPercentage = Math.min(Math.max(Number(course.offerPercentage || 0), 0), 100);
+  const discountedPrice = basePrice * (1 - (offerPercentage / 100));
+  return Math.max(Number(discountedPrice.toFixed(2)), 1);
+};
+
 const normalizeLiveClass = (liveClass: LiveClass): LiveClass => ({
   ...liveClass,
   livePlaybackUrl: resolveAbsoluteUrl(liveClass.livePlaybackUrl || null) || liveClass.livePlaybackUrl || null,
@@ -153,6 +346,12 @@ const normalizeProtectedLessonPlayback = (playback: ProtectedLessonPlayback): Pr
   ...playback,
   embedUrl: resolveAbsoluteUrl(playback.embedUrl || null) || playback.embedUrl || null,
   streamUrl: resolveAbsoluteUrl(playback.streamUrl || null) || playback.streamUrl || null,
+  fallbackStreamUrl: resolveAbsoluteUrl(playback.fallbackStreamUrl || null) || playback.fallbackStreamUrl || null,
+  drmConfig: playback.drmConfig ? {
+    ...playback.drmConfig,
+    manifestUrl: resolveAbsoluteUrl(playback.drmConfig.manifestUrl || null) || playback.drmConfig.manifestUrl,
+    fairplayCertificateUrl: resolveAbsoluteUrl(playback.drmConfig.fairplayCertificateUrl || null) || playback.drmConfig.fairplayCertificateUrl || null,
+  } : playback.drmConfig ?? null,
 });
 
 const normalizeLiveClassAccess = (access: LiveClassAccess): LiveClassAccess => ({
@@ -180,6 +379,57 @@ const getClientDeviceLabel = () => {
 
   return `${browser} on ${platform}`;
 };
+
+const getPersistentDeviceId = () => {
+  if (typeof window === 'undefined') {
+    return 'server-device';
+  }
+
+  const existing = window.localStorage.getItem(DEVICE_ID_KEY);
+  if (existing) {
+    return existing;
+  }
+
+  const next = globalThis.crypto?.randomUUID?.() || `device_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  window.localStorage.setItem(DEVICE_ID_KEY, next);
+  return next;
+};
+
+const getClientPlatform = () => {
+  if (typeof window === 'undefined') {
+    return 'server';
+  }
+
+  const userAgent = window.navigator.userAgent.toLowerCase();
+  const userAgentDataPlatform = (window.navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform?.toLowerCase() || '';
+  const platform = String(window.navigator.platform || '').toLowerCase();
+  const source = `${userAgentDataPlatform} ${platform} ${userAgent}`;
+
+  if (source.includes('android')) return 'android';
+  if (source.includes('iphone') || source.includes('ipad') || source.includes('ipod') || source.includes('ios')) return 'ios';
+  if (source.includes('mac')) return 'macos';
+  if (source.includes('win')) return 'windows';
+  if (source.includes('linux')) return 'linux';
+  return 'unknown';
+};
+
+const getClientBrowser = () => {
+  if (typeof window === 'undefined') {
+    return 'server';
+  }
+
+  const ua = window.navigator.userAgent;
+  if (/Edg\//.test(ua)) return 'edge';
+  if (/OPR\/|Opera/.test(ua)) return 'opera';
+  if (/Firefox\/|FxiOS\//.test(ua)) return 'firefox';
+  if (/Chrome\/|CriOS\//.test(ua)) return 'chrome';
+  if (/Safari\//.test(ua) && !/Chrome\/|CriOS\/|Edg\//.test(ua)) return 'safari';
+  return 'unknown';
+};
+
+const getClientAppMode = () => (typeof window !== 'undefined' && (window as Window & { Capacitor?: unknown }).Capacitor)
+  ? 'native'
+  : 'web';
 
 const readStoredToken = () => {
   if (typeof window === 'undefined') {
@@ -241,12 +491,48 @@ const buildHeaders = (hasBody: boolean, includeAuth = true) => {
   return {
     ...(hasBody ? { 'content-type': 'application/json' } : {}),
     ...(token ? { authorization: `Bearer ${token}` } : {}),
+    'x-edumaster-device-id': getPersistentDeviceId(),
+    'x-edumaster-client-platform': getClientPlatform(),
+    'x-edumaster-client-browser': getClientBrowser(),
+    'x-edumaster-app': getClientAppMode(),
   };
 };
 
 const buildAuthHeaders = () => {
   const token = readStoredToken();
-  return token ? { authorization: `Bearer ${token}` } : {};
+  return {
+    ...(token ? { authorization: `Bearer ${token}` } : {}),
+    'x-edumaster-device-id': getPersistentDeviceId(),
+    'x-edumaster-client-platform': getClientPlatform(),
+    'x-edumaster-client-browser': getClientBrowser(),
+    'x-edumaster-app': getClientAppMode(),
+  };
+};
+
+const buildProtectedLessonPlaybackCacheKey = (courseId: string, lessonId: string) =>
+  `${String(courseId)}::${String(lessonId)}`;
+
+const readProtectedLessonPlaybackCache = (courseId: string, lessonId: string) => {
+  const key = buildProtectedLessonPlaybackCacheKey(courseId, lessonId);
+  const cached = protectedLessonPlaybackCache.get(key);
+  if (!cached) {
+    return null;
+  }
+
+  if (cached.expiresAt <= Date.now()) {
+    protectedLessonPlaybackCache.delete(key);
+    return null;
+  }
+
+  return cached.value;
+};
+
+const writeProtectedLessonPlaybackCache = (courseId: string, lessonId: string, value: ProtectedLessonPlayback) => {
+  protectedLessonPlaybackCache.set(buildProtectedLessonPlaybackCacheKey(courseId, lessonId), {
+    value,
+    expiresAt: Date.now() + PROTECTED_LESSON_PLAYBACK_CACHE_TTL_MS,
+  });
+  return value;
 };
 
 const parsePayload = async (response: Response) => {
@@ -356,37 +642,25 @@ export const EduService = {
   setToken: (token: string | null) => saveToken(token),
   clearToken: () => saveToken(null),
 
-  register: async (payload: RegisterPayload & { channel?: OtpChannel }): Promise<RegisterOtpResponse> => {
+  register: async (payload: RegisterPayload): Promise<AuthResponse> => {
     const normalizedEmail = String(payload.email || '').trim().toLowerCase();
     return runDedupedAuthRequest(`register:${normalizedEmail}`, async () => {
-      return request<RegisterOtpResponse>('/auth/register', {
+      const response = await request<AuthResponse>('/auth/register', {
         method: 'POST',
         body: JSON.stringify({
           ...payload,
           role: 'student',
+          device: getClientDeviceLabel(),
         }),
       });
+      saveToken(response.token);
+      emitAuthEvent({
+        type: 'login',
+        userId: response.user._id,
+        sessionId: response.user.session || null,
+      });
+      return response;
     });
-  },
-
-  verifyRegistrationOtp: async (challengeId: string, otp: string): Promise<AuthResponse> => {
-    const response = await request<AuthResponse>('/auth/register/verify-otp', {
-      method: 'POST',
-      includeAuth: false,
-      expireSessionOn401: false,
-      body: JSON.stringify({
-        challengeId,
-        otp,
-        device: getClientDeviceLabel(),
-      }),
-    });
-    saveToken(response.token);
-    emitAuthEvent({
-      type: 'login',
-      userId: response.user._id,
-      sessionId: response.user.session || null,
-    });
-    return response;
   },
 
   updateProfile: async (payload: { name: string; email: string; mobileNumber?: string | null }) => {
@@ -428,8 +702,16 @@ export const EduService = {
   },
 
   socialLogin: async (provider: 'google' | 'apple', idToken: string, options: LoginOptions = {}): Promise<AuthResponse> => {
+    return EduService.firebaseLogin(provider, idToken, options);
+  },
+
+  firebaseLogin: async (
+    provider: FirebaseAuthProvider,
+    idToken: string,
+    options: LoginOptions & { name?: string; mobileNumber?: string | null } = {},
+  ): Promise<AuthResponse> => {
     const device = getClientDeviceLabel();
-    const response = await request<AuthResponse>('/auth/social', {
+    const response = await request<AuthResponse>('/auth/firebase', {
       method: 'POST',
       includeAuth: false,
       expireSessionOn401: false,
@@ -438,6 +720,8 @@ export const EduService = {
         idToken,
         device,
         forceLogoutOtherSessions: options.forceLogoutOtherSessions ?? false,
+        name: options.name,
+        mobileNumber: options.mobileNumber ?? undefined,
       }),
     });
 
@@ -450,86 +734,6 @@ export const EduService = {
     return response;
   },
 
-  requestLoginOtp: async (identifier: string, channel?: OtpChannel): Promise<{ challenge: AuthOtpChallenge }> => {
-    return request<{ challenge: AuthOtpChallenge }>('/auth/login/request-otp', {
-      method: 'POST',
-      includeAuth: false,
-      expireSessionOn401: false,
-      body: JSON.stringify({
-        identifier,
-        channel,
-      }),
-    });
-  },
-
-  loginWithOtp: async (
-    challengeId: string,
-    otp: string,
-    options: LoginOptions = {},
-  ): Promise<AuthResponse> => {
-    const device = getClientDeviceLabel();
-    const response = await request<AuthResponse>('/auth/login/verify-otp', {
-      method: 'POST',
-      includeAuth: false,
-      expireSessionOn401: false,
-      body: JSON.stringify({
-        challengeId,
-        otp,
-        device,
-        forceLogoutOtherSessions: options.forceLogoutOtherSessions ?? false,
-      }),
-    });
-    saveToken(response.token);
-    emitAuthEvent({
-      type: 'login',
-      userId: response.user._id,
-      sessionId: response.user.session || null,
-    });
-    return response;
-  },
-
-  requestPasswordResetOtp: async (identifier: string, channel?: OtpChannel): Promise<{ challenge: AuthOtpChallenge }> => {
-    return request<{ challenge: AuthOtpChallenge }>('/auth/forgot-password/request-otp', {
-      method: 'POST',
-      includeAuth: false,
-      expireSessionOn401: false,
-      body: JSON.stringify({
-        identifier,
-        channel,
-      }),
-    });
-  },
-
-  resetPasswordWithOtp: async (
-    challengeId: string,
-    otp: string,
-    password: string,
-    loginAfterReset = true,
-  ): Promise<AuthResponse | { message: string }> => {
-    const response = await request<AuthResponse | { message: string }>('/auth/forgot-password/reset', {
-      method: 'POST',
-      includeAuth: false,
-      expireSessionOn401: false,
-      body: JSON.stringify({
-        challengeId,
-        otp,
-        password,
-        loginAfterReset,
-        device: getClientDeviceLabel(),
-      }),
-    });
-
-    if ('token' in response) {
-      saveToken(response.token);
-      emitAuthEvent({
-        type: 'login',
-        userId: response.user._id,
-        sessionId: response.user.session || null,
-      });
-    }
-
-    return response;
-  },
 
   restoreSession: async (): Promise<AuthUser | null> => {
     if (!readStoredToken()) {
@@ -755,30 +959,43 @@ export const EduService = {
     });
   },
 
-  unlockCourse: async (course: CourseCard, provider: CoursePaymentProvider = 'stripe') => {
-    const endpoint = provider === 'phonepe' ? '/api/phonepe/course-checkout' : '/api/stripe/course-checkout';
-    return rootRequest<{ url: string; sessionId?: string; orderId?: string; paymentId: string; provider: CoursePaymentProvider }>(endpoint, {
+  listMockTestAttempts: async () => {
+    return request<TestAttemptResult[]>('/tests/attempts/me', {
+      method: 'GET',
+    });
+  },
+
+  unlockCourse: async (course: CourseCard) => {
+    const endpoint = '/api/razorpay/create-order';
+    return rootRequest<{
+      order_id?: string;
+      amount?: number;
+      currency?: string;
+      paymentId: string;
+      provider: 'razorpay';
+    }>(endpoint, {
       method: 'POST',
       body: JSON.stringify({
         courseId: course._id,
         courseTitle: course.title,
-        price: course.price,
+        amount: Math.round(getDiscountedCoursePrice(course) * 100),
+        currency: 'INR',
+        receipt: `course-${course._id}-${Date.now()}`,
         origin: getCheckoutOrigin(),
       }),
     });
   },
 
-  confirmCoursePayment: async (sessionId: string, courseId: string) => {
-    return rootRequest(`/api/stripe/confirm-course-payment`, {
+  verifyRazorpayCoursePayment: async (payload: {
+    courseId: string;
+    paymentId: string;
+    razorpay_order_id: string;
+    razorpay_payment_id: string;
+    razorpay_signature: string;
+  }) => {
+    return rootRequest(`/api/razorpay/verify-payment`, {
       method: 'POST',
-      body: JSON.stringify({ sessionId, courseId }),
-    });
-  },
-
-  confirmPhonePeCoursePayment: async (orderId: string, courseId: string, paymentId?: string) => {
-    return rootRequest(`/api/phonepe/confirm-course-payment`, {
-      method: 'POST',
-      body: JSON.stringify({ orderId, courseId, paymentId }),
+      body: JSON.stringify(payload),
     });
   },
 
@@ -792,33 +1009,20 @@ export const EduService = {
       }),
     });
   },
-
-  unlockSubscription: async (plan: SubscriptionPlan) => {
-    return rootRequest<{ url: string; sessionId: string; paymentId: string }>(`/api/stripe/subscription-checkout`, {
-      method: 'POST',
-      body: JSON.stringify({
-        planId: plan._id,
-        planTitle: plan.title,
-        price: plan.price,
-        billingCycle: plan.billingCycle,
-        origin: getCheckoutOrigin(),
-      }),
-    });
-  },
-
-  confirmSubscriptionPayment: async (sessionId: string, planId: string) => {
-    return rootRequest(`/api/stripe/confirm-subscription-payment`, {
-      method: 'POST',
-      body: JSON.stringify({ sessionId, planId }),
-    });
-  },
-
   updateWatchProgress: async (
     courseId: string,
     lessonId: string,
     progressPercent: number,
     progressSeconds: number,
     completed: boolean,
+    metadata: {
+      lessonStage?: 'video' | 'exam' | 'explanation' | null;
+      examSubmitted?: boolean | null;
+      examSelectedOption?: number | null;
+      explanationSeconds?: number | null;
+      videoWatchCount?: number | null;
+      explanationWatchCount?: number | null;
+    } = {},
     requestOptions: RequestInit = {},
   ) => {
     return request(`/platform/watch-progress`, {
@@ -830,6 +1034,12 @@ export const EduService = {
         progressPercent,
         progressSeconds,
         completed,
+        lessonStage: metadata.lessonStage ?? null,
+        examSubmitted: metadata.examSubmitted ?? null,
+        examSelectedOption: metadata.examSelectedOption ?? null,
+        explanationSeconds: metadata.explanationSeconds ?? null,
+        videoWatchCount: metadata.videoWatchCount ?? null,
+        explanationWatchCount: metadata.explanationWatchCount ?? null,
       }),
     });
   },
@@ -981,6 +1191,51 @@ export const EduService = {
     });
   },
 
+  uploadMockTestVideo: async (
+    testId: string,
+    file: File,
+    title: string,
+    durationMinutes?: number,
+  ) => {
+    const formData = new FormData();
+    formData.append('video', file);
+    formData.append('title', title);
+    formData.append('durationMinutes', String(durationMinutes || 0));
+
+    const response = await fetch(resolveRootPath(`/backend/api/tests/${testId}/video`), {
+      method: 'POST',
+      headers: {
+        ...buildAuthHeaders(),
+      },
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.message || 'Upload failed');
+    }
+
+    return response.json();
+  },
+
+  deleteMockTestVideo: async (testId: string) => {
+    return request<{ message: string }>(`/tests/${testId}/video`, {
+      method: 'DELETE',
+    });
+  },
+
+  getMockTestVideoMetadata: async (testId: string) => {
+    return request<{ companionVideo: MockTest['companionVideo'] }>(`/tests/${testId}/video`, {
+      method: 'GET',
+    });
+  },
+
+  getProtectedMockTestVideoPlayback: async (testId: string) => {
+    return request<ProtectedLessonPlayback>(`/tests/${testId}/video/player`, {
+      method: 'GET',
+    });
+  },
+
   attachLessonCbt: async (
     courseId: string,
     moduleId: string,
@@ -1064,43 +1319,244 @@ export const EduService = {
     durationMinutes?: number,
     isPremium?: boolean,
     chapterId?: string,
+    options?: {
+      onProgress?: (progress: VideoUploadProgress) => void;
+    },
   ) => {
+    const onProgress = options?.onProgress;
+    try {
+      const session = await request<CloudflareStreamUploadSession>(
+        `/courses/${courseId}/modules/${moduleId}/videos/cloudflare/direct-upload`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            lessonTitle,
+            durationMinutes: durationMinutes || 0,
+            isPremium: Boolean(isPremium),
+            lessonType: 'video',
+            chapterId: chapterId || undefined,
+            originalFilename: file.name,
+            mimeType: file.type || 'video/mp4',
+            fileSize: file.size,
+          }),
+        },
+      );
+
+      if (!session?.upload?.uploadURL || !session.upload.uid) {
+        throw new Error('Cloudflare Stream upload session was not created.');
+      }
+
+      if (session.upload.method === 'tus') {
+        await uploadTusToCloudflare(session.upload.uploadURL, file, onProgress);
+      } else {
+        await uploadDirectPostToCloudflare(session.upload.uploadURL, file, onProgress);
+      }
+
+      await request(`/courses/${courseId}/modules/${moduleId}/videos/cloudflare/complete`, {
+        method: 'POST',
+        body: JSON.stringify({
+          uid: session.upload.uid,
+          lessonId: session.video?.id,
+        }),
+      }).catch(() => null);
+
+      return {
+        ...session,
+        message: session.message
+          || 'Video uploaded successfully. It will become visible to students after Cloudflare Stream finishes encoding.',
+      };
+    } catch (error) {
+      const apiError = error as ApiRequestError;
+      const canUseLegacyUpload = apiError instanceof ApiRequestError
+        && ['CLOUDFLARE_STREAM_NOT_CONFIGURED', 'REQUEST_FAILED'].includes(apiError.code)
+        && [404, 501, 503].includes(apiError.status);
+      if (!canUseLegacyUpload) {
+        throw error;
+      }
+    }
+
     const formData = new FormData();
-    formData.append('video', file);
-    formData.append('lessonTitle', lessonTitle);
-    formData.append('durationMinutes', String(durationMinutes || 0));
-    formData.append('isPremium', String(Boolean(isPremium)));
-    formData.append('lessonType', 'video');
+    const appendSharedFields = (target: FormData) => {
+      target.append('lessonTitle', lessonTitle);
+      target.append('durationMinutes', String(durationMinutes || 0));
+      target.append('isPremium', String(Boolean(isPremium)));
+      target.append('lessonType', 'video');
+      if (chapterId) {
+        target.append('chapterId', chapterId);
+      }
+    };
 
-    if (chapterId) {
-      formData.append('chapterId', chapterId);
+    if (file.size <= DIRECT_VIDEO_UPLOAD_LIMIT_BYTES) {
+      formData.append('video', file);
+      appendSharedFields(formData);
+
+      const response = await fetch(resolveRootPath(`/backend/api/courses/${courseId}/modules/${moduleId}/videos`), {
+        method: 'POST',
+        headers: {
+          ...buildAuthHeaders(),
+        },
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.message || 'Upload failed');
+      }
+
+      onProgress?.({
+        uploadedBytes: file.size,
+        totalBytes: file.size,
+        chunkIndex: 0,
+        totalChunks: 1,
+      });
+
+      return response.json();
     }
 
-    const response = await fetch(resolveRootPath(`/backend/api/courses/${courseId}/modules/${moduleId}/videos`), {
-      method: 'POST',
-      headers: {
-        ...buildAuthHeaders(),
-      },
-      body: formData,
-    });
+    const uploadId = buildVideoUploadId();
+    const totalChunks = Math.ceil(file.size / VIDEO_UPLOAD_CHUNK_SIZE_BYTES);
+    let lastPayload: unknown = null;
 
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.message || 'Upload failed');
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+      const start = chunkIndex * VIDEO_UPLOAD_CHUNK_SIZE_BYTES;
+      const end = Math.min(start + VIDEO_UPLOAD_CHUNK_SIZE_BYTES, file.size);
+      const chunkBlob = file.slice(start, end, file.type || 'application/octet-stream');
+      let response: Response | null = null;
+      let lastError: Error | null = null;
+
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const chunkFormData = new FormData();
+        chunkFormData.append('chunk', chunkBlob, file.name);
+        appendSharedFields(chunkFormData);
+        chunkFormData.append('uploadId', uploadId);
+        chunkFormData.append('chunkIndex', String(chunkIndex));
+        chunkFormData.append('totalChunks', String(totalChunks));
+        chunkFormData.append('originalFilename', file.name);
+        chunkFormData.append('mimeType', file.type || 'video/mp4');
+        chunkFormData.append('fileSize', String(file.size));
+
+        try {
+          response = await fetch(resolveRootPath(`/backend/api/courses/${courseId}/modules/${moduleId}/videos/chunked`), {
+            method: 'POST',
+            headers: {
+              ...buildAuthHeaders(),
+            },
+            body: chunkFormData,
+          });
+
+          if (response.ok) {
+            break;
+          }
+
+          const error = await response.json().catch(() => ({}));
+          lastError = new Error(error.message || `Upload failed on chunk ${chunkIndex + 1}`);
+        } catch (error) {
+          lastError = error instanceof Error ? error : new Error(`Upload failed on chunk ${chunkIndex + 1}`);
+        }
+
+        if (attempt < 2) {
+          await delay(700 * (attempt + 1));
+        }
+      }
+
+      if (!response?.ok) {
+        throw lastError || new Error('Upload failed');
+      }
+
+      lastPayload = await response.json();
+      onProgress?.({
+        uploadedBytes: end,
+        totalBytes: file.size,
+        chunkIndex,
+        totalChunks,
+      });
     }
 
-    return response.json();
+    return lastPayload;
   },
 
-  getProtectedLessonPlayback: async (courseId: string, lessonId: string) => {
-    const playback = await request<ProtectedLessonPlayback>(`/courses/${courseId}/lessons/${lessonId}/player`, {
+  getProtectedLessonPlayback: async (courseId: string, lessonId: string, options: { forceRefresh?: boolean } = {}) => {
+    const { forceRefresh = false } = options;
+    const key = buildProtectedLessonPlaybackCacheKey(courseId, lessonId);
+
+    if (!forceRefresh) {
+      const cached = readProtectedLessonPlaybackCache(courseId, lessonId);
+      if (cached) {
+        return cached;
+      }
+
+      const inflight = protectedLessonPlaybackInflight.get(key);
+      if (inflight) {
+        return inflight;
+      }
+    }
+
+    const playbackPromise = request<ProtectedLessonPlayback>(`/courses/${courseId}/lessons/${lessonId}/player`, {
+      method: 'GET',
+    })
+      .then((playback) => writeProtectedLessonPlaybackCache(courseId, lessonId, normalizeProtectedLessonPlayback(playback)))
+      .finally(() => {
+        protectedLessonPlaybackInflight.delete(key);
+      });
+
+    protectedLessonPlaybackInflight.set(key, playbackPromise);
+    return playbackPromise;
+  },
+
+  prefetchProtectedLessonPlayback: async (courseId: string, lessonId: string) => {
+    try {
+      await EduService.getProtectedLessonPlayback(courseId, lessonId);
+    } catch {
+      // Prefetch should stay best-effort.
+    }
+  },
+
+  getProtectedLessonBootstrap: async (courseId: string, lessonId: string) => {
+    const response = await request<{
+      course: CourseCard;
+      lessons: CourseLesson[];
+      lesson: CourseLesson | null;
+      player: ProtectedLessonPlayback;
+    }>(`/courses/${courseId}/lessons/${lessonId}/bootstrap`, {
       method: 'GET',
     });
-    return normalizeProtectedLessonPlayback(playback);
+
+    return {
+      course: normalizeCourseCard(response.course),
+      lessons: Array.isArray(response.lessons) ? response.lessons.map(normalizeCourseLesson) : [],
+      lesson: response.lesson ? normalizeCourseLesson(response.lesson) : null,
+      player: normalizeProtectedLessonPlayback(response.player),
+    };
   },
 
-  listVideosInModule: async (courseId: string, moduleId: string) => {
-    return request(`/courses/${courseId}/modules/${moduleId}/videos`, {
+  listLessonDoubts: async (courseId: string, lessonId: string) => {
+    return request<{
+      viewerRole: 'student' | 'admin';
+      lessonPath: string[];
+      threads: LessonDoubtThread[];
+    }>(`/courses/${courseId}/lessons/${lessonId}/doubts`, {
+      method: 'GET',
+    });
+  },
+
+  postLessonDoubtMessage: async (
+    courseId: string,
+    lessonId: string,
+    payload: { message: string; threadId?: string | null },
+  ) => {
+    return request<{
+      message: string;
+      thread: LessonDoubtThread;
+      notificationsSent: number;
+    }>(`/courses/${courseId}/lessons/${lessonId}/doubts`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  listVideosInModule: async (courseId: string, moduleId: string, chapterId?: string | null) => {
+    const query = chapterId ? `?chapterId=${encodeURIComponent(chapterId)}` : '';
+    return request(`/courses/${courseId}/modules/${moduleId}/videos${query}`, {
       method: 'GET',
     });
   },

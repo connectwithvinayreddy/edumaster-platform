@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   ArrowRight,
@@ -59,7 +59,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import { AuthProvider, useAuth } from './AuthContext';
+import { useAuth } from './AuthContext';
 import { appleProvider, auth as firebaseAuth, googleProvider } from './firebase';
 import { BrandLogo } from './components/BrandLogo';
 import { CourseFigmaTab } from './components/CourseFigmaTab';
@@ -70,11 +70,11 @@ import { ApiRequestError, EduService } from './EduService';
 import { AdminCourseManager } from './components/AdminCourseManager';
 import { AdminModuleManager } from './components/AdminModuleManager';
 import { AdminVideoUpload } from './components/AdminVideoUpload';
+import { AdminMockTestVideoUpload } from './components/AdminMockTestVideoUpload';
 import Hls from 'hls.js';
 import { signInWithPopup } from 'firebase/auth';
 import {
   AiResponse,
-  AuthOtpChallenge,
   MockTest,
   MockQuestion,
   NotificationItem,
@@ -167,9 +167,8 @@ const formatPlaybackTime = (seconds: number) => {
   return `${String(minutes).padStart(2, '0')}:${String(remainingSeconds).padStart(2, '0')}`;
 };
 
-const CBT_BRAND_NAME = 'VARONENGLISH';
+const CBT_BRAND_NAME = 'VaronEnglish';
 const LIVE_FONT_STACK = 'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-const smsOtpEnabled = String((import.meta.env as Record<string, string | undefined>).VITE_AUTH_SMS_OTP_ENABLED || 'false').trim().toLowerCase() === 'true';
 const getInitials = (value: string) =>
   value
     .split(' ')
@@ -248,7 +247,7 @@ const getSessionDeviceIcon = (deviceLabel: string) => {
 };
 
 const buildCourseFallbackArtwork = (title: string) => {
-  const safeTitle = String(title || 'VARONENGLISH Course').slice(0, 28);
+  const safeTitle = String(title || 'VaronEnglish Course').slice(0, 28);
   const svg = `
     <svg xmlns="http://www.w3.org/2000/svg" width="320" height="240" viewBox="0 0 320 240" fill="none">
       <defs>
@@ -261,7 +260,7 @@ const buildCourseFallbackArtwork = (title: string) => {
       <circle cx="250" cy="64" r="42" fill="rgba(255,255,255,0.12)"/>
       <circle cx="78" cy="178" r="56" fill="rgba(255,255,255,0.08)"/>
       <text x="28" y="168" fill="#ffffff" font-size="28" font-family="Georgia, serif" font-weight="700">${safeTitle}</text>
-      <text x="28" y="204" fill="rgba(255,255,255,0.72)" font-size="14" font-family="Arial, sans-serif">VARONENGLISH course</text>
+      <text x="28" y="204" fill="rgba(255,255,255,0.72)" font-size="14" font-family="Arial, sans-serif">VaronEnglish course</text>
     </svg>
   `.trim();
   return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
@@ -336,6 +335,7 @@ type NotificationNavigationTarget = {
   liveClassId?: string | null;
   courseId?: string | null;
   lessonId?: string | null;
+  doubtThreadId?: string | null;
 };
 
 type RevisionDayPlan = {
@@ -400,6 +400,7 @@ const getNotificationNavigationTarget = (notification: NotificationItem): Notifi
   const liveClassId = readStringPayload(payload, 'liveClassId') || notification.entityId || null;
   const courseId = readStringPayload(payload, 'courseId') || null;
   const lessonId = readStringPayload(payload, 'lessonId') || null;
+  const doubtThreadId = readStringPayload(payload, 'doubtThreadId') || null;
 
   if (payloadTab && payloadTab in shellTabMeta) {
     return {
@@ -407,6 +408,7 @@ const getNotificationNavigationTarget = (notification: NotificationItem): Notifi
       liveClassId,
       courseId,
       lessonId,
+      doubtThreadId,
     };
   }
 
@@ -421,6 +423,7 @@ const getNotificationNavigationTarget = (notification: NotificationItem): Notifi
           liveClassId: parsedUrl.searchParams.get('liveClassId') || liveClassId,
           courseId: parsedUrl.searchParams.get('courseId') || courseId,
           lessonId: parsedUrl.searchParams.get('lessonId') || lessonId,
+          doubtThreadId: parsedUrl.searchParams.get('doubtThreadId') || doubtThreadId,
         };
       }
     } catch {
@@ -432,7 +435,7 @@ const getNotificationNavigationTarget = (notification: NotificationItem): Notifi
     return { tab: 'live', liveClassId };
   }
   if (courseId || String(notification.type || '').includes('course')) {
-    return { tab: 'courses', courseId, lessonId };
+    return { tab: 'courses', courseId, lessonId, doubtThreadId };
   }
   if (String(notification.type || '').includes('test')) {
     return { tab: 'tests' };
@@ -670,7 +673,7 @@ const MobileNotificationSheet = ({
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
           onClick={onClose}
-	          className="fixed inset-0 z-40 bg-[#071833]/48 backdrop-blur-[2px] lg:hidden"
+	          className="fixed inset-0 z-40 bg-[#071833]/48 backdrop-blur-[2px]"
           aria-label="Close notifications"
         />
         <motion.div
@@ -678,7 +681,7 @@ const MobileNotificationSheet = ({
           animate={{ y: 0, opacity: 1 }}
           exit={{ y: 24, opacity: 0 }}
           transition={{ duration: 0.2, ease: 'easeOut' }}
-	          className="fixed inset-x-3 top-[calc(env(safe-area-inset-top)+92px)] z-50 max-h-[70dvh] overflow-hidden rounded-[24px] border border-[#dbe6f6] bg-[#fbfdff] shadow-[0_28px_90px_rgba(15,34,68,0.26)] lg:hidden"
+	          className="fixed inset-x-3 top-[calc(env(safe-area-inset-top)+92px)] z-50 max-h-[70dvh] overflow-hidden rounded-[24px] border border-[#dbe6f6] bg-[#fbfdff] shadow-[0_28px_90px_rgba(15,34,68,0.26)] sm:left-auto sm:right-6 sm:top-24 sm:w-[420px] lg:w-[440px]"
           style={{ fontFamily: LIVE_FONT_STACK }}
         >
 	          <div className="flex items-center justify-between border-b border-[#dfe8f6] bg-[linear-gradient(180deg,#f7fbff_0%,#eef5ff_100%)] px-5 py-4">
@@ -720,6 +723,58 @@ const MobileNotificationSheet = ({
       </>
     )}
   </AnimatePresence>
+);
+
+const InAppNotificationToasts = ({
+  notifications,
+  onOpen,
+  onDismiss,
+}: {
+  notifications: NotificationItem[];
+  onOpen: (notification: NotificationItem) => void;
+  onDismiss: (notificationId: string) => void;
+}) => (
+  <div className="pointer-events-none fixed right-4 top-[calc(env(safe-area-inset-top)+18px)] z-[80] flex w-[min(92vw,380px)] flex-col gap-3">
+    <AnimatePresence>
+      {notifications.map((notification) => (
+        <motion.div
+          key={notification._id}
+          initial={{ opacity: 0, y: -16, scale: 0.96 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          exit={{ opacity: 0, y: -12, scale: 0.96 }}
+          transition={{ duration: 0.18, ease: 'easeOut' }}
+          className="pointer-events-auto overflow-hidden rounded-[20px] border border-[#dbe6f6] bg-white/98 shadow-[0_20px_48px_rgba(15,23,42,0.18)] backdrop-blur-md"
+        >
+          <div className="flex items-start gap-3 px-4 py-4">
+            <span className="mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-[14px] bg-[#eef5ff] text-[#2f6fe4]">
+              <BellRing className="h-4 w-4" />
+            </span>
+            <button
+              type="button"
+              onClick={() => onOpen(notification)}
+              className="min-w-0 flex-1 text-left"
+            >
+              <span className="block text-[14px] font-semibold text-[#17233f]">{notification.title}</span>
+              <span className="mt-1 block text-[12px] leading-5 text-[#607394]">{notification.message}</span>
+              <span className="mt-2 inline-flex text-[11px] font-semibold uppercase tracking-[0.08em] text-[#2f6fe4]">
+                Tap to open
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                onDismiss(notification._id);
+              }}
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-[#dbe6f6] bg-white text-[#607394]"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        </motion.div>
+      ))}
+    </AnimatePresence>
+  </div>
 );
 
 const ProfileEditorSheet = ({
@@ -1560,12 +1615,10 @@ const buildLocalTestAttemptResult = (
 };
 
 const AuthScreen = () => {
-  const { login, register, refreshSession } = useAuth();
-  const [mode, setMode] = useState<'login' | 'register' | 'register-otp' | 'login-otp' | 'forgot-password' | 'reset-password'>('login');
-  const [loginMethod, setLoginMethod] = useState<'password' | 'otp'>('password');
+  const { login, register, refreshSession, requestPasswordReset } = useAuth();
+  const [mode, setMode] = useState<'login' | 'register' | 'forgot-password'>('login');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [sessionConflict, setSessionConflict] = useState<{
     authMethod: 'password' | 'social';
     identifier: string;
@@ -1584,12 +1637,11 @@ const AuthScreen = () => {
     device: string;
     loggedOutAt: string;
   } | null>(null);
-  const [loginForm, setLoginForm] = useState({ identifier: '', password: '', channel: 'email' as 'email' | 'sms' });
+  const [loginForm, setLoginForm] = useState({ identifier: '', password: '' });
   const [registerForm, setRegisterForm] = useState<RegisterPayload & {
     mobileNumber: string;
     confirmPassword: string;
     agreeToTerms: boolean;
-    channel: 'email' | 'sms';
   }>({
     name: '',
     email: '',
@@ -1597,22 +1649,13 @@ const AuthScreen = () => {
     mobileNumber: '',
     confirmPassword: '',
     agreeToTerms: false,
-    channel: 'email',
-  });
-  const [otpCode, setOtpCode] = useState('');
-  const [activeChallenge, setActiveChallenge] = useState<AuthOtpChallenge | null>(null);
-  const [forgotPasswordForm, setForgotPasswordForm] = useState({
-    identifier: '',
-    channel: 'email' as 'email' | 'sms',
-    password: '',
-    confirmPassword: '',
   });
   const [rememberMe, setRememberMe] = useState(true);
+  const [resetEmail, setResetEmail] = useState('');
+  const [resetSentTo, setResetSentTo] = useState<string | null>(null);
   const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [showRegisterPassword, setShowRegisterPassword] = useState(false);
   const [showRegisterConfirmPassword, setShowRegisterConfirmPassword] = useState(false);
-  const [showResetPassword, setShowResetPassword] = useState(false);
-  const [showResetConfirmPassword, setShowResetConfirmPassword] = useState(false);
   const passwordStrength = useMemo(() => {
     const password = registerForm.password;
     if (!password) {
@@ -1640,9 +1683,9 @@ const AuthScreen = () => {
   const takeOverDevice = sessionConflict?.activeSessions[0]?.device || sessionConflict?.activeDevice || 'another device';
   const resetFeedback = () => {
     setError(null);
-    setNotice(null);
+    setResetSentTo(null);
   };
-  const switchMode = (nextMode: 'login' | 'register' | 'register-otp' | 'login-otp' | 'forgot-password' | 'reset-password') => {
+  const switchMode = (nextMode: 'login' | 'register' | 'forgot-password') => {
     resetFeedback();
     setMode(nextMode);
   };
@@ -1671,10 +1714,6 @@ const AuthScreen = () => {
   const socialButtonClassName = 'flex h-[48px] w-full items-center justify-center gap-3 rounded-[14px] border border-[#d7e3f2] bg-white px-4 text-[15px] font-bold text-[#17233d] shadow-[0_10px_24px_rgba(37,73,125,0.06)] transition hover:border-[#b9cbe3] hover:bg-[#f7fbff]';
   const primaryButtonClassName = 'relative flex h-[50px] w-full items-center justify-center gap-3 rounded-[14px] bg-[linear-gradient(90deg,#2f6fe4_0%,#1698d4_100%)] px-4 text-[16px] font-bold text-white shadow-[0_16px_32px_rgba(47,111,228,0.28)] transition hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-60';
   const renderPhoneStatusBar = () => null;
-  const otpHint = activeChallenge
-    ? `We sent a 6-digit OTP to ${activeChallenge.destination}. It expires in ${Math.max(Math.round(activeChallenge.expiresInSeconds / 60), 1)} minute${activeChallenge.expiresInSeconds >= 120 ? 's' : ''}.`
-    : null;
-
   const submitLogin = async (
     identifier = loginForm.identifier,
     password = loginForm.password,
@@ -1683,7 +1722,10 @@ const AuthScreen = () => {
     setSubmitting(true);
     resetFeedback();
     try {
-      await login(identifier, password, options);
+      await login(identifier, password, {
+        ...options,
+        rememberMe,
+      });
       setSessionConflict(null);
     } catch (err) {
       if (err instanceof ApiRequestError && err.code === 'SESSION_ACTIVE') {
@@ -1726,25 +1768,15 @@ const AuthScreen = () => {
       setError('Please accept the Terms & Conditions and Privacy Policy.');
       return;
     }
-    if (registerForm.channel === 'sms' && !registerForm.mobileNumber.trim()) {
-      setError('Add a mobile number to receive OTP by SMS.');
-      return;
-    }
-
     setSubmitting(true);
     resetFeedback();
     try {
-      const response = await register({
+      await register({
         name: registerForm.name,
         email: registerForm.email,
         mobileNumber: registerForm.mobileNumber,
         password: registerForm.password,
-        channel: registerForm.channel,
       });
-      setActiveChallenge(response.challenge);
-      setOtpCode('');
-      setNotice(`OTP sent to ${response.challenge.destination}. Verify it to activate your account.`);
-      setMode('register-otp');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to create account');
     } finally {
@@ -1752,134 +1784,20 @@ const AuthScreen = () => {
     }
   };
 
-  const submitRegistrationOtp = async () => {
-    if (!activeChallenge) {
-      setError('Registration OTP session expired. Please start registration again.');
-      setMode('register');
-      return;
-    }
-    if (!otpCode.trim()) {
-      setError('Enter the OTP you received.');
-      return;
-    }
-
-    setSubmitting(true);
-    resetFeedback();
-    try {
-      await EduService.verifyRegistrationOtp(activeChallenge.challengeId, otpCode.trim());
-      await refreshSession();
-      setActiveChallenge(null);
-      setOtpCode('');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to verify OTP');
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const submitLoginOtpRequest = async () => {
-    if (!loginForm.identifier.trim()) {
-      setError('Enter your email or mobile number.');
-      return;
-    }
-    if (loginForm.channel === 'sms' && !/\d/.test(loginForm.identifier)) {
-      setError('Enter your mobile number to receive OTP by SMS.');
-      return;
-    }
-
-    setSubmitting(true);
-    resetFeedback();
-    try {
-      const response = await EduService.requestLoginOtp(loginForm.identifier, loginForm.channel);
-      setActiveChallenge(response.challenge);
-      setOtpCode('');
-      setNotice(`OTP sent to ${response.challenge.destination}.`);
-      setMode('login-otp');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to send OTP');
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const submitLoginOtpVerification = async () => {
-    if (!activeChallenge) {
-      setError('Login OTP session expired. Please request a new OTP.');
-      setMode('login');
-      return;
-    }
-    if (!otpCode.trim()) {
-      setError('Enter the OTP you received.');
-      return;
-    }
-
-    setSubmitting(true);
-    resetFeedback();
-    try {
-      await EduService.loginWithOtp(activeChallenge.challengeId, otpCode.trim());
-      await refreshSession();
-      setActiveChallenge(null);
-      setOtpCode('');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to log in with OTP');
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const submitForgotPasswordRequest = async () => {
-    if (!forgotPasswordForm.identifier.trim()) {
-      setError('Enter your email or mobile number.');
-      return;
-    }
-    if (forgotPasswordForm.channel === 'sms' && !/\d/.test(forgotPasswordForm.identifier)) {
-      setError('Enter your mobile number to receive OTP by SMS.');
-      return;
-    }
-
-    setSubmitting(true);
-    resetFeedback();
-    try {
-      const response = await EduService.requestPasswordResetOtp(forgotPasswordForm.identifier, forgotPasswordForm.channel);
-      setActiveChallenge(response.challenge);
-      setOtpCode('');
-      setNotice(`Password reset OTP sent to ${response.challenge.destination}.`);
-      setMode('reset-password');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to send reset OTP');
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
   const submitPasswordReset = async () => {
-    if (!activeChallenge) {
-      setError('Reset session expired. Please request a fresh OTP.');
-      setMode('forgot-password');
-      return;
-    }
-    if (!otpCode.trim()) {
-      setError('Enter the OTP you received.');
-      return;
-    }
-    if (!forgotPasswordForm.password) {
-      setError('Enter a new password.');
-      return;
-    }
-    if (forgotPasswordForm.password !== forgotPasswordForm.confirmPassword) {
-      setError('Password and confirm password must match.');
+    const normalizedEmail = String(resetEmail || '').trim();
+    if (!normalizedEmail) {
+      setError('Enter your email address to receive a reset link.');
       return;
     }
 
     setSubmitting(true);
     resetFeedback();
     try {
-      await EduService.resetPasswordWithOtp(activeChallenge.challengeId, otpCode.trim(), forgotPasswordForm.password, true);
-      await refreshSession();
-      setActiveChallenge(null);
-      setOtpCode('');
+      await requestPasswordReset(normalizedEmail);
+      setResetSentTo(normalizedEmail);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to reset password');
+      setError(err instanceof Error ? err.message : 'Unable to send reset email');
     } finally {
       setSubmitting(false);
     }
@@ -1940,7 +1858,10 @@ const AuthScreen = () => {
         }
         await EduService.socialLogin(sessionConflict.socialProvider, sessionConflict.socialIdToken, { forceLogoutOtherSessions: true });
       } else {
-        await EduService.login(sessionConflict.identifier, sessionConflict.password, { forceLogoutOtherSessions: true });
+        await login(sessionConflict.identifier, sessionConflict.password, {
+          forceLogoutOtherSessions: true,
+          rememberMe,
+        });
       }
       setTakeoverSuccess({
         device: takeOverDevice,
@@ -1966,26 +1887,6 @@ const AuthScreen = () => {
     }
   };
 
-  const renderBrandMark = (large = false) => (
-    <div className="flex flex-col items-center text-center">
-      <div className={cn(
-        'relative flex items-center justify-center overflow-hidden rounded-[24px] border border-[#d7e3f2] bg-[linear-gradient(180deg,#ffffff_0%,#eaf4ff_100%)] shadow-[0_16px_34px_rgba(47,111,228,0.14)]',
-        large ? 'h-[62px] w-[62px] sm:h-[92px] sm:w-[92px]' : 'h-[88px] w-[88px]',
-      )}>
-        <img
-          src="/favicon.svg"
-          alt="VARONENGLISH"
-          className={cn('object-contain drop-shadow-[0_10px_20px_rgba(47,111,228,0.18)]', large ? 'h-[46px] w-[46px] sm:h-[66px] sm:w-[66px]' : 'h-[60px] w-[60px]')}
-          draggable="false"
-        />
-      </div>
-      <p className={cn('mt-2 font-bold tracking-[0.02em] text-[#17233d]', large ? 'text-[18px] sm:text-[28px]' : 'text-[24px]')}>VARONENGLISH</p>
-      <p className="mt-0.5 text-[8px] font-semibold uppercase tracking-[0.24em] text-[#657792] sm:text-[11px] sm:tracking-[0.32em]">
-        FOR COMPETITIVE EXAMS
-      </p>
-    </div>
-  );
-
   const renderAuthHeader = () => (
     <div className="relative overflow-hidden border-b border-[#e3ecf7] bg-[linear-gradient(180deg,#ffffff_0%,#f1f7ff_100%)] px-6 pb-5 pt-9 sm:px-8 sm:pb-7 sm:pt-8">
       <div className="absolute right-6 top-5 grid grid-cols-4 gap-2 opacity-70">
@@ -1997,14 +1898,6 @@ const AuthScreen = () => {
         <button
           type="button"
           onClick={() => {
-            if (mode === 'register-otp') {
-              switchMode('register');
-              return;
-            }
-            if (mode === 'login-otp' || mode === 'forgot-password' || mode === 'reset-password') {
-              switchMode('login');
-              return;
-            }
             switchMode('login');
           }}
           className="absolute left-6 top-8 inline-flex h-9 w-9 items-center justify-center rounded-full border border-[#d7e3f2] bg-white text-[#17233d] shadow-[0_8px_18px_rgba(47,111,228,0.08)]"
@@ -2012,100 +1905,8 @@ const AuthScreen = () => {
           <ChevronLeft className="h-5 w-5" />
         </button>
       )}
-      {renderBrandMark(true)}
+      <BrandLogo size="lg" className="justify-center" />
     </div>
-  );
-
-  const renderOtpChannelSelector = (
-    value: 'email' | 'sms',
-    onChange: (channel: 'email' | 'sms') => void,
-    smsDisabled = false,
-  ) => (
-    <div className="grid grid-cols-2 gap-2">
-      {[
-        { key: 'email' as const, label: 'Email OTP', icon: Mail, disabled: false },
-        { key: 'sms' as const, label: 'SMS OTP', icon: Phone, disabled: smsDisabled },
-      ].map((option) => (
-        <button
-          key={option.key}
-          type="button"
-          disabled={option.disabled}
-          onClick={() => onChange(option.key)}
-          className={cn(
-            'flex h-11 items-center justify-center gap-2 rounded-[14px] border text-[13px] font-semibold transition',
-            value === option.key
-              ? 'border-[#2f6fe4] bg-[#eef4ff] text-[#2f6fe4]'
-              : 'border-[#d7e3f2] bg-white text-[#53647d]',
-            option.disabled && 'cursor-not-allowed opacity-50',
-          )}
-        >
-          <option.icon className="h-4 w-4" />
-          {option.label}
-        </button>
-      ))}
-    </div>
-  );
-
-  const renderOtpVerificationForm = ({
-    title,
-    body,
-    submitLabel,
-    onSubmit,
-    onResend,
-  }: {
-    title: string;
-    body: string;
-    submitLabel: string;
-    onSubmit: () => Promise<void>;
-    onResend?: () => Promise<void>;
-  }) => (
-    <>
-      <div>
-        <h1 className="!font-sans max-w-[320px] text-[24px] font-bold leading-[1.18] text-[#17233d] sm:max-w-none sm:text-[28px]">{title}</h1>
-        <p className="mt-2 text-[14px] leading-6 text-[#53647d] sm:text-[15px]">{body}</p>
-      </div>
-
-      {otpHint && (
-        <div className="mt-4 rounded-[14px] border border-[#bfdbfe] bg-[#eff6ff] px-4 py-3 text-[13px] leading-6 text-[#1d4ed8]">
-          {otpHint}
-        </div>
-      )}
-
-      <form
-        className="mt-4 space-y-3"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void onSubmit();
-        }}
-      >
-        <div>
-          <label className="text-[13px] font-bold text-[#17233d]">One-Time Password</label>
-          <div className="relative mt-2">
-            <ShieldCheck className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-[#7b8da6]" />
-            <input
-              type="text"
-              inputMode="numeric"
-              value={otpCode}
-              onChange={(event) => setOtpCode(event.target.value.replace(/\D/g, '').slice(0, 6))}
-              className={authInputClassName}
-              placeholder="Enter 6-digit OTP"
-              autoComplete="one-time-code"
-            />
-          </div>
-        </div>
-
-        <button type="submit" disabled={submitting} className={primaryButtonClassName}>
-          <span>{submitting ? <LoaderCircle className="h-5 w-5 animate-spin" /> : submitLabel}</span>
-          {!submitting && <ArrowRight className="absolute right-6 h-5 w-5" />}
-        </button>
-      </form>
-
-      {onResend && (
-        <button type="button" onClick={() => void onResend()} disabled={submitting} className="mt-4 text-[13px] font-bold text-[#2f6fe4]">
-          Resend OTP
-        </button>
-      )}
-    </>
   );
 
   const renderLoginForm = () => (
@@ -2115,41 +1916,15 @@ const AuthScreen = () => {
         <p className="mt-2 text-[14px] leading-6 text-[#53647d] sm:text-[15px]">Login to continue your exam preparation.</p>
       </div>
 
-      <div className="mt-4 grid grid-cols-2 gap-2 rounded-[16px] border border-[#dbe6f3] bg-[#f8fbff] p-1">
-        {[
-          { key: 'password' as const, label: 'Password' },
-          { key: 'otp' as const, label: 'OTP Login' },
-        ].map((option) => (
-          <button
-            key={option.key}
-            type="button"
-            onClick={() => {
-              setLoginMethod(option.key);
-              resetFeedback();
-            }}
-            className={cn(
-              'rounded-[12px] px-3 py-2 text-[13px] font-semibold transition',
-              loginMethod === option.key ? 'bg-white text-[#17233d] shadow-[0_10px_20px_rgba(47,111,228,0.10)]' : 'text-[#53647d]',
-            )}
-          >
-            {option.label}
-          </button>
-        ))}
-      </div>
-
       <form
         className="mt-4 space-y-3"
         onSubmit={(event) => {
           event.preventDefault();
-          if (loginMethod === 'otp') {
-            void submitLoginOtpRequest();
-            return;
-          }
           void submitLogin();
         }}
       >
         <div>
-          <label className="text-[13px] font-bold text-[#17233d]">Email or Mobile Number</label>
+          <label className="text-[13px] font-bold text-[#17233d]">Email Address</label>
           <div className="relative mt-2">
             <Mail className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-[#7b8da6]" />
             <input
@@ -2158,63 +1933,64 @@ const AuthScreen = () => {
               value={loginForm.identifier}
               onChange={(event) => setLoginForm((current) => ({ ...current, identifier: event.target.value }))}
               className={authInputClassName}
-              placeholder="Enter your email or mobile number"
+              placeholder="Enter your email address"
               autoComplete="username"
             />
           </div>
         </div>
 
-        {loginMethod === 'password' ? (
-          <div>
-            <div className="flex items-center justify-between gap-3">
-              <label className="text-[13px] font-bold text-[#17233d]">Password</label>
-              <button type="button" onClick={() => switchMode('forgot-password')} className="text-[12px] font-bold text-[#2f6fe4]">Forgot Password?</button>
-            </div>
-            <div className="relative mt-2">
-              <Lock className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-[#7b8da6]" />
-              <input
-                data-testid="auth-login-password"
-                type={showLoginPassword ? 'text' : 'password'}
-                value={loginForm.password}
-                onChange={(event) => setLoginForm((current) => ({ ...current, password: event.target.value }))}
-                className={authInputClassName}
-                placeholder="Enter your password"
-                autoComplete="current-password"
-              />
-              <button
-                type="button"
-                aria-label={showLoginPassword ? 'Hide password' : 'Show password'}
-                onClick={() => setShowLoginPassword((current) => !current)}
-                className="absolute right-4 top-1/2 -translate-y-1/2 text-[#7b8da6]"
-              >
-                {showLoginPassword ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
-              </button>
-            </div>
-          </div>
-        ) : (
-          <div className="space-y-2">
-            <label className="text-[13px] font-bold text-[#17233d]">Where should we send the OTP?</label>
-            {renderOtpChannelSelector(loginForm.channel, (channel) => setLoginForm((current) => ({ ...current, channel })), !smsOtpEnabled)}
-          </div>
-        )}
-
-        {loginMethod === 'password' && (
-          <label className="flex items-center gap-3 text-[13px] font-medium text-[#53647d]">
+        <div>
+          <label className="text-[13px] font-bold text-[#17233d]">Password</label>
+          <div className="relative mt-2">
+            <Lock className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-[#7b8da6]" />
+            <input
+              data-testid="auth-login-password"
+              type={showLoginPassword ? 'text' : 'password'}
+              value={loginForm.password}
+              onChange={(event) => setLoginForm((current) => ({ ...current, password: event.target.value }))}
+              className={authInputClassName}
+              placeholder="Enter your password"
+              autoComplete="current-password"
+            />
             <button
               type="button"
-              aria-pressed={rememberMe}
-              aria-label="Remember me"
-              onClick={() => setRememberMe((current) => !current)}
-              className={cn(
-                'flex h-5 w-5 items-center justify-center rounded-[6px] border transition',
-                rememberMe ? 'border-[#2f6fe4] bg-[#2f6fe4] text-white' : 'border-[#c8d6ea] bg-white text-transparent',
-              )}
+              aria-label={showLoginPassword ? 'Hide password' : 'Show password'}
+              onClick={() => setShowLoginPassword((current) => !current)}
+              className="absolute right-4 top-1/2 -translate-y-1/2 text-[#7b8da6]"
             >
-              <Check className="h-3.5 w-3.5" />
+              {showLoginPassword ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
             </button>
-            Remember me
-          </label>
-        )}
+          </div>
+        </div>
+
+        <label className="flex items-center gap-3 text-[13px] font-medium text-[#53647d]">
+          <button
+            type="button"
+            aria-pressed={rememberMe}
+            aria-label="Remember me"
+            onClick={() => setRememberMe((current) => !current)}
+            className={cn(
+              'flex h-5 w-5 items-center justify-center rounded-[6px] border transition',
+              rememberMe ? 'border-[#2f6fe4] bg-[#2f6fe4] text-white' : 'border-[#c8d6ea] bg-white text-transparent',
+            )}
+          >
+            <Check className="h-3.5 w-3.5" />
+          </button>
+          Remember me
+        </label>
+
+        <div className="flex justify-end">
+          <button
+            type="button"
+            onClick={() => {
+              setResetEmail(loginForm.identifier);
+              switchMode('forgot-password');
+            }}
+            className="text-[13px] font-bold text-[#2f6fe4]"
+          >
+            Forgot password?
+          </button>
+        </div>
 
         <button
           data-testid="auth-login-submit"
@@ -2222,7 +1998,7 @@ const AuthScreen = () => {
           disabled={submitting}
           className={primaryButtonClassName}
         >
-          <span>{submitting ? <LoaderCircle className="h-5 w-5 animate-spin" /> : loginMethod === 'password' ? 'Login' : 'Send OTP'}</span>
+          <span>{submitting ? <LoaderCircle className="h-5 w-5 animate-spin" /> : 'Login'}</span>
           {!submitting && <ArrowRight className="absolute right-6 h-5 w-5" />}
         </button>
       </form>
@@ -2303,30 +2079,6 @@ const AuthScreen = () => {
               autoComplete="email"
             />
           </div>
-        </div>
-
-        <div>
-          <label className="text-[13px] font-bold text-[#17233d]">Mobile Number (Optional)</label>
-          <div className="relative mt-2">
-            <Phone className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-[#7b8da6]" />
-            <input
-              type="tel"
-              value={registerForm.mobileNumber}
-              onChange={(event) => setRegisterForm((current) => ({ ...current, mobileNumber: event.target.value }))}
-              className={authInputClassName}
-              placeholder="Enter your mobile number"
-              autoComplete="tel"
-            />
-          </div>
-        </div>
-
-        <div className="space-y-2">
-          <label className="text-[13px] font-bold text-[#17233d]">Send verification OTP via</label>
-          {renderOtpChannelSelector(
-            registerForm.channel,
-            (channel) => setRegisterForm((current) => ({ ...current, channel })),
-            !smsOtpEnabled || !registerForm.mobileNumber.trim(),
-          )}
         </div>
 
         <div>
@@ -2440,139 +2192,74 @@ const AuthScreen = () => {
   const renderForgotPasswordForm = () => (
     <>
       <div>
-        <h1 className="!font-sans max-w-[320px] text-[24px] font-bold leading-[1.18] text-[#17233d] sm:max-w-none sm:text-[28px]">Reset your password</h1>
-        <p className="mt-2 text-[14px] leading-6 text-[#53647d] sm:text-[15px]">We&apos;ll verify your email or mobile number with an OTP before changing the password.</p>
+        <h1 className="!font-sans max-w-[300px] text-[24px] font-bold leading-[1.18] text-[#17233d] sm:max-w-none sm:text-[28px]">Reset your password</h1>
+        <p className="mt-2 text-[14px] leading-6 text-[#53647d] sm:text-[15px]">We&apos;ll send a secure reset link to your email address.</p>
       </div>
 
       <form
-        className="mt-4 space-y-3"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void submitForgotPasswordRequest();
-        }}
-      >
-        <div>
-          <label className="text-[13px] font-bold text-[#17233d]">Email or Mobile Number</label>
-          <div className="relative mt-2">
-            <Mail className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-[#7b8da6]" />
-            <input
-              type="text"
-              value={forgotPasswordForm.identifier}
-              onChange={(event) => setForgotPasswordForm((current) => ({ ...current, identifier: event.target.value }))}
-              className={authInputClassName}
-              placeholder="Enter your email or mobile number"
-            />
-          </div>
-        </div>
-
-        <div className="space-y-2">
-          <label className="text-[13px] font-bold text-[#17233d]">Send reset OTP via</label>
-          {renderOtpChannelSelector(forgotPasswordForm.channel, (channel) => setForgotPasswordForm((current) => ({ ...current, channel })), !smsOtpEnabled)}
-        </div>
-
-        <button type="submit" disabled={submitting} className={primaryButtonClassName}>
-          <span>{submitting ? <LoaderCircle className="h-5 w-5 animate-spin" /> : 'Send Reset OTP'}</span>
-          {!submitting && <ArrowRight className="absolute right-6 h-5 w-5" />}
-        </button>
-      </form>
-    </>
-  );
-
-  const renderResetPasswordForm = () => (
-    <>
-      <div>
-        <h1 className="!font-sans max-w-[320px] text-[24px] font-bold leading-[1.18] text-[#17233d] sm:max-w-none sm:text-[28px]">Create a new password</h1>
-        <p className="mt-2 text-[14px] leading-6 text-[#53647d] sm:text-[15px]">Verify the OTP and set a new password. We&apos;ll log you in right after a successful reset.</p>
-      </div>
-
-      {otpHint && (
-        <div className="mt-4 rounded-[14px] border border-[#bfdbfe] bg-[#eff6ff] px-4 py-3 text-[13px] leading-6 text-[#1d4ed8]">
-          {otpHint}
-        </div>
-      )}
-
-      <form
-        className="mt-4 space-y-3"
+        className="mt-4 space-y-4"
         onSubmit={(event) => {
           event.preventDefault();
           void submitPasswordReset();
         }}
       >
         <div>
-          <label className="text-[13px] font-bold text-[#17233d]">OTP</label>
+          <label className="text-[13px] font-bold text-[#17233d]">Email Address</label>
           <div className="relative mt-2">
-            <ShieldCheck className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-[#7b8da6]" />
+            <Mail className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-[#7b8da6]" />
             <input
-              type="text"
-              inputMode="numeric"
-              value={otpCode}
-              onChange={(event) => setOtpCode(event.target.value.replace(/\D/g, '').slice(0, 6))}
+              data-testid="auth-reset-email"
+              type="email"
+              value={resetEmail}
+              onChange={(event) => setResetEmail(event.target.value)}
               className={authInputClassName}
-              placeholder="Enter 6-digit OTP"
+              placeholder="Enter your email address"
+              autoComplete="email"
             />
           </div>
         </div>
 
-        <div>
-          <label className="text-[13px] font-bold text-[#17233d]">New Password</label>
-          <div className="relative mt-2">
-            <Lock className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-[#7b8da6]" />
-            <input
-              type={showResetPassword ? 'text' : 'password'}
-              value={forgotPasswordForm.password}
-              onChange={(event) => setForgotPasswordForm((current) => ({ ...current, password: event.target.value }))}
-              className={authInputClassName}
-              placeholder="Enter your new password"
-              autoComplete="new-password"
-            />
-            <button type="button" onClick={() => setShowResetPassword((current) => !current)} className="absolute right-4 top-1/2 -translate-y-1/2 text-[#7b8da6]">
-              {showResetPassword ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
-            </button>
-          </div>
-        </div>
-
-        <div>
-          <label className="text-[13px] font-bold text-[#17233d]">Confirm Password</label>
-          <div className="relative mt-2">
-            <Lock className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-[#7b8da6]" />
-            <input
-              type={showResetConfirmPassword ? 'text' : 'password'}
-              value={forgotPasswordForm.confirmPassword}
-              onChange={(event) => setForgotPasswordForm((current) => ({ ...current, confirmPassword: event.target.value }))}
-              className={authInputClassName}
-              placeholder="Confirm your new password"
-              autoComplete="new-password"
-            />
-            <button type="button" onClick={() => setShowResetConfirmPassword((current) => !current)} className="absolute right-4 top-1/2 -translate-y-1/2 text-[#7b8da6]">
-              {showResetConfirmPassword ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
-            </button>
-          </div>
-        </div>
-
-        <button type="submit" disabled={submitting} className={primaryButtonClassName}>
-          <span>{submitting ? <LoaderCircle className="h-5 w-5 animate-spin" /> : 'Verify OTP & Reset Password'}</span>
+        <button
+          data-testid="auth-reset-submit"
+          type="submit"
+          disabled={submitting}
+          className={primaryButtonClassName}
+        >
+          <span>{submitting ? <LoaderCircle className="h-5 w-5 animate-spin" /> : 'Send reset link'}</span>
           {!submitting && <ArrowRight className="absolute right-6 h-5 w-5" />}
         </button>
       </form>
+
+      {resetSentTo && (
+        <div className="mt-4 rounded-[14px] border border-[#ccebd7] bg-[#effcf4] px-4 py-3 text-[14px] font-medium text-[#116b43]">
+          Password reset link sent to {resetSentTo}.
+        </div>
+      )}
+
+      <p className="mt-4 text-center text-[13px] font-medium text-[#657792]">
+        Remembered your password?{' '}
+        <button
+          type="button"
+          onClick={() => {
+            switchMode('login');
+          }}
+          className="font-bold text-[#2f6fe4]"
+        >
+          Back to login
+        </button>
+      </p>
     </>
   );
 
   return (
     <div className="relative min-h-dvh overflow-x-hidden overflow-y-auto bg-[#d3daec] text-[#17233d]" style={{ fontFamily: LIVE_FONT_STACK }}>
       <div className="absolute inset-0 bg-[radial-gradient(circle_at_14%_8%,rgba(255,255,255,0.72),transparent_24%),radial-gradient(circle_at_85%_14%,rgba(47,111,228,0.13),transparent_22%),linear-gradient(180deg,#d3daec_0%,#edf4ff_58%,#d3daec_100%)]" />
-
       <div className="relative mx-auto flex min-h-dvh w-full max-w-7xl items-center justify-center px-0 py-0 sm:px-4 sm:py-6 lg:px-8">
         <div className="grid w-full max-w-[1260px] gap-8 lg:grid-cols-[0.86fr_1.14fr] lg:items-center">
           <section className="hidden lg:block">
             <div className="rounded-[28px] border border-[#d8e5f5] bg-white/88 p-8 shadow-[0_24px_70px_rgba(37,73,125,0.16)] backdrop-blur">
               <div className="flex items-center gap-5">
-                <div className="flex h-20 w-20 items-center justify-center rounded-[22px] border border-[#d7e3f2] bg-[#eef6ff]">
-                  <img src="/favicon.svg" alt="VARONENGLISH" className="h-14 w-14 object-contain" />
-                </div>
-                <div>
-                  <p className="font-serif text-[34px] font-black tracking-[0.04em] text-[#17233d]">VARONENGLISH</p>
-                  <p className="mt-1 text-[14px] font-semibold uppercase tracking-[0.28em] text-[#657792]">FOR COMPETITIVE EXAMS</p>
-                </div>
+                <BrandLogo size="lg" />
               </div>
 
               <div className="mt-10 grid gap-4 text-sm text-[#53647d]">
@@ -2600,28 +2287,7 @@ const AuthScreen = () => {
               <div className="px-6 pb-6 pt-5 sm:px-8 sm:pb-8 sm:pt-7">
                 {mode === 'login' && renderLoginForm()}
                 {mode === 'register' && renderRegisterForm()}
-                {mode === 'register-otp' && renderOtpVerificationForm({
-                  title: 'Verify your account',
-                  body: 'Enter the OTP we sent to activate your account and continue into the platform.',
-                  submitLabel: 'Verify & Continue',
-                  onSubmit: submitRegistrationOtp,
-                  onResend: submitRegister,
-                })}
-                {mode === 'login-otp' && renderOtpVerificationForm({
-                  title: 'Login with OTP',
-                  body: 'Enter the OTP from your email or phone to continue without using a password.',
-                  submitLabel: 'Verify & Login',
-                  onSubmit: submitLoginOtpVerification,
-                  onResend: submitLoginOtpRequest,
-                })}
                 {mode === 'forgot-password' && renderForgotPasswordForm()}
-                {mode === 'reset-password' && renderResetPasswordForm()}
-
-                {notice && (
-                  <div className="mt-5 rounded-[14px] border border-[#bfdbfe] bg-[#eff6ff] px-4 py-3 text-[14px] font-medium text-[#1d4ed8]">
-                    {notice}
-                  </div>
-                )}
 
                 {error && (
                   <div className="mt-5 rounded-[14px] border border-[#fecaca] bg-[#fff1f2] px-4 py-3 text-[14px] font-medium text-[#b42318]">
@@ -2841,8 +2507,8 @@ const Shell = ({
   setActiveTab: (tab: TabKey) => void;
   onLogout: () => Promise<void>;
   onRefresh: () => Promise<void>;
-  resumeTarget: { courseId: string; lessonId?: string | null } | null;
-  onContinueLearningNavigate: (courseId: string, lessonId?: string | null) => void;
+  resumeTarget: { courseId: string; lessonId?: string | null; doubtThreadId?: string | null } | null;
+  onContinueLearningNavigate: (courseId: string, lessonId?: string | null, doubtThreadId?: string | null) => void;
   onOpenNotification: (notification: NotificationItem) => void;
   onResumeNavigationHandled: () => void;
   savedTopicIds: string[];
@@ -2863,7 +2529,9 @@ const Shell = ({
   const [isImmersiveTestsFlow, setIsImmersiveTestsFlow] = useState(false);
   const [pendingLiveClassId, setPendingLiveClassId] = useState<string | null>(null);
   const [activeCourseCbtLaunch, setActiveCourseCbtLaunch] = useState<{ test: MockTest; onSubmitted?: () => void } | null>(null);
+  const [toastNotifications, setToastNotifications] = useState<NotificationItem[]>([]);
   const searchContainerRef = useRef<HTMLDivElement | null>(null);
+  const seenNotificationIdsRef = useRef<Set<string>>(new Set());
 
   const visibleTabs = tabs.filter((tab) => tab.id !== 'admin' || isAdmin);
   const overviewSidebarTabs = useMemo(
@@ -3007,6 +2675,44 @@ const Shell = ({
     }
   }, []);
 
+  useEffect(() => {
+    const incomingIds = new Set((overview.notifications || []).map((notification) => notification._id));
+    const seenIds = seenNotificationIdsRef.current;
+
+    if (seenIds.size === 0) {
+      seenNotificationIdsRef.current = incomingIds;
+      return;
+    }
+
+    const freshNotifications = (overview.notifications || [])
+      .filter((notification) => !seenIds.has(notification._id))
+      .slice(0, 4);
+
+    if (freshNotifications.length > 0) {
+      setToastNotifications((current) => {
+        const existing = new Set(current.map((notification) => notification._id));
+        return [...freshNotifications.filter((notification) => !existing.has(notification._id)), ...current].slice(0, 4);
+      });
+    }
+
+    seenNotificationIdsRef.current = incomingIds;
+  }, [overview.notifications]);
+
+  useEffect(() => {
+    if (!toastNotifications.length) {
+      return undefined;
+    }
+
+    const timers = toastNotifications.map((notification) =>
+      window.setTimeout(() => {
+        setToastNotifications((current) => current.filter((item) => item._id !== notification._id));
+      }, 6000));
+
+    return () => {
+      timers.forEach((timer) => window.clearTimeout(timer));
+    };
+  }, [toastNotifications]);
+
   const handleSearchTargetSelect = (target: SearchTarget) => {
     setSearchQuery('');
     setIsSearchOpen(false);
@@ -3014,7 +2720,7 @@ const Shell = ({
 
     if (target.kind === 'course' || target.kind === 'lesson' || target.kind === 'saved') {
       setActiveTab('courses');
-      onContinueLearningNavigate(target.courseId, target.lessonId || null);
+      onContinueLearningNavigate(target.courseId, target.lessonId || null, null);
       return;
     }
 
@@ -3047,7 +2753,7 @@ const Shell = ({
       }
 
       if (target.tab === 'courses' && target.courseId) {
-        onContinueLearningNavigate(target.courseId, target.lessonId || null);
+        onContinueLearningNavigate(target.courseId, target.lessonId || null, target.doubtThreadId || null);
       }
 
       return;
@@ -3083,7 +2789,7 @@ const Shell = ({
   const renderActiveTab = () => {
     if (activeTab === 'overview') {
       return (
-          <OverviewFigmaTab
+        <OverviewFigmaTab
           overview={overview}
           onContinueLearning={(courseId, lessonId) => {
             onContinueLearningNavigate(courseId, lessonId);
@@ -3093,7 +2799,6 @@ const Shell = ({
           onOpenTestsTab={() => setActiveTab('tests')}
           onOpenRevisionTab={() => setActiveTab('revision')}
           onOpenCoursesTab={() => setActiveTab('courses')}
-          onOpenNotification={handleNotificationOpen}
         />
       );
     }
@@ -3105,6 +2810,7 @@ const Shell = ({
           onRefresh={onRefresh}
           initialCourseId={resumeTarget?.courseId}
           initialLessonId={resumeTarget?.lessonId || null}
+          initialDoubtThreadId={resumeTarget?.doubtThreadId || null}
           onResumeNavigationHandled={onResumeNavigationHandled}
           savedTopicIds={savedTopicIds}
           onToggleSavedTopic={onToggleSavedTopic}
@@ -3178,24 +2884,41 @@ const Shell = ({
             style={{ fontFamily: 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif' }}
           >
             <div>
-              <div className="flex items-center justify-between gap-3 px-2">
-                <div className="min-w-0">
-                  <BrandLogo tone="light" size="sm" />
-                  <p className="mt-[4px] text-[11px] leading-none text-[#7b8cab]">Competitive exam platform</p>
-                </div>
-                <button
-                  type="button"
-                  onClick={openNotifications}
-                  className="relative flex h-[38px] w-[38px] shrink-0 items-center justify-center rounded-[14px] border border-[#dbe5f4] bg-white text-[#53647d] shadow-[0_10px_24px_rgba(31,45,78,0.06)] transition hover:border-[#bdd4f7] hover:text-[#1b5fe3]"
-                  aria-label="Open notifications"
-                >
-                  <BellRing className="h-[18px] w-[18px]" />
-                  {overview.notifications.length > 0 && (
-                    <span className="absolute -right-1 -top-1 flex h-[17px] min-w-[17px] items-center justify-center rounded-full bg-[#2f6fe4] px-1 text-[9px] font-bold text-white">
-                      {overview.notifications.length}
+              <div className="px-2">
+                <BrandLogo tone="light" size="sm" />
+                <p className="mt-[4px] text-[11px] leading-none text-[#7b8cab]">Competitive exam platform</p>
+                <div className="mt-4 grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={openProfileEditor}
+                    className="flex items-center gap-2 rounded-[16px] border border-[#dbe5f4] bg-white px-3 py-2 text-left text-[#20335c] shadow-[0_10px_24px_rgba(31,45,78,0.05)] transition hover:border-[#bdd4f7]"
+                    aria-label="Open profile editor"
+                  >
+                    <span className="flex h-[28px] w-[28px] items-center justify-center rounded-[10px] bg-[#edf4ff] text-[11px] font-bold text-[#1b5fe3]">
+                      {buildInitials(learnerName)}
                     </span>
-                  )}
-                </button>
+                    <span className="min-w-0">
+                      <span className="block text-[10px] uppercase tracking-[0.18em] text-[#8b9ab3]">Account</span>
+                      <span className="block truncate text-[12px] font-semibold">Profile</span>
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={openNotifications}
+                    className="relative flex items-center gap-2 rounded-[16px] border border-[#dbe5f4] bg-white px-3 py-2 text-left text-[#20335c] shadow-[0_10px_24px_rgba(31,45,78,0.05)] transition hover:border-[#bdd4f7]"
+                    aria-label="Open notifications"
+                  >
+                    <span className="flex h-[28px] w-[28px] items-center justify-center rounded-[10px] bg-[#f5f8ff] text-[#53647d]">
+                      <BellRing className="h-[15px] w-[15px]" />
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block text-[10px] uppercase tracking-[0.18em] text-[#8b9ab3]">Alerts</span>
+                      <span className="block truncate text-[12px] font-semibold">
+                        {overview.notifications.length > 0 ? `${overview.notifications.length} new` : 'All clear'}
+                      </span>
+                    </span>
+                  </button>
+                </div>
               </div>
 
               <div className="relative mt-5">
@@ -3233,15 +2956,8 @@ const Shell = ({
 
               <div className="mt-5 rounded-[20px] border border-[#e3ebf7] bg-[linear-gradient(180deg,#f8fbff_0%,#eef5ff_100%)] px-[14px] py-[16px] shadow-[0_16px_34px_rgba(31,45,78,0.06)]">
                 <p className="text-[9px] font-semibold uppercase tracking-[0.22em] text-[#8b9ab3]">Current learner</p>
-                <div className="mt-[14px] flex items-center gap-[12px]">
-                  <div className="flex h-[42px] w-[42px] items-center justify-center rounded-[15px] bg-white text-[#2563eb] shadow-[0_10px_22px_rgba(37,99,235,0.08)]">
-                    <span className="text-[13px] font-semibold">{buildInitials(learnerName)}</span>
-                  </div>
-                  <div className="min-w-0">
-                    <p className="truncate text-[13px] font-semibold text-[#20335c]">{learnerName}</p>
-                    <p className="text-[12px] text-[#7b8cab]">{learnerLevel}</p>
-                  </div>
-                </div>
+                <p className="mt-[10px] truncate text-[14px] font-semibold text-[#20335c]">{learnerName}</p>
+                <p className="mt-[2px] text-[12px] text-[#7b8cab]">{learnerLevel}</p>
 
                 <div className="mt-[16px] grid grid-cols-2 gap-[10px] text-[11px]">
                   {sidebarStats.map((stat) => (
@@ -3335,6 +3051,7 @@ const Shell = ({
               <div className="flex items-center gap-4">
                 <button
                   type="button"
+                  data-testid="mobile-nav-more"
                   onClick={() => {
                     setIsMobileMoreOpen(true);
                     setIsSearchOpen(false);
@@ -3401,10 +3118,9 @@ const Shell = ({
 
           {isLiveWorkspace && !isImmersiveWorkspace && (
             <div className="hidden border-b border-[#edf2fb] bg-white px-4 py-5 lg:block lg:px-8">
-              <div className="mx-auto flex w-full max-w-[1460px] items-center justify-between gap-4">
+              <div className="mx-auto flex w-full max-w-[1460px] items-center gap-4">
                 <div className="flex min-w-0 flex-1 items-center gap-4">
-                  <div className="hidden h-10 w-px bg-[#edf2fb] lg:block" />
-                  <div className="flex min-w-0 flex-1 items-center gap-3 rounded-[18px] border border-[#e9eff8] bg-[#fbfcff] px-5 py-3 shadow-[0_10px_24px_rgba(15,23,42,0.04)] lg:max-w-[520px]">
+                  <div className="flex min-w-0 flex-1 items-center gap-3 rounded-[18px] border border-[#e9eff8] bg-[#fbfcff] px-5 py-3 shadow-[0_10px_24px_rgba(15,23,42,0.04)] lg:max-w-[640px]">
                     <Search className="h-5 w-5 text-[#6f82a5]" />
                     <input
                       value={searchQuery}
@@ -3422,32 +3138,6 @@ const Shell = ({
                     <span className="hidden rounded-[10px] border border-[#e5ebf6] bg-white px-2.5 py-1 text-[12px] font-semibold text-[#7b8cab] sm:inline-flex">
                       ⌘ K
                     </span>
-                  </div>
-                </div>
-                <div className="flex items-center gap-4">
-                  <button
-                    type="button"
-	                  onClick={() => {
-	                    if (overview.notifications[0]) {
-	                      handleNotificationOpen(overview.notifications[0]);
-	                    }
-	                  }}
-                    className="relative flex h-11 w-11 items-center justify-center rounded-full text-[#20335c]"
-                  >
-                    <BellRing className="h-5 w-5" />
-                    <span className="absolute right-0 top-0 flex h-4 min-w-4 items-center justify-center rounded-full bg-[#ff4d5d] px-1 text-[9px] font-semibold text-white">
-                      {overview.notifications.length}
-                    </span>
-                  </button>
-                  <div className="flex items-center gap-3 rounded-full pl-1">
-                    <div className="flex h-12 w-12 items-center justify-center rounded-full bg-[linear-gradient(135deg,#dce8ff_0%,#7ea7ff_100%)] text-sm font-semibold text-[#22375e] shadow-[0_10px_24px_rgba(15,23,42,0.08)]">
-                      {buildInitials(user?.name || 'Learner')}
-                    </div>
-                    <div className="hidden sm:block">
-                      <p className="text-[15px] font-semibold text-[#1f2d4e]">{user?.name || 'Learner'}</p>
-                      <p className="text-[13px] text-[#7b8cab]">{isAdmin ? 'Teacher' : 'Aspirant'}</p>
-                    </div>
-                    <ChevronDown className="hidden h-4 w-4 text-[#7b8cab] sm:block" />
                   </div>
                 </div>
               </div>
@@ -3585,6 +3275,16 @@ const Shell = ({
                 onClose={() => setIsProfileEditorOpen(false)}
                 onSave={() => void saveProfile()}
               />
+              <InAppNotificationToasts
+                notifications={toastNotifications}
+                onOpen={(notification) => {
+                  setToastNotifications((current) => current.filter((item) => item._id !== notification._id));
+                  handleNotificationOpen(notification);
+                }}
+                onDismiss={(notificationId) => {
+                  setToastNotifications((current) => current.filter((item) => item._id !== notificationId));
+                }}
+              />
 
               <div
                 className="pointer-events-none fixed inset-x-0 bottom-0 z-30 border-t border-[#e5ebf4] bg-white px-5 pt-2 shadow-[0_-12px_34px_rgba(15,23,42,0.08)] lg:hidden"
@@ -3634,14 +3334,12 @@ const OverviewTab = ({
   savedTopics: SavedTopic[];
 }) => {
   const learnerName = overview.user?.name || 'Learner';
-  const learnerInitials = buildInitials(learnerName);
   const enrolledCourses = overview.courses.filter((course) => course.enrolled);
   const continueCourse = overview.dashboard.continueLearning[0] || enrolledCourses[0] || overview.courses[0] || null;
   const secondaryCourse = overview.dashboard.continueLearning[1] || enrolledCourses[1] || overview.courses[1] || null;
   const activeCourses = [continueCourse, secondaryCourse].filter(
     (course, index, items): course is NonNullable<typeof course> => Boolean(course) && items.findIndex((item) => item?._id === course?._id) === index,
   );
-  const actionQueueNotification = overview.notifications[0] || null;
   const nextLiveClass = overview.liveClasses.find((liveClass) => {
     const state = `${liveClass.status || ''} ${liveClass.mode || ''}`.toLowerCase();
     return state.includes('live') || state.includes('scheduled') || state.includes('upcoming');
@@ -3724,29 +3422,6 @@ const OverviewTab = ({
               <span className="hidden sm:inline">Search...</span>
               <span className="sm:hidden">Search</span>
             </button>
-            <button
-              type="button"
-              data-testid="overview-notification-button"
-              onClick={() => {
-                if (actionQueueNotification) {
-                  onOpenNotification(actionQueueNotification);
-                }
-              }}
-              className="relative flex h-11 w-11 items-center justify-center rounded-full border border-white/80 bg-white/72 text-[var(--ink-soft)] shadow-[0_10px_24px_rgba(15,23,42,0.07)] backdrop-blur transition hover:text-[var(--ink)]"
-              aria-label="Open notifications"
-            >
-              <BellRing className="h-5 w-5" />
-              <span className="absolute -right-1 -top-1 flex h-5 min-w-5 items-center justify-center rounded-full bg-[var(--accent-rust)] px-1 text-[10px] font-semibold text-white">
-                {overview.notifications.length}
-              </span>
-            </button>
-            <div
-              data-testid="overview-profile-avatar"
-              className="flex h-11 w-11 items-center justify-center rounded-full border border-white/80 bg-[linear-gradient(135deg,#6b9cff_0%,#2b63df_100%)] text-sm font-semibold text-white shadow-[0_10px_24px_rgba(15,23,42,0.08)]"
-              title={learnerName}
-            >
-              {learnerInitials}
-            </div>
           </div>
         </div>
 
@@ -4037,7 +3712,7 @@ const OverviewTab = ({
                       : 'Your next live class will appear here once it is scheduled.'}
                   </p>
                   <div className="mt-4 flex items-center justify-between gap-3 text-sm text-[var(--ink-soft)]">
-                    <span>{nextLiveClass?.instructor || overview.highlights.modules[0] || 'VARONENGLISH'}</span>
+                    <span>{nextLiveClass?.instructor || overview.highlights.modules[0] || 'VaronEnglish'}</span>
                     <span>{nextLiveClass ? formatDateTime(nextLiveClass.startTime) : 'Upcoming'}</span>
                   </div>
                   <button
@@ -6035,28 +5710,14 @@ const ExactCbtTestPlayer = ({
   };
 
   const renderBrandMark = (size: 'sm' | 'md' = 'sm') => {
-    const large = size === 'md';
-
     return (
-      <div
-        className={cn(
-          'relative overflow-hidden rounded-[5px] border border-[#cfd6df] bg-white shadow-[inset_0_0_0_1px_rgba(255,255,255,0.85)]',
-          large ? 'h-[39px] w-[39px]' : 'h-[34px] w-[34px]',
-        )}
-      >
-        <div
-          className={cn(
-            'absolute bottom-[5px] left-[6px] rounded-[1px] bg-[#15395f]',
-            large ? 'top-[5px] w-[8px]' : 'top-[4px] w-[7px]',
-          )}
-        />
-        <div
-          className={cn(
-            'absolute bg-[#23bbe8]',
-            large ? 'bottom-[5px] left-[13px] top-[5px] w-[15px]' : 'bottom-[4px] left-[12px] top-[4px] w-[13px]',
-          )}
-          style={{ clipPath: 'polygon(0 0,100% 10%,100% 72%,56% 100%,0 74%)' }}
-        />
+      <div className="flex flex-col">
+        <div className={cn('font-black leading-none text-[#1a4fe3]', size === 'md' ? 'text-[22px]' : 'text-[18px]')}>
+          VaronEnglish
+        </div>
+        <div className={cn('mt-1 font-bold uppercase leading-none text-[#d59a00]', size === 'md' ? 'text-[8px] tracking-[0.26em]' : 'text-[7px] tracking-[0.22em]')}>
+          For Competitive Exams
+        </div>
       </div>
     );
   };
@@ -6687,7 +6348,6 @@ const ExactCbtTestPlayer = ({
     <div className="flex items-center gap-5 border-b border-slate-200 bg-white px-5 py-4 shadow-[0_1px_3px_rgba(15,23,42,0.06)]">
       <div className="flex items-center gap-3">
         {renderBrandMark('md')}
-        <p className="text-[18px] font-bold leading-none text-[#1bb9e8]">{CBT_BRAND_NAME}</p>
       </div>
       <p className="text-[13px] font-medium text-slate-800">{test.title}</p>
     </div>
@@ -6708,7 +6368,6 @@ const ExactCbtTestPlayer = ({
         <div className="flex items-center gap-3">
           {renderBrandMark('md')}
           <div>
-            <p className="text-[20px] font-bold leading-none text-[#1bb9e8]">{CBT_BRAND_NAME}</p>
             <p className="mt-1 text-[10px] font-semibold leading-tight text-slate-900">{test.title}</p>
           </div>
         </div>
@@ -7221,6 +6880,60 @@ const AnalyticsTab = ({ overview }: { overview: PlatformOverview }) => {
   const [aiMessage, setAiMessage] = useState('');
   const [aiReply, setAiReply] = useState<AiResponse | null>(null);
   const [asking, setAsking] = useState(false);
+  const seriesPerformance = overview.analytics.seriesPerformance || [];
+
+  const statusTone = {
+    weak: {
+      badge: 'bg-[#fff1ef] text-[#d94832]',
+      border: 'border-[#ffd8d2]',
+      progress: 'bg-[#ef6b57]',
+      panel: 'bg-[linear-gradient(180deg,#fff7f5_0%,#ffffff_100%)]',
+    },
+    watch: {
+      badge: 'bg-[#fff7e8] text-[#bc6c00]',
+      border: 'border-[#ffe1ae]',
+      progress: 'bg-[#f2aa3b]',
+      panel: 'bg-[linear-gradient(180deg,#fffaf0_0%,#ffffff_100%)]',
+    },
+    strong: {
+      badge: 'bg-[#ecfbf2] text-[#16824a]',
+      border: 'border-[#cbeed8]',
+      progress: 'bg-[#2fb26a]',
+      panel: 'bg-[linear-gradient(180deg,#f4fff8_0%,#ffffff_100%)]',
+    },
+  } as const;
+
+  const weakestConcepts = useMemo(() => (
+    seriesPerformance
+      .flatMap((series) => series.focusConcepts.map((concept) => ({
+        ...concept,
+        seriesTitle: series.title,
+      })))
+      .sort((left, right) => {
+        if (left.accuracy !== right.accuracy) {
+          return left.accuracy - right.accuracy;
+        }
+
+        return right.totalQuestions - left.totalQuestions;
+      })
+      .slice(0, 8)
+  ), [seriesPerformance]);
+
+  const strongestConcepts = useMemo(() => (
+    seriesPerformance
+      .flatMap((series) => series.healthyConcepts.map((concept) => ({
+        ...concept,
+        seriesTitle: series.title,
+      })))
+      .sort((left, right) => {
+        if (left.accuracy !== right.accuracy) {
+          return right.accuracy - left.accuracy;
+        }
+
+        return right.totalQuestions - left.totalQuestions;
+      })
+      .slice(0, 6)
+  ), [seriesPerformance]);
 
   const sendAi = async (message: string) => {
     if (!user || !message.trim()) {
@@ -7238,52 +6951,193 @@ const AnalyticsTab = ({ overview }: { overview: PlatformOverview }) => {
   };
 
   return (
-    <div className="grid gap-6 xl:grid-cols-[0.8fr_1.2fr]">
-      <section className="rounded-[30px] border border-white/70 bg-white/92 p-6 shadow-[0_22px_70px_rgba(15,23,42,0.07)]">
-        <SectionHeader title="Performance analytics" caption="Accuracy, speed, topic health" />
-        <div className="mt-6 grid gap-4">
-          <MetricCard title="Accuracy" value={`${overview.analytics.accuracy}%`} hint="Derived from CBT and mock test results" icon={Target} />
-          <MetricCard title="Speed" value={`${overview.analytics.speed}x`} hint="Tracks pace for mock environments" icon={Gauge} />
-          <MetricCard title="Attempts" value={`${overview.analytics.attempts}`} hint="CBT and mock test participation count" icon={ClipboardCheck} />
+    <div data-testid="analytics-page" className="space-y-6">
+      <section data-testid="analytics-summary" className="rounded-[30px] border border-white/70 bg-white/92 p-6 shadow-[0_22px_70px_rgba(15,23,42,0.07)]">
+        <SectionHeader title="Performance analytics" caption="Real weak sections and concept gaps from linked test series" />
+        <div className="mt-6 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          <MetricCard title="Accuracy" value={`${overview.analytics.accuracy}%`} hint="Across quizzes and mock test attempts" icon={Target} />
+          <MetricCard title="Attempts" value={`${overview.analytics.attempts}`} hint="Practice sessions tracked in analytics" icon={ClipboardCheck} />
+          <MetricCard title="Tracked series" value={`${seriesPerformance.length}`} hint="Course-linked test series with usable section analytics" icon={BookOpen} />
+          <MetricCard title="Weak sections" value={`${seriesPerformance.reduce((sum, series) => sum + series.sections.filter((section) => section.status === 'weak').length, 0)}`} hint="Sections needing urgent revision" icon={AlertTriangle} />
         </div>
-        <div className="mt-6 grid gap-4 md:grid-cols-2">
-          <div className="rounded-[24px] bg-[var(--accent-cream)] p-4">
-            <p className="font-semibold text-[var(--ink)]">Weak topics</p>
-            <div className="mt-3 flex flex-wrap gap-2">
-              {overview.analytics.weakTopics.map((topic) => (
-                <span key={topic} className="rounded-full bg-white px-3 py-2 text-sm text-[var(--danger)]">{topic}</span>
+
+        <div className="mt-6 grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
+          <div className="rounded-[26px] border border-[var(--line)] bg-[linear-gradient(180deg,#fff8f4_0%,#ffffff_100%)] p-5">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <p className="text-sm font-semibold text-[var(--ink)]">Weakest concepts right now</p>
+                <p className="mt-1 text-sm text-[var(--ink-soft)]">Use these as the next revision order from your completed test series.</p>
+              </div>
+              <span className="rounded-full bg-[#fff0ea] px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-[#c25b2d]">
+                Priority
+              </span>
+            </div>
+            <div className="mt-4 space-y-3">
+              {weakestConcepts.length === 0 ? (
+                <div className="rounded-[20px] border border-dashed border-[var(--line)] p-4 text-sm text-[var(--ink-soft)]">
+                  Complete a linked mock test series to unlock section-wise and chapter-wise weakness analytics here.
+                </div>
+              ) : weakestConcepts.map((concept, index) => (
+                <div key={`${concept.seriesTitle}-${concept.sectionName}-${concept.topic}-${index}`} className="rounded-[20px] border border-[#ffd8d2] bg-white px-4 py-4">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold text-[var(--ink)]">{concept.topic}</p>
+                      <p className="mt-1 text-xs uppercase tracking-[0.18em] text-[var(--ink-soft)]">{concept.seriesTitle} • {concept.sectionName}</p>
+                      <p className="mt-2 text-sm text-[var(--ink-soft)]">{concept.pathLabel || concept.chapterTitle || concept.moduleTitle || 'Mapped from test-series topic performance'}</p>
+                    </div>
+                    <span className="rounded-full bg-[#fff1ef] px-3 py-2 text-sm font-semibold text-[#d94832]">
+                      {concept.accuracy}%
+                    </span>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-2 text-xs text-[var(--ink-soft)]">
+                    <span className="rounded-full bg-[var(--accent-cream)] px-3 py-2">Correct {concept.correct}</span>
+                    <span className="rounded-full bg-[var(--accent-cream)] px-3 py-2">Wrong {concept.incorrect}</span>
+                    <span className="rounded-full bg-[var(--accent-cream)] px-3 py-2">Skipped {concept.unattempted}</span>
+                  </div>
+                </div>
               ))}
             </div>
           </div>
-          <div className="rounded-[24px] bg-[var(--accent-cream)] p-4">
-            <p className="font-semibold text-[var(--ink)]">Strong topics</p>
-            <div className="mt-3 flex flex-wrap gap-2">
-              {(overview.analytics.strongTopics.length > 0 ? overview.analytics.strongTopics : ['General Awareness']).map((topic) => (
-                <span key={topic} className="rounded-full bg-white px-3 py-2 text-sm text-[var(--success)]">{topic}</span>
-              ))}
+
+          <div className="space-y-4">
+            <div className="rounded-[26px] bg-[var(--card-dark)] p-5 text-white">
+              <p className="text-sm font-semibold">Recommendation engine</p>
+              <p className="mt-3 text-sm leading-7 text-white/75">{overview.analytics.suggestions[0] || 'Attempt one linked mock test series to unlock adaptive recommendations.'}</p>
+            </div>
+            <div className="rounded-[26px] border border-[var(--line)] bg-white p-5">
+              <p className="text-sm font-semibold text-[var(--ink)]">Adaptive test difficulty</p>
+              <div className="mt-4 flex flex-wrap gap-3">
+                <span className="rounded-full bg-[var(--accent-cream)] px-3 py-2 text-sm text-[var(--ink)]">
+                  Next: {overview.analytics.adaptivePlan.nextTestType}
+                </span>
+                <span className="rounded-full bg-[var(--accent-cream)] px-3 py-2 text-sm text-[var(--ink)]">
+                  Difficulty: {overview.analytics.adaptivePlan.difficulty}
+                </span>
+              </div>
+              <p className="mt-4 text-sm leading-7 text-[var(--ink-soft)]">{overview.analytics.adaptivePlan.reason}</p>
+            </div>
+            <div className="rounded-[26px] border border-[var(--line)] bg-[var(--accent-cream)] p-5">
+              <p className="text-sm font-semibold text-[var(--ink)]">Strongest concepts</p>
+              <div className="mt-4 flex flex-wrap gap-2">
+                {(strongestConcepts.length > 0 ? strongestConcepts : overview.analytics.strongTopics.map((topic) => ({
+                  topic,
+                  seriesTitle: 'Performance trend',
+                  sectionName: 'Healthy area',
+                  accuracy: 100,
+                }))).map((concept, index) => (
+                  <span key={`${concept.topic}-${index}`} className="rounded-full bg-white px-3 py-2 text-sm text-[var(--success)]">
+                    {concept.topic}
+                  </span>
+                ))}
+              </div>
             </div>
           </div>
-        </div>
-        <div className="mt-6 rounded-[24px] bg-[var(--card-dark)] p-5 text-white">
-          <p className="text-sm font-semibold">Recommendation engine</p>
-          <p className="mt-3 text-sm leading-7 text-white/75">{overview.analytics.suggestions[0]}</p>
-        </div>
-        <div className="mt-6 rounded-[24px] border border-[var(--line)] p-5">
-          <p className="text-sm font-semibold text-[var(--ink)]">Adaptive test difficulty</p>
-          <div className="mt-4 flex flex-wrap gap-3">
-            <span className="rounded-full bg-[var(--accent-cream)] px-3 py-2 text-sm text-[var(--ink)]">
-              Next: {overview.analytics.adaptivePlan.nextTestType}
-            </span>
-            <span className="rounded-full bg-[var(--accent-cream)] px-3 py-2 text-sm text-[var(--ink)]">
-              Difficulty: {overview.analytics.adaptivePlan.difficulty}
-            </span>
-          </div>
-          <p className="mt-4 text-sm leading-7 text-[var(--ink-soft)]">{overview.analytics.adaptivePlan.reason}</p>
         </div>
       </section>
 
-      <section className="rounded-[30px] border border-white/70 bg-white/92 p-6 shadow-[0_22px_70px_rgba(15,23,42,0.07)]">
-        <SectionHeader title="AI coach" caption="Doubt solving + graph-based insights" />
+      <section data-testid="analytics-weakness-map" className="rounded-[30px] border border-white/70 bg-white/92 p-6 shadow-[0_22px_70px_rgba(15,23,42,0.07)]">
+        <SectionHeader title="Section and chapter weakness map" caption="Built from linked test series -> section breakup -> topic performance" />
+        <div className="mt-6 space-y-5">
+          {seriesPerformance.length === 0 ? (
+            <div className="rounded-[24px] border border-dashed border-[var(--line)] bg-[var(--accent-cream)] p-6 text-sm leading-7 text-[var(--ink-soft)]">
+              No test-series analytics are available yet. Once a learner attempts linked mock tests, this area will show weak sections like GS, Reasoning, Technical and the exact chapter concepts where performance drops.
+            </div>
+          ) : seriesPerformance.map((series) => {
+            const tone = statusTone[series.status];
+
+            return (
+              <div key={series.id} className={cn('rounded-[28px] border p-5 shadow-[0_16px_44px_rgba(15,23,42,0.05)]', tone.border, tone.panel)}>
+                <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+                  <div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className={cn('rounded-full px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em]', tone.badge)}>
+                        {series.status === 'weak' ? 'Needs recovery' : series.status === 'watch' ? 'Watchlist' : 'Healthy'}
+                      </span>
+                      {series.exam && (
+                        <span className="rounded-full bg-white px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-[var(--ink-soft)]">
+                          {series.exam}
+                        </span>
+                      )}
+                    </div>
+                    <h3 className="mt-3 text-2xl font-semibold text-[var(--ink)]">{series.title}</h3>
+                    <p className="mt-2 text-sm leading-7 text-[var(--ink-soft)]">
+                      {series.attempts} attempt{series.attempts === 1 ? '' : 's'} across {series.linkedTests} linked mock test{series.linkedTests === 1 ? '' : 's'}
+                      {series.lastAttemptedAt ? ` • Last attempt ${formatDateTime(series.lastAttemptedAt)}` : ''}
+                    </p>
+                  </div>
+
+                  <div className="grid shrink-0 grid-cols-2 gap-3 xl:min-w-[280px]">
+                    <div className="rounded-[20px] bg-white/92 p-4">
+                      <p className="text-xs uppercase tracking-[0.16em] text-[var(--ink-soft)]">Overall accuracy</p>
+                      <p className="mt-2 text-2xl font-bold text-[var(--ink)]">{series.overallAccuracy}%</p>
+                    </div>
+                    <div className="rounded-[20px] bg-white/92 p-4">
+                      <p className="text-xs uppercase tracking-[0.16em] text-[var(--ink-soft)]">Average score</p>
+                      <p className="mt-2 text-2xl font-bold text-[var(--ink)]">{Math.round(series.averageScore)}/{Math.round(series.totalMarks)}</p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-5 h-[10px] overflow-hidden rounded-full bg-white/80">
+                  <div className={cn('h-full rounded-full', tone.progress)} style={{ width: `${Math.max(Math.min(series.overallAccuracy, 100), 0)}%` }} />
+                </div>
+
+                <div className="mt-6 grid gap-4 xl:grid-cols-3">
+                  {series.sections.map((section) => {
+                    const sectionTone = statusTone[section.status];
+
+                    return (
+                      <div key={`${series.id}-${section.name}`} className={cn('rounded-[22px] border bg-white/94 p-4', sectionTone.border)}>
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <p className="text-lg font-semibold text-[var(--ink)]">{section.name}</p>
+                            <p className="mt-1 text-sm text-[var(--ink-soft)]">
+                              {section.correct} correct • {section.incorrect} wrong • {section.unattempted} skipped
+                            </p>
+                          </div>
+                          <span className={cn('rounded-full px-3 py-2 text-sm font-semibold', sectionTone.badge)}>
+                            {section.accuracy}%
+                          </span>
+                        </div>
+
+                        <div className="mt-4 h-[8px] overflow-hidden rounded-full bg-[var(--accent-cream)]">
+                          <div className={cn('h-full rounded-full', sectionTone.progress)} style={{ width: `${Math.max(Math.min(section.accuracy, 100), 0)}%` }} />
+                        </div>
+
+                        <div className="mt-4 space-y-3">
+                          {section.weakConcepts.length === 0 ? (
+                            <div className="rounded-[18px] bg-[var(--accent-cream)] px-4 py-3 text-sm text-[var(--ink-soft)]">
+                              This section is stable right now.
+                            </div>
+                          ) : section.weakConcepts.map((concept) => (
+                            <div key={`${section.name}-${concept.topic}`} className="rounded-[18px] bg-[var(--accent-cream)] px-4 py-3">
+                              <div className="flex items-center justify-between gap-3">
+                                <p className="text-sm font-semibold text-[var(--ink)]">{concept.topic}</p>
+                                <span className={cn('rounded-full px-2.5 py-1 text-xs font-semibold', statusTone[concept.status].badge)}>
+                                  {concept.accuracy}%
+                                </span>
+                              </div>
+                              <p className="mt-2 text-sm leading-6 text-[var(--ink-soft)]">{concept.pathLabel || concept.chapterTitle || concept.moduleTitle || 'Linked concept from attempted questions'}</p>
+                              <div className="mt-3 flex flex-wrap gap-2 text-xs text-[var(--ink-soft)]">
+                                <span className="rounded-full bg-white px-3 py-2">C {concept.correct}</span>
+                                <span className="rounded-full bg-white px-3 py-2">W {concept.incorrect}</span>
+                                <span className="rounded-full bg-white px-3 py-2">S {concept.unattempted}</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
+      <section data-testid="analytics-ai-coach" className="rounded-[30px] border border-white/70 bg-white/92 p-6 shadow-[0_22px_70px_rgba(15,23,42,0.07)]">
+        <SectionHeader title="AI coach" caption="Ask for a revision plan using the live analytics above" />
         <div className="mt-6 rounded-[24px] bg-[var(--accent-cream)] p-4">
           <p className="text-sm font-semibold text-[var(--ink)]">Performance trend</p>
           <div className="mt-4 h-64">
@@ -7314,7 +7168,7 @@ const AnalyticsTab = ({ overview }: { overview: PlatformOverview }) => {
           value={aiMessage}
           onChange={(event) => setAiMessage(event.target.value)}
           className="mt-6 h-40 w-full rounded-[24px] border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 text-sm outline-none transition focus:border-[var(--accent-rust)]"
-          placeholder="Ask for a 7-day revision plan, a topic strategy, or a recommendation on what to study next."
+          placeholder="Ask for a 7-day plan for GS weak areas, section-wise reasoning recovery, or a technical revision sequence."
         />
         <button
           onClick={() => void sendAi(aiMessage)}
@@ -7344,6 +7198,12 @@ const AnalyticsTab = ({ overview }: { overview: PlatformOverview }) => {
 };
 
 const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefresh: () => Promise<void> }) => {
+  const getDiscountedCoursePrice = (price: number, offerPercentage: number) => {
+    const safePrice = Math.max(Number(price || 0), 0);
+    const safeOffer = Math.min(Math.max(Number(offerPercentage || 0), 0), 100);
+    const discountedPrice = safePrice * (1 - (safeOffer / 100));
+    return Math.max(Number(discountedPrice.toFixed(2)), 0);
+  };
   const [activeAdminSection, setActiveAdminSection] = useState<'overview' | 'courses' | 'curriculum' | 'assessments' | 'security'>('overview');
   const [courseForm, setCourseForm] = useState({
     title: '',
@@ -7354,6 +7214,7 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
     instructor: '',
     officialChannelUrl: '',
     price: 0,
+    offerPercentage: 0,
     validityDays: 183,
     level: 'Full Course',
   });
@@ -7421,6 +7282,8 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
   const selectedCbtChapter = selectedCbtModule?.chapters?.find((chapter) => chapter.id === cbtForm.chapterId) || null;
   const selectedCbtLessons = selectedCbtChapter?.lessons || selectedCbtModule?.lessons || [];
   const selectedFullMockCourse = overview.courses.find((course) => course._id === fullMockTestForm.courseId) || null;
+  const getCourseTitleById = (courseId?: string | null) =>
+    overview.courses.find((course) => course._id === String(courseId || ''))?.title || null;
   const existingLessonCbts = useMemo(() => (
     overview.courses.flatMap((course) =>
       (course.modules || []).flatMap((module) => ([
@@ -7462,6 +7325,10 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
       return normalizedType.includes('full') || normalizedType.includes('mock');
     }),
     [overview.testSeries],
+  );
+  const unlinkedFullMockTests = useMemo(
+    () => existingFullMockTests.filter((test) => !String(test.course || '').trim()),
+    [existingFullMockTests],
   );
 
   const sendMajorAnnouncement = async () => {
@@ -7512,6 +7379,7 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
         instructor: '',
         officialChannelUrl: '',
         price: 0,
+        offerPercentage: 0,
         validityDays: 183,
         level: 'Full Course',
       });
@@ -7617,6 +7485,10 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
   const createFullLengthMockTest = async () => {
     setBusy(true);
     try {
+      if (!fullMockTestForm.courseId) {
+        throw new Error('Link this mock test to a course before publishing it. Only learners enrolled in that course will be able to access it.');
+      }
+
       const questions = parseAssessmentQuestions(fullMockQuestions);
       const sectionMap = new Map<string, number>();
       let totalMarks = 0;
@@ -7812,7 +7684,9 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
     selectedCbtLessons.find((lesson) => lesson.id === cbtForm.lessonId)?.title,
   ].filter(Boolean).join(' • ');
 
-  const fullMockReviewPath = selectedFullMockCourse?.title || fullMockTestForm.category || 'Standalone test series';
+  const fullMockReviewPath = selectedFullMockCourse
+    ? `${selectedFullMockCourse.title} • ${fullMockTestForm.title || 'New mock test'}`
+    : 'Choose parent course';
 
   const renderBuilderSectionCard = ({
     title,
@@ -8031,23 +7905,8 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
     switch (fullMockBuilderStep) {
       case 0:
         return renderBuilderSectionCard({
-          title: 'Basic mock test information',
-          subtitle: 'Set the full-length test identity, timing, and scoring before you move into questions.',
-          children: (
-            <>
-              <input value={fullMockTestForm.title} onChange={(event) => setFullMockTestForm((current) => ({ ...current, title: event.target.value }))} placeholder="Mock test title" className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
-              <input value={fullMockTestForm.topic} onChange={(event) => setFullMockTestForm((current) => ({ ...current, topic: event.target.value }))} placeholder="Topic / section mix" className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
-              <input value={fullMockTestForm.category} onChange={(event) => setFullMockTestForm((current) => ({ ...current, category: event.target.value }))} placeholder="Category" className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
-              <input value={selectedFullMockCourse?.title || ''} readOnly placeholder="Linked course (optional)" className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none opacity-70" />
-              <input type="number" value={fullMockTestForm.durationMinutes} onChange={(event) => setFullMockTestForm((current) => ({ ...current, durationMinutes: Number(event.target.value) }))} placeholder="Duration" className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
-              <input type="number" step="0.01" value={fullMockTestForm.negativeMarking} onChange={(event) => setFullMockTestForm((current) => ({ ...current, negativeMarking: Number(event.target.value) }))} placeholder="Negative marking" className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
-            </>
-          ),
-        });
-      case 1:
-        return renderBuilderSectionCard({
-          title: 'Decide where the mock lives',
-          subtitle: 'Keep it global or link it to a specific course so the surface area stays predictable.',
+          title: 'Choose parent course and mock basics',
+          subtitle: 'Start by choosing the course this mock belongs to. Example: choose SSC, then create SSC Mock Test 1, SSC Mock Test 2, and so on under that same course.',
           children: (
             <>
               <select
@@ -8055,13 +7914,41 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
                 onChange={(event) => setFullMockTestForm((current) => ({ ...current, courseId: event.target.value }))}
                 className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none"
               >
-                <option value="">All courses / global mock</option>
+                <option value="">Select parent course</option>
+                {overview.courses.map((course) => <option key={course._id} value={course._id}>{course.title}</option>)}
+              </select>
+              <input value={fullMockTestForm.title} onChange={(event) => setFullMockTestForm((current) => ({ ...current, title: event.target.value }))} placeholder="Mock test title" className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
+              <input value={fullMockTestForm.topic} onChange={(event) => setFullMockTestForm((current) => ({ ...current, topic: event.target.value }))} placeholder="Topic / section mix" className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
+              <input value={fullMockTestForm.category} onChange={(event) => setFullMockTestForm((current) => ({ ...current, category: event.target.value }))} placeholder="Category" className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
+              <input
+                value={selectedFullMockCourse ? `${selectedFullMockCourse.title} -> ${fullMockTestForm.title || 'Mock Test 1'}` : ''}
+                readOnly
+                placeholder="Example: SSC -> SSC Mock Test 1"
+                className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none opacity-70"
+              />
+              <input type="number" value={fullMockTestForm.durationMinutes} onChange={(event) => setFullMockTestForm((current) => ({ ...current, durationMinutes: Number(event.target.value) }))} placeholder="Duration" className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
+              <input type="number" step="0.01" value={fullMockTestForm.negativeMarking} onChange={(event) => setFullMockTestForm((current) => ({ ...current, negativeMarking: Number(event.target.value) }))} placeholder="Negative marking" className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
+            </>
+          ),
+        });
+      case 1:
+        return renderBuilderSectionCard({
+          title: 'Confirm parent course access',
+          subtitle: 'This course link controls access. Only students who bought the selected course will be able to see and attempt these mock tests.',
+          children: (
+            <>
+              <select
+                value={fullMockTestForm.courseId}
+                onChange={(event) => setFullMockTestForm((current) => ({ ...current, courseId: event.target.value }))}
+                className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none"
+              >
+                <option value="">Select parent course</option>
                 {overview.courses.map((course) => <option key={course._id} value={course._id}>{course.title}</option>)}
               </select>
               <div className="rounded-[20px] border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 text-sm leading-6 text-[var(--ink-soft)]">
                 {selectedFullMockCourse
-                  ? `This mock will appear with ${selectedFullMockCourse.title}.`
-                  : 'This mock will stay global and appear in the main Mock Tests workspace.'}
+                  ? `These mocks now belong under ${selectedFullMockCourse.title}. Create titles like ${selectedFullMockCourse.title} Mock Test 1, ${selectedFullMockCourse.title} Mock Test 2, and only learners enrolled in ${selectedFullMockCourse.title} will be able to open, attempt, and watch the companion video for them.`
+                  : 'Choose a parent course. Full mock tests are course-locked and should be created under the exact course students need to buy first.'}
               </div>
             </>
           ),
@@ -8333,14 +8220,54 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
           <section className="rounded-[30px] border border-white/70 bg-white/92 p-6 shadow-[0_20px_60px_rgba(15,23,42,0.07)]">
             <SectionHeader title="Create course" caption="Catalog, pricing, and publishing baseline" />
             <div className="mt-6 grid gap-4 md:grid-cols-2">
-              <input value={courseForm.title} onChange={(event) => setCourseForm((current) => ({ ...current, title: event.target.value }))} placeholder="Course title" className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
-              <input value={courseForm.subject} onChange={(event) => setCourseForm((current) => ({ ...current, subject: event.target.value }))} placeholder="Subject" className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
-              <input value={courseForm.instructor} onChange={(event) => setCourseForm((current) => ({ ...current, instructor: event.target.value }))} placeholder="Instructor" className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
-              <input value={courseForm.officialChannelUrl} onChange={(event) => setCourseForm((current) => ({ ...current, officialChannelUrl: event.target.value }))} placeholder="Official channel URL" className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
-              <input type="number" value={courseForm.price} onChange={(event) => setCourseForm((current) => ({ ...current, price: Number(event.target.value) }))} placeholder="Price" className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
-              <input value={courseForm.category} onChange={(event) => setCourseForm((current) => ({ ...current, category: event.target.value }))} placeholder="Category" className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
-              <input value={courseForm.level} onChange={(event) => setCourseForm((current) => ({ ...current, level: event.target.value }))} placeholder="Level" className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
-              <textarea value={courseForm.description} onChange={(event) => setCourseForm((current) => ({ ...current, description: event.target.value }))} placeholder="Course description" className="md:col-span-2 h-32 rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
+              <label className="space-y-2">
+                <span className="block text-sm font-semibold text-[var(--ink)]">Course Title</span>
+                <input value={courseForm.title} onChange={(event) => setCourseForm((current) => ({ ...current, title: event.target.value }))} placeholder="e.g. SSC JE Complete Batch 2026" className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
+              </label>
+              <label className="space-y-2">
+                <span className="block text-sm font-semibold text-[var(--ink)]">Subject</span>
+                <input value={courseForm.subject} onChange={(event) => setCourseForm((current) => ({ ...current, subject: event.target.value }))} placeholder="e.g. Civil Engineering" className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
+              </label>
+              <label className="space-y-2">
+                <span className="block text-sm font-semibold text-[var(--ink)]">Instructor</span>
+                <input value={courseForm.instructor} onChange={(event) => setCourseForm((current) => ({ ...current, instructor: event.target.value }))} placeholder="Teacher name shown to students" className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
+              </label>
+              <label className="space-y-2">
+                <span className="block text-sm font-semibold text-[var(--ink)]">Official Channel URL</span>
+                <input value={courseForm.officialChannelUrl} onChange={(event) => setCourseForm((current) => ({ ...current, officialChannelUrl: event.target.value }))} placeholder="Optional YouTube or website link" className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
+              </label>
+              <label className="space-y-2">
+                <span className="block text-sm font-semibold text-[var(--ink)]">Course Fee (INR)</span>
+                <input type="number" min="0" value={courseForm.price} onChange={(event) => setCourseForm((current) => ({ ...current, price: Number(event.target.value) }))} placeholder="Use 0 for a free course" className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
+                <span className="block text-xs text-[var(--ink-soft)]">Set `0` if students should access the course for free.</span>
+              </label>
+              <label className="space-y-2">
+                <span className="block text-sm font-semibold text-[var(--ink)]">Offer Percentage</span>
+                <input type="number" min="0" max="100" value={courseForm.offerPercentage} onChange={(event) => setCourseForm((current) => ({ ...current, offerPercentage: Number(event.target.value) }))} placeholder="Discount shown on paid courses" className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
+              </label>
+              <label className="space-y-2">
+                <span className="block text-sm font-semibold text-[var(--ink)]">Exam</span>
+                <input value={courseForm.exam} onChange={(event) => setCourseForm((current) => ({ ...current, exam: event.target.value }))} placeholder="e.g. SSC JE, RRB JE" className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
+              </label>
+              <label className="space-y-2">
+                <span className="block text-sm font-semibold text-[var(--ink)]">Category</span>
+                <input value={courseForm.category} onChange={(event) => setCourseForm((current) => ({ ...current, category: event.target.value }))} placeholder="e.g. Full course, crash course" className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
+              </label>
+              <label className="space-y-2">
+                <span className="block text-sm font-semibold text-[var(--ink)]">Level</span>
+                <input value={courseForm.level} onChange={(event) => setCourseForm((current) => ({ ...current, level: event.target.value }))} placeholder="e.g. Beginner, Advanced, Full Course" className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
+              </label>
+              <label className="space-y-2">
+                <span className="block text-sm font-semibold text-[var(--ink)]">Validity (Days)</span>
+                <input type="number" min="1" value={courseForm.validityDays} onChange={(event) => setCourseForm((current) => ({ ...current, validityDays: Number(event.target.value) }))} placeholder="How many days the course stays active after purchase" className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
+              </label>
+              <label className="space-y-2 md:col-span-2">
+                <span className="block text-sm font-semibold text-[var(--ink)]">Course Description</span>
+                <textarea value={courseForm.description} onChange={(event) => setCourseForm((current) => ({ ...current, description: event.target.value }))} placeholder="Write what the learner will study in this course." className="h-32 w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 outline-none" />
+              </label>
+              <div className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-4 text-sm text-[var(--ink-soft)] md:col-span-2">
+                Learner payable price: <span className="font-semibold text-[var(--ink)]">{courseForm.price === 0 ? 'Free' : currency.format(getDiscountedCoursePrice(courseForm.price, courseForm.offerPercentage))}</span>
+              </div>
               <div className="md:col-span-2">
                 <button onClick={() => void createCourse()} disabled={busy} className="rounded-2xl bg-[var(--ink)] px-5 py-4 font-semibold text-white">
                   Create course
@@ -8442,7 +8369,7 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
           <BuilderFrame
             eyebrow="Mock Test Creation"
             title="Full-Length Mock Builder"
-            description="Create full mock tests with the same guided structure, but keep them standalone so they appear in the Mock Tests workspace."
+            description="Create full mock tests with the same guided structure and link each one to a course so only enrolled learners can access it."
             actions={(
               <div className="flex flex-wrap gap-3">
                 <button onClick={resetFullMockForm} disabled={busy} className="rounded-2xl border border-[var(--line)] bg-white px-5 py-3 text-sm font-semibold text-[var(--ink)] disabled:opacity-60">
@@ -8458,6 +8385,12 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
           >
             <div className="grid gap-6 xl:grid-cols-[minmax(0,1.35fr)_340px]">
               <div className="space-y-5">
+                {unlinkedFullMockTests.length > 0 && (
+                  <div className="rounded-[24px] border border-[#f3d3a1] bg-[#fff7e8] px-5 py-4 text-sm leading-6 text-[#7a4b00]">
+                    {unlinkedFullMockTests.length} existing full mock test{unlinkedFullMockTests.length === 1 ? '' : 's'} still ha{unlinkedFullMockTests.length === 1 ? 's' : 've'} no course link.
+                    Edit and assign a course so students only get access after buying the related course.
+                  </div>
+                )}
                 {renderFullMockBuilderContent()}
                 {renderBuilderFooter({
                   step: fullMockBuilderStep,
@@ -8531,10 +8464,10 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
                       <div>
                         <p className="text-sm font-semibold text-[var(--ink)]">{test.title}</p>
                         <p className="mt-1 text-sm text-[var(--ink-soft)]">
-                          {test.category} • {test.questions.length} questions • {test.durationMinutes} min
+                          {(getCourseTitleById(test.course) || 'Course link required')} • {test.category} • {test.questions.length} questions • {test.durationMinutes} min
                         </p>
                         <p className="mt-2 text-xs uppercase tracking-[0.14em] text-[var(--ink-soft)]">
-                          {test.course || 'Global mock'} • negative {test.negativeMarking}
+                          Parent course: {getCourseTitleById(test.course) || 'Course link required'} • negative {test.negativeMarking}
                         </p>
                       </div>
                       <div className="flex flex-wrap gap-2">
@@ -8555,6 +8488,8 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
               </div>
             </section>
           </div>
+
+          <AdminMockTestVideoUpload tests={existingFullMockTests} onVideoUploaded={onRefresh} />
         </div>
       )}
 
@@ -8587,20 +8522,32 @@ const AppContent = () => {
   const [overview, setOverview] = useState<PlatformOverview | null>(null);
   const [activeTab, setActiveTab] = useState<TabKey>('overview');
   const [loadingOverview, setLoadingOverview] = useState(true);
-  const [resumeTarget, setResumeTarget] = useState<{ courseId: string; lessonId?: string | null } | null>(null);
+  const [resumeTarget, setResumeTarget] = useState<{ courseId: string; lessonId?: string | null; doubtThreadId?: string | null } | null>(null);
   const [savedTopicIds, setSavedTopicIds] = useState<string[]>([]);
+  const overviewRequestRef = useRef<Promise<PlatformOverview | null> | null>(null);
 
   const refreshOverview = async (background = true) => {
     if (!background) {
       setLoadingOverview(true);
     }
     try {
-      if (user) {
-        const nextOverview = await EduService.getPlatformOverview();
-        setOverview(nextOverview);
-      } else {
+      if (!user && !EduService.getToken()) {
         setOverview(null);
+        return null;
       }
+
+      if (!overviewRequestRef.current) {
+        overviewRequestRef.current = EduService.getPlatformOverview()
+          .then((nextOverview) => {
+            setOverview(nextOverview);
+            return nextOverview;
+          })
+          .finally(() => {
+            overviewRequestRef.current = null;
+          });
+      }
+
+      return await overviewRequestRef.current;
     } finally {
       if (!background) {
         setLoadingOverview(false);
@@ -8608,9 +8555,30 @@ const AppContent = () => {
     }
   };
 
-  useLayoutEffect(() => {
+  useEffect(() => {
+    if (!EduService.getToken()) {
+      setLoadingOverview(false);
+      return;
+    }
+
     void refreshOverview(false);
-  }, [user]);
+  }, []);
+
+  useEffect(() => {
+    if (loading) {
+      return;
+    }
+
+    if (!user) {
+      setOverview(null);
+      setLoadingOverview(false);
+      return;
+    }
+
+    if (!overview) {
+      void refreshOverview(false);
+    }
+  }, [loading, overview, user]);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -8621,13 +8589,14 @@ const AppContent = () => {
     const tab = params.get('tab');
     const courseId = params.get('courseId');
     const lessonId = params.get('lessonId');
+    const doubtThreadId = params.get('doubtThreadId');
 
     if (tab && tab in shellTabMeta) {
       setActiveTab(tab as TabKey);
     }
 
     if (tab === 'courses' && courseId) {
-      setResumeTarget({ courseId, lessonId: lessonId || null });
+      setResumeTarget({ courseId, lessonId: lessonId || null, doubtThreadId: doubtThreadId || null });
     }
   }, []);
 
@@ -8727,9 +8696,11 @@ const AppContent = () => {
       activeTab={activeTab}
       setActiveTab={setActiveTab}
       onLogout={logout}
-      onRefresh={() => refreshOverview(true)}
+      onRefresh={async () => {
+        await refreshOverview(true);
+      }}
       resumeTarget={resumeTarget}
-      onContinueLearningNavigate={(courseId, lessonId) => setResumeTarget({ courseId, lessonId })}
+      onContinueLearningNavigate={(courseId, lessonId, doubtThreadId) => setResumeTarget({ courseId, lessonId, doubtThreadId })}
       onOpenNotification={openNotification}
       onResumeNavigationHandled={() => setResumeTarget(null)}
       savedTopicIds={savedTopicIds}
@@ -8740,9 +8711,5 @@ const AppContent = () => {
 };
 
 export default function App() {
-  return (
-    <AuthProvider>
-      <AppContent />
-    </AuthProvider>
-  );
+  return <AppContent />;
 }

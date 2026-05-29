@@ -12,12 +12,14 @@ const {
   optionalNumber,
 } = require('../lib/http.js');
 const {
+  HLS_ACCESS_COOKIE_NAME,
   issuePlaybackToken,
   issueCompactAssetSignature,
   verifyPlaybackToken,
   verifyCompactAssetSignature,
   resolvePrivateVideoPath,
   resolvePrivateHlsPath,
+  getProtectedAssetStorageRoot,
 } = require('../lib/private-video.js');
 const {
   getSignedPrivateVideoUrl,
@@ -30,6 +32,9 @@ const {
   rewriteHlsManifestUris,
 } = require('../lib/hls-manifest.js');
 const { appConfig } = require('../lib/config.js');
+const {
+  buildSecurePlaybackClientContext,
+} = require('../lib/secure-playback.js');
 
 const defaultCourseValidityDays = appConfig.courseDefaultValidityDays || 183;
 const HLS_SEGMENT_EXTENSIONS = new Set(['.ts', '.m4s', '.mp4', '.aac', '.vtt', '.webvtt', '.key']);
@@ -40,6 +45,88 @@ const sharedHttpCacheWarmInFlight = new Map();
 const sourceManifestMemoryCache = new Map();
 const rewrittenManifestMemoryCache = new Map();
 const COMPACT_HLS_ROUTE_BASE = '/backend/api/courses/h';
+const HLS_ACCESS_COOKIE_PATH = '/backend/api/';
+
+const parseRequestCookies = (req) => String(req.headers.cookie || '')
+  .split(';')
+  .map((entry) => entry.trim())
+  .filter(Boolean)
+  .reduce((accumulator, entry) => {
+    const separatorIndex = entry.indexOf('=');
+    if (separatorIndex <= 0) {
+      return accumulator;
+    }
+
+    const name = entry.slice(0, separatorIndex).trim();
+    const value = entry.slice(separatorIndex + 1).trim();
+    accumulator[name] = decodeURIComponent(value);
+    return accumulator;
+  }, {});
+
+const setPlaybackCookie = (res, token, expiresAtIso) => {
+  const expiresAtMs = Number(new Date(expiresAtIso || '').getTime() || 0);
+  const maxAgeSeconds = expiresAtMs > Date.now()
+    ? Math.max(60, Math.floor((expiresAtMs - Date.now()) / 1000))
+    : Math.max(Number(appConfig.privateVideoHlsSegmentTokenTtlSeconds || 21_600), 300);
+  const cookieParts = [
+    `${HLS_ACCESS_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    `Path=${HLS_ACCESS_COOKIE_PATH}`,
+    `Max-Age=${maxAgeSeconds}`,
+    'HttpOnly',
+    'SameSite=Lax',
+  ];
+
+  if (appConfig.nodeEnv === 'production') {
+    cookieParts.push('Secure');
+  }
+
+  res.append('Set-Cookie', cookieParts.join('; '));
+};
+
+const requestMatchesPlaybackContext = (req, payload = {}) => {
+  if (!payload?.userAgentHash) {
+    return true;
+  }
+
+  const requestContext = buildSecurePlaybackClientContext(req);
+  return String(requestContext.userAgentHash || '') === String(payload.userAgentHash || '');
+};
+
+const getValidHlsGrantFromRequest = async (req, storageRoot) => {
+  const cookieToken = parseRequestCookies(req)[HLS_ACCESS_COOKIE_NAME] || '';
+  const payload = verifyPlaybackToken(cookieToken);
+  if (!payload || payload.kind !== 'course-hls-grant' || String(payload.storageRoot || '') !== String(storageRoot || '')) {
+    return null;
+  }
+
+  if (payload.sessionId && payload.userId) {
+    const activeSessionId = await sessionRepository.getActiveSessionId(String(payload.userId), String(payload.sessionId));
+    if (activeSessionId !== payload.sessionId) {
+      return null;
+    }
+  }
+
+  if (!requestMatchesPlaybackContext(req, payload)) {
+    return null;
+  }
+
+  return payload;
+};
+
+const getStorageRootFromPlayerStreamUrl = (streamUrl) => {
+  const rawUrl = String(streamUrl || '');
+  const manifestBundlePath = rawUrl.split('/course-manifests/b/')[1]?.split('/_p/')[0] || '';
+  if (manifestBundlePath) {
+    return getProtectedAssetStorageRoot(manifestBundlePath);
+  }
+
+  const compactAssetPath = rawUrl.split(`${COMPACT_HLS_ROUTE_BASE}/`)[1]?.split('?')[0] || '';
+  if (compactAssetPath) {
+    return getProtectedAssetStorageRoot(decodeCompactAssetPath(compactAssetPath));
+  }
+
+  return '';
+};
 
 const getExtension = (value) => path.extname(String(value || '')).toLowerCase();
 
@@ -192,6 +279,7 @@ const buildHlsAssetUrl = (payload, assetPath, mimeType) => {
   const params = new URLSearchParams({
     e: String(issued.exp),
     s: issued.sig,
+    p: String(payload.storageProvider || appConfig.privateVideoStorageProvider || 'local'),
   });
   return `${COMPACT_HLS_ROUTE_BASE}/${encodeCompactAssetPath(assetPath)}?${params.toString()}`;
 };
@@ -448,6 +536,30 @@ const getCourseLessons = asyncHandler(async (req, res) => {
   return ok(res, lessons);
 });
 
+const appendPlaybackGrantCookieIfNeeded = (req, res, player) => {
+  if (!(player?.streamFormat === 'hls' && player?.streamUrl)) {
+    return;
+  }
+
+  const storageRoot = getStorageRootFromPlayerStreamUrl(player.streamUrl);
+
+  if (!storageRoot) {
+    return;
+  }
+
+  const issuedGrant = issuePlaybackToken({
+    kind: 'course-hls-grant',
+    userId: req.user?.id || null,
+    sessionId: req.user?.session || null,
+    storageRoot,
+    userAgentHash: buildSecurePlaybackClientContext(req).userAgentHash,
+  }, {
+    expiresAtMs: Number(new Date(player.tokenExpiresAt || '').getTime() || 0) || undefined,
+    ttlSeconds: appConfig.privateVideoHlsSegmentTokenTtlSeconds,
+  });
+  setPlaybackCookie(res, issuedGrant.token, issuedGrant.expiresAt);
+};
+
 const getProtectedLessonPlayer = asyncHandler(async (req, res) => {
   const courseId = requireString(req.params.id, 'course id');
   const lessonId = requireString(req.params.lessonId, 'lesson id');
@@ -455,13 +567,32 @@ const getProtectedLessonPlayer = asyncHandler(async (req, res) => {
     userId: req.user?.id || null,
     courseId,
     lessonId,
+    requestContext: buildSecurePlaybackClientContext(req),
   });
+
+  appendPlaybackGrantCookieIfNeeded(req, res, player);
+
   return ok(res, player);
+});
+
+const getProtectedLessonBootstrap = asyncHandler(async (req, res) => {
+  const courseId = requireString(req.params.id, 'course id');
+  const lessonId = requireString(req.params.lessonId, 'lesson id');
+  const bootstrap = await coursesRepository.getProtectedLessonBootstrap({
+    userId: req.user?.id || null,
+    courseId,
+    lessonId,
+    requestContext: buildSecurePlaybackClientContext(req),
+  });
+
+  appendPlaybackGrantCookieIfNeeded(req, res, bootstrap.player);
+  return ok(res, bootstrap);
 });
 
 const streamCompactProtectedLessonAsset = asyncHandler(async (req, res) => {
   const storagePath = decodeCompactAssetPath(req.params[0] || '');
-  const storageProvider = String(appConfig.privateVideoStorageProvider || 'local');
+  const storageRoot = getProtectedAssetStorageRoot(storagePath);
+  const storageProvider = String(req.query.p || appConfig.privateVideoStorageProvider || 'local');
   const cacheScope = isHlsSegmentPath(storagePath) ? 'shared-hls-segment' : 'shared-hls-manifest';
   const exp = Number(req.query.e || 0);
   const sig = String(req.query.s || '');
@@ -472,6 +603,11 @@ const streamCompactProtectedLessonAsset = asyncHandler(async (req, res) => {
     cacheScope,
   }, exp, sig)) {
     throw new ApiError(401, 'Playback asset signature is invalid or expired', { code: 'PLAYBACK_ASSET_INVALID' });
+  }
+
+  const hlsGrant = await getValidHlsGrantFromRequest(req, storageRoot);
+  if (!hlsGrant) {
+    throw new ApiError(401, 'Playback grant is missing or expired', { code: 'PLAYBACK_GRANT_INVALID' });
   }
 
   const payload = {
@@ -492,17 +628,18 @@ const streamCompactProtectedLessonAsset = asyncHandler(async (req, res) => {
       return;
     }
 
-    const signedUrl = await getSignedPrivateVideoUrl({
+    const assetBuffer = await getPrivateStorageObjectBuffer({
+      storageProvider,
       storagePath,
-      mimeType: payload.mimeType,
     });
 
-    if (!signedUrl) {
-      throw new ApiError(404, 'Protected HLS asset could not be delivered', { code: 'PRIVATE_HLS_URL_UNAVAILABLE' });
+    if (!assetBuffer) {
+      throw new ApiError(404, 'Protected HLS asset could not be delivered', { code: 'PRIVATE_HLS_ASSET_UNAVAILABLE' });
     }
 
-    setHlsCacheHeaders(res, storagePath, payload, { redirect: true });
-    res.redirect(307, signedUrl);
+    setHlsCacheHeaders(res, storagePath, payload);
+    res.setHeader('Content-Type', payload.mimeType);
+    res.send(assetBuffer);
     return;
   }
 
@@ -539,6 +676,12 @@ const streamProtectedLesson = asyncHandler(async (req, res) => {
     throw new ApiError(401, 'Playback session is no longer active', { code: 'PLAYBACK_SESSION_INVALID' });
   }
 
+  if (!requestMatchesPlaybackContext(req, payload)) {
+    throw new ApiError(401, 'Playback token is not valid for this device or browser session', {
+      code: 'PLAYBACK_CONTEXT_INVALID',
+    });
+  }
+
   if (isS3Provider(payload.storageProvider) && payload.assetKind === 'hls') {
     if (isHlsManifestPath(payload.storagePath)) {
       const manifestText = await getSourceHlsManifestText(payload);
@@ -550,17 +693,18 @@ const streamProtectedLesson = asyncHandler(async (req, res) => {
       return;
     }
 
-    const signedUrl = await getSignedPrivateVideoUrl({
+    const assetBuffer = await getPrivateStorageObjectBuffer({
+      storageProvider: payload.storageProvider,
       storagePath: payload.storagePath,
-      mimeType: payload.mimeType,
     });
 
-    if (!signedUrl) {
-      throw new ApiError(404, 'Protected HLS asset could not be delivered', { code: 'PRIVATE_HLS_URL_UNAVAILABLE' });
+    if (!assetBuffer) {
+      throw new ApiError(404, 'Protected HLS asset could not be delivered', { code: 'PRIVATE_HLS_ASSET_UNAVAILABLE' });
     }
 
-    setHlsCacheHeaders(res, payload.storagePath, payload, { redirect: true });
-    res.redirect(307, signedUrl);
+    setHlsCacheHeaders(res, payload.storagePath, payload);
+    res.setHeader('Content-Type', payload.mimeType);
+    res.send(assetBuffer);
     return;
   }
 
@@ -636,6 +780,96 @@ const streamProtectedLesson = asyncHandler(async (req, res) => {
   fs.createReadStream(filePath, { start, end }).pipe(res);
 });
 
+const readRawRequestBody = async (req) => new Promise((resolve, reject) => {
+  const chunks = [];
+  req.on('data', (chunk) => {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  });
+  req.on('end', () => resolve(Buffer.concat(chunks)));
+  req.on('error', reject);
+});
+
+const getUpstreamDrmLicenseUrl = (provider) => {
+  switch (String(provider || '').toLowerCase()) {
+    case 'widevine':
+      return String(appConfig.privateVideoDrmWidevineLicenseUrl || '').trim();
+    case 'playready':
+      return String(appConfig.privateVideoDrmPlayreadyLicenseUrl || '').trim();
+    case 'fairplay':
+      return String(appConfig.privateVideoDrmFairplayLicenseUrl || '').trim();
+    case 'fairplay-cert':
+      return String(appConfig.privateVideoDrmFairplayCertificateUrl || '').trim();
+    default:
+      return '';
+  }
+};
+
+const proxyProtectedDrmLicense = asyncHandler(async (req, res) => {
+  const courseId = requireString(req.params.id, 'course id');
+  const lessonId = requireString(req.params.lessonId, 'lesson id');
+  const provider = requireString(req.params.provider, 'DRM provider');
+  const token = requireString(req.query.token, 'playback token');
+  const payload = verifyPlaybackToken(token);
+
+  if (!payload || payload.kind !== 'course-drm-license' || String(payload.provider || '') !== String(provider)) {
+    throw new ApiError(401, 'DRM playback token is invalid or expired', { code: 'DRM_TOKEN_INVALID' });
+  }
+
+  const activeSessionId = payload.userId
+    ? await sessionRepository.getActiveSessionId(String(payload.userId), payload.sessionId || null)
+    : null;
+  if (payload.sessionId && activeSessionId !== payload.sessionId) {
+    throw new ApiError(401, 'Playback session is no longer active', { code: 'PLAYBACK_SESSION_INVALID' });
+  }
+
+  if (!requestMatchesPlaybackContext(req, payload)) {
+    throw new ApiError(401, 'Playback token is not valid for this device or browser session', {
+      code: 'PLAYBACK_CONTEXT_INVALID',
+    });
+  }
+
+  const player = await coursesRepository.getProtectedLessonPlayback({
+    userId: req.user?.id || payload.userId || null,
+    user: req.user?.profile || null,
+    courseId,
+    lessonId,
+    requestContext: buildSecurePlaybackClientContext(req),
+  });
+
+  if (!player?.drmEnabled) {
+    throw new ApiError(403, 'DRM playback is not enabled for this lesson', { code: 'DRM_NOT_ENABLED' });
+  }
+
+  const upstreamUrl = getUpstreamDrmLicenseUrl(provider);
+  if (!upstreamUrl) {
+    throw new ApiError(503, 'DRM provider is not configured', { code: 'DRM_PROVIDER_NOT_CONFIGURED' });
+  }
+
+  const requestBody = await readRawRequestBody(req);
+  const upstreamResponse = await fetch(upstreamUrl, {
+    method: req.method,
+    headers: {
+      ...(req.headers['content-type'] ? { 'content-type': req.headers['content-type'] } : {}),
+      ...(req.headers.accept ? { accept: req.headers.accept } : {}),
+    },
+    body: requestBody.length > 0 ? requestBody : undefined,
+  });
+
+  const responseBuffer = Buffer.from(await upstreamResponse.arrayBuffer());
+  res.status(upstreamResponse.status);
+  const contentType = upstreamResponse.headers.get('content-type');
+  if (contentType) {
+    res.setHeader('Content-Type', contentType);
+  }
+  res.setHeader('Cache-Control', 'private, no-store, no-cache, must-revalidate');
+  res.send(responseBuffer);
+});
+
+const proxyProtectedFairplayCertificate = asyncHandler(async (req, res) => {
+  req.params.provider = 'fairplay-cert';
+  return proxyProtectedDrmLicense(req, res);
+});
+
 const createCourse = asyncHandler(async (req, res) => {
   const title = requireString(req.body?.title, 'title', { maxLength: 160 });
   const description = optionalString(req.body?.description, '', { maxLength: 3000 });
@@ -646,7 +880,8 @@ const createCourse = asyncHandler(async (req, res) => {
   const officialChannelUrl = optionalString(req.body?.officialChannelUrl, '', { maxLength: 500 }) || null;
   const level = optionalString(req.body?.level, 'Full Course', { maxLength: 80 });
   const thumbnailUrl = optionalString(req.body?.thumbnailUrl, '', { maxLength: 500 });
-  const price = optionalNumber(req.body?.price, 0, { min: 0 });
+  const price = optionalNumber(req.body?.price, 1, { min: 1 });
+  const offerPercentage = optionalNumber(req.body?.offerPercentage, 0, { min: 0, max: 100 });
   const validityDays = optionalNumber(req.body?.validityDays, defaultCourseValidityDays, { min: 1, max: 3650, integer: true });
   const modules = Array.isArray(req.body?.modules) ? req.body.modules : [];
 
@@ -661,6 +896,7 @@ const createCourse = asyncHandler(async (req, res) => {
     level,
     thumbnailUrl,
     price,
+    offerPercentage,
     validityDays,
     modules,
     createdBy: req.user?.id || req.body?.createdBy || null,
@@ -672,7 +908,10 @@ module.exports = {
   getCourses,
   getCourse,
   getCourseLessons,
+  getProtectedLessonBootstrap,
   getProtectedLessonPlayer,
+  proxyProtectedDrmLicense,
+  proxyProtectedFairplayCertificate,
   streamProtectedLesson,
   streamCompactProtectedLessonAsset,
   createCourse,

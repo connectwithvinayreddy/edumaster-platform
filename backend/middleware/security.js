@@ -80,7 +80,7 @@ const getLoginSubjectKey = (req) => {
 const getRateLimitPolicy = (req) => {
   const requestPath = String(req.path || '');
 
-  if (/^\/api\/auth\/(login|register|signup|forgot-password|reset-password)/.test(requestPath)) {
+  if (/^\/api\/auth\/(login|register|signup|social)/.test(requestPath)) {
     return {
       name: 'auth',
       max: Math.max(1, Number(appConfig.rateLimitAuthMax || 30)),

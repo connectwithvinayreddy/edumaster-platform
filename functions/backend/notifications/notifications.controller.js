@@ -3,7 +3,10 @@ const { notificationsRepository } = require('../lib/repositories.js');
 
 const getNotifications = async (req, res) => {
   try {
-    const notifications = await notificationsRepository.list(req.query.userId);
+    const requestedUserId = req.user?.role === 'admin' && req.query.userId
+      ? req.query.userId
+      : req.user?.id;
+    const notifications = await notificationsRepository.list(requestedUserId);
     res.json(notifications);
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -21,12 +24,13 @@ const sendNotification = async (req, res) => {
       actionUrl,
       actionLabel,
       payload,
+      audience,
     } = req.body || {};
-    if (!userId) {
-      return res.status(400).json({ message: 'userId is required' });
+    if (!userId && audience !== 'all') {
+      return res.status(400).json({ message: 'userId or audience=all is required' });
     }
 
-    const notification = await notificationsRepository.create({
+    const notifications = await notificationsRepository.notifyAnnouncement({
       userId,
       title,
       message,
@@ -36,7 +40,11 @@ const sendNotification = async (req, res) => {
       actionLabel,
       payload,
     });
-    res.json({ message: 'Notification sent', notification });
+    res.json({
+      message: userId ? 'Notification sent' : 'Announcement sent',
+      notification: notifications[0] || null,
+      notificationsSent: notifications.length,
+    });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }

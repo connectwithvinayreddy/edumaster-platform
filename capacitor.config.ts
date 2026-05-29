@@ -7,6 +7,9 @@ const config: CapacitorConfig = {
   server: {
     androidScheme: 'https',
     allowNavigation: [
+      'app.varonenglishapp.in',
+      'live.varonenglishapp.in',
+      '*.varonenglishapp.in',
       'app.varoonenglish.com',
       '*.varoonenglish.com',
       'app.178.105.48.179.nip.io',

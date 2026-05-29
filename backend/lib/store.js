@@ -16,6 +16,8 @@ const state = {
   loginSessions: [],
   deviceActivities: [],
   notifications: [],
+  lessonDoubtThreads: [],
+  lessonDoubtMessages: [],
   referrals: [],
   uploads: [],
   payments: [],

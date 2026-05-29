@@ -11,6 +11,7 @@ const schemaStatements = [
       id TEXT PRIMARY KEY,
       full_name VARCHAR(120) NOT NULL,
       email VARCHAR(160) UNIQUE NOT NULL,
+      mobile_number VARCHAR(20),
       password_hash TEXT NOT NULL,
       role VARCHAR(20) NOT NULL DEFAULT 'student',
       device JSONB,
@@ -23,6 +24,7 @@ const schemaStatements = [
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
   `,
+  `ALTER TABLE users ADD COLUMN IF NOT EXISTS mobile_number VARCHAR(20)`,
   `
     CREATE TABLE IF NOT EXISTS user_sessions (
       id TEXT PRIMARY KEY,
@@ -57,6 +59,7 @@ const schemaStatements = [
       subject VARCHAR(120) NOT NULL DEFAULT 'General',
       level VARCHAR(60) NOT NULL DEFAULT 'Full Course',
       price_inr NUMERIC(10,2) NOT NULL DEFAULT 0,
+      offer_percentage NUMERIC(5,2) NOT NULL DEFAULT 0,
       validity_days INT NOT NULL DEFAULT 365,
       thumbnail_url TEXT,
       instructor_name VARCHAR(120),
@@ -66,6 +69,7 @@ const schemaStatements = [
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
   `,
+  'ALTER TABLE courses ADD COLUMN IF NOT EXISTS offer_percentage NUMERIC(5,2) NOT NULL DEFAULT 0',
   `
     CREATE TABLE IF NOT EXISTS tests (
       id TEXT PRIMARY KEY,
@@ -77,11 +81,13 @@ const schemaStatements = [
       total_marks NUMERIC(8,2) NOT NULL DEFAULT 0,
       negative_marking NUMERIC(6,2) NOT NULL DEFAULT 0,
       course_id TEXT,
+      companion_video JSONB,
       section_breakup JSONB NOT NULL DEFAULT '[]'::jsonb,
       questions JSONB NOT NULL DEFAULT '[]'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
   `,
+  `ALTER TABLE tests ADD COLUMN IF NOT EXISTS companion_video JSONB`,
   `
     CREATE TABLE IF NOT EXISTS test_attempts (
       id TEXT PRIMARY KEY,
@@ -144,8 +150,17 @@ const schemaStatements = [
       progress_percent NUMERIC(5,2) NOT NULL DEFAULT 0,
       progress_seconds INT NOT NULL DEFAULT 0,
       completed BOOLEAN NOT NULL DEFAULT FALSE,
+      lesson_stage VARCHAR(20),
+      exam_submitted BOOLEAN NOT NULL DEFAULT FALSE,
+      exam_selected_option INT,
+      explanation_seconds INT NOT NULL DEFAULT 0,
+      video_watch_count INT NOT NULL DEFAULT 0,
+      explanation_watch_count INT NOT NULL DEFAULT 0,
+      last_session_id TEXT,
+      last_device JSONB,
+      last_watched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      UNIQUE (user_id, lesson_id)
+      UNIQUE (user_id, course_id, lesson_id)
     )
   `,
   `
@@ -202,6 +217,12 @@ const schemaStatements = [
       recording_published_at TIMESTAMPTZ,
       recording_expires_at TIMESTAMPTZ,
       recording_duration_minutes INT,
+      poster_url TEXT,
+      class_description TEXT,
+      teacher_profile JSONB NOT NULL DEFAULT '{}'::jsonb,
+      session_notes JSONB NOT NULL DEFAULT '[]'::jsonb,
+      resource_items JSONB NOT NULL DEFAULT '[]'::jsonb,
+      active_poll JSONB,
       topic_tags JSONB NOT NULL DEFAULT '[]'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
@@ -226,6 +247,12 @@ const schemaStatements = [
   'ALTER TABLE live_classes ADD COLUMN IF NOT EXISTS recording_published_at TIMESTAMPTZ',
   'ALTER TABLE live_classes ADD COLUMN IF NOT EXISTS recording_expires_at TIMESTAMPTZ',
   'ALTER TABLE live_classes ADD COLUMN IF NOT EXISTS recording_duration_minutes INT',
+  'ALTER TABLE live_classes ADD COLUMN IF NOT EXISTS poster_url TEXT',
+  'ALTER TABLE live_classes ADD COLUMN IF NOT EXISTS class_description TEXT',
+  'ALTER TABLE live_classes ADD COLUMN IF NOT EXISTS teacher_profile JSONB NOT NULL DEFAULT \'{}\'::jsonb',
+  'ALTER TABLE live_classes ADD COLUMN IF NOT EXISTS session_notes JSONB NOT NULL DEFAULT \'[]\'::jsonb',
+  'ALTER TABLE live_classes ADD COLUMN IF NOT EXISTS resource_items JSONB NOT NULL DEFAULT \'[]\'::jsonb',
+  'ALTER TABLE live_classes ADD COLUMN IF NOT EXISTS active_poll JSONB',
   'ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS view_count INT NOT NULL DEFAULT 0',
   `
     ALTER TABLE video_access_grants
@@ -237,6 +264,33 @@ const schemaStatements = [
   'ALTER TABLE video_access_grants ADD COLUMN IF NOT EXISTS active_session_id TEXT',
   'ALTER TABLE video_access_grants ADD COLUMN IF NOT EXISTS last_started_at TIMESTAMPTZ',
   'ALTER TABLE video_access_grants ADD COLUMN IF NOT EXISTS last_completed_at TIMESTAMPTZ',
+  'ALTER TABLE watch_history ADD COLUMN IF NOT EXISTS lesson_stage VARCHAR(20)',
+  'ALTER TABLE watch_history ADD COLUMN IF NOT EXISTS exam_submitted BOOLEAN NOT NULL DEFAULT FALSE',
+  'ALTER TABLE watch_history ADD COLUMN IF NOT EXISTS exam_selected_option INT',
+  'ALTER TABLE watch_history ADD COLUMN IF NOT EXISTS explanation_seconds INT NOT NULL DEFAULT 0',
+  'ALTER TABLE watch_history ADD COLUMN IF NOT EXISTS video_watch_count INT NOT NULL DEFAULT 0',
+  'ALTER TABLE watch_history ADD COLUMN IF NOT EXISTS explanation_watch_count INT NOT NULL DEFAULT 0',
+  'ALTER TABLE watch_history ADD COLUMN IF NOT EXISTS last_session_id TEXT',
+  'ALTER TABLE watch_history ADD COLUMN IF NOT EXISTS last_device JSONB',
+  'ALTER TABLE watch_history ADD COLUMN IF NOT EXISTS last_watched_at TIMESTAMPTZ NOT NULL DEFAULT now()',
+  `
+    WITH ranked_watch_history AS (
+      SELECT
+        id,
+        ROW_NUMBER() OVER (
+          PARTITION BY user_id, course_id, lesson_id
+          ORDER BY completed DESC, progress_seconds DESC, updated_at DESC, id DESC
+        ) AS row_rank
+      FROM watch_history
+    )
+    DELETE FROM watch_history
+    WHERE id IN (
+      SELECT id FROM ranked_watch_history WHERE row_rank > 1
+    )
+  `,
+  'ALTER TABLE watch_history DROP CONSTRAINT IF EXISTS watch_history_user_id_lesson_id_key',
+  'ALTER TABLE watch_history DROP CONSTRAINT IF EXISTS watch_history_user_id_course_id_lesson_id_key',
+  'ALTER TABLE watch_history ADD CONSTRAINT watch_history_user_id_course_id_lesson_id_key UNIQUE (user_id, course_id, lesson_id)',
   `
     CREATE TABLE IF NOT EXISTS live_replay_access_grants (
       id TEXT PRIMARY KEY,
@@ -315,6 +369,37 @@ const schemaStatements = [
   'ALTER TABLE notifications ADD COLUMN IF NOT EXISTS action_label VARCHAR(80)',
   'ALTER TABLE notifications ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT \'{}\'::jsonb',
   `
+    CREATE TABLE IF NOT EXISTS lesson_doubt_threads (
+      id TEXT PRIMARY KEY,
+      course_id TEXT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+      lesson_id TEXT NOT NULL,
+      student_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      student_name VARCHAR(160) NOT NULL,
+      student_email VARCHAR(160),
+      course_title VARCHAR(255) NOT NULL,
+      module_title VARCHAR(160),
+      chapter_title VARCHAR(160),
+      lesson_title VARCHAR(255) NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'open',
+      last_message_preview TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      last_message_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (course_id, lesson_id, student_user_id)
+    )
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS lesson_doubt_messages (
+      id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL REFERENCES lesson_doubt_threads(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      user_role VARCHAR(20) NOT NULL DEFAULT 'student',
+      user_name VARCHAR(160) NOT NULL,
+      message TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `,
+  `
     CREATE TABLE IF NOT EXISTS referrals (
       id TEXT PRIMARY KEY,
       referrer_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -367,16 +452,37 @@ const schemaStatements = [
     )
   `,
   'CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id)',
+  'CREATE INDEX IF NOT EXISTS idx_user_sessions_user_status_last_seen ON user_sessions(user_id, status, last_seen_at DESC)',
   'CREATE INDEX IF NOT EXISTS idx_device_activity_user_id ON device_activity(user_id)',
+  'CREATE INDEX IF NOT EXISTS idx_device_activity_user_created ON device_activity(user_id, created_at DESC)',
   'CREATE INDEX IF NOT EXISTS idx_test_attempts_user_id ON test_attempts(user_id)',
+  'CREATE INDEX IF NOT EXISTS idx_test_attempts_user_completed ON test_attempts(user_id, completed_at DESC)',
   'CREATE INDEX IF NOT EXISTS idx_daily_quiz_attempts_user_id ON daily_quiz_attempts(user_id)',
+  'CREATE INDEX IF NOT EXISTS idx_daily_quiz_attempts_quiz_submitted ON daily_quiz_attempts(daily_quiz_id, submitted_at DESC)',
   'CREATE INDEX IF NOT EXISTS idx_watch_history_user_course ON watch_history(user_id, course_id)',
+  'CREATE INDEX IF NOT EXISTS idx_watch_history_user_lesson ON watch_history(user_id, lesson_id)',
+  'CREATE INDEX IF NOT EXISTS idx_watch_history_user_course_lesson ON watch_history(user_id, course_id, lesson_id)',
   'CREATE INDEX IF NOT EXISTS idx_notifications_user_id ON notifications(user_id)',
+  'CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications(user_id, created_at DESC)',
+  'CREATE INDEX IF NOT EXISTS idx_lesson_doubt_threads_lesson ON lesson_doubt_threads(course_id, lesson_id, last_message_at DESC)',
+  'CREATE INDEX IF NOT EXISTS idx_lesson_doubt_threads_student ON lesson_doubt_threads(student_user_id, last_message_at DESC)',
+  'CREATE INDEX IF NOT EXISTS idx_lesson_doubt_messages_thread_created ON lesson_doubt_messages(thread_id, created_at ASC)',
   'CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id)',
+  'CREATE INDEX IF NOT EXISTS idx_payments_user_created ON payments(user_id, created_at DESC)',
+  'CREATE INDEX IF NOT EXISTS idx_enrollments_user_course ON enrollments(user_id, course_id)',
+  'CREATE INDEX IF NOT EXISTS idx_enrollments_course_user ON enrollments(course_id, user_id)',
+  'CREATE INDEX IF NOT EXISTS idx_live_chat_messages_class_created ON live_chat_messages(live_class_id, created_at)',
+  'CREATE INDEX IF NOT EXISTS idx_live_classes_status_start ON live_classes(status, scheduled_start_at)',
+  'CREATE INDEX IF NOT EXISTS idx_subscriptions_user_status ON subscriptions(user_id, status)',
+  'CREATE INDEX IF NOT EXISTS idx_video_access_grants_user_lesson ON video_access_grants(user_id, course_id, lesson_id)',
+  'CREATE INDEX IF NOT EXISTS idx_live_replay_access_grants_user_live ON live_replay_access_grants(user_id, live_class_id)',
 ];
 
 const isSslDisabledTarget = (connectionString) =>
-  connectionString.includes('localhost') || connectionString.includes('127.0.0.1');
+  connectionString.includes('localhost')
+  || connectionString.includes('127.0.0.1')
+  || connectionString.includes('@postgres:')
+  || connectionString.includes('//postgres:');
 
 const getPool = () => {
   if (!appConfig.postgresUrl) {
@@ -386,9 +492,11 @@ const getPool = () => {
   if (!pool) {
     pool = new Pool({
       connectionString: appConfig.postgresUrl,
-      max: 20,
-      idleTimeoutMillis: 30_000,
-      connectionTimeoutMillis: 5_000,
+      max: Math.max(1, Number(appConfig.postgresPoolMax || 20)),
+      idleTimeoutMillis: Math.max(1_000, Number(appConfig.postgresIdleTimeoutMillis || 30_000)),
+      connectionTimeoutMillis: Math.max(1_000, Number(appConfig.postgresConnectionTimeoutMillis || 10_000)),
+      statement_timeout: Math.max(1_000, Number(appConfig.postgresStatementTimeoutMillis || 15_000)),
+      query_timeout: Math.max(1_000, Number(appConfig.postgresStatementTimeoutMillis || 15_000)),
       ssl: isSslDisabledTarget(appConfig.postgresUrl)
         ? false
         : { rejectUnauthorized: false },
@@ -523,6 +631,11 @@ const checkPostgresHealth = async () => {
       enabled: true,
       status: 'up',
       detail: result.rows[0]?.database || 'connected',
+      pool: {
+        total: currentPool.totalCount,
+        idle: currentPool.idleCount,
+        waiting: currentPool.waitingCount,
+      },
     };
   } catch (error) {
     postgresReady = false;

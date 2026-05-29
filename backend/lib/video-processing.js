@@ -1,4 +1,5 @@
 const fs = require('fs');
+const crypto = require('crypto');
 const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
@@ -12,7 +13,7 @@ const {
 } = require('./private-video.js');
 const {
   getPrivateVideoStorageProvider,
-  getPrivateStorageObjectBuffer,
+  downloadPrivateStorageObjectToFile,
   uploadPrivateStorageFile,
   deleteStoredPrivateVideoPrefix,
 } = require('./private-video-storage.js');
@@ -23,18 +24,28 @@ const {
 } = require('./manifest-bundle.js');
 
 const activeJobs = new Set();
+const queuedJobs = [];
+let activeTranscodingJobs = 0;
+
+const getRecordedHlsStorageProvider = () => {
+  const configured = String(appConfig.videoHlsStorageProvider || appConfig.privateVideoStorageProvider || 'local').toLowerCase();
+  if (configured === 's3') {
+    return 's3';
+  }
+  return 'local';
+};
 
 const getTargetQualities = () => {
   const configured = Array.isArray(appConfig.videoTargetRenditions) ? appConfig.videoTargetRenditions : [];
-  const supported = ['480p', '720p'];
+  const supported = ['240p', '360p', '480p', '720p'];
   const result = configured.filter((entry) => supported.includes(entry));
-  return result.length > 0 ? result : ['480p', '720p'];
+  return result.length > 0 ? result : ['240p', '360p', '480p', '720p'];
 };
 
 const createInitialVideoDeliveryState = () => ({
   deliveryProfile: appConfig.videoDeliveryProfile,
-  deliveryStrategy: appConfig.enableVideoTranscoding ? 'hls' : 'source',
-  sourceFallbackAllowed: Boolean(appConfig.sourcePlaybackFallbackEnabled),
+  deliveryStrategy: 'hls',
+  sourceFallbackAllowed: false,
   targetQualities: getTargetQualities(),
   hlsStorageProvider: null,
   hlsProcessingStatus: appConfig.enableVideoTranscoding ? 'queued' : 'ready',
@@ -55,15 +66,19 @@ const cleanupDirectory = (directoryPath) => {
   }
 };
 
-const deleteProcessedHlsAssets = async (manifestPath) => {
+const deleteProcessedHlsAssets = async (manifestPath, storageProvider = null) => {
+  if (!manifestPath) {
+    return;
+  }
+
   const resolvedManifest = resolvePrivateHlsPath(manifestPath);
-  if (resolvedManifest && fs.existsSync(path.dirname(resolvedManifest))) {
+  if ((!storageProvider || storageProvider === 'local') && resolvedManifest && fs.existsSync(path.dirname(resolvedManifest))) {
     cleanupDirectory(path.dirname(resolvedManifest));
     return;
   }
 
   await deleteStoredPrivateVideoPrefix({
-    storageProvider: getPrivateVideoStorageProvider(),
+    storageProvider: storageProvider || getRecordedHlsStorageProvider(),
     storagePathPrefix: path.posix.dirname(String(manifestPath)),
   });
 };
@@ -71,8 +86,30 @@ const deleteProcessedHlsAssets = async (manifestPath) => {
 const waitForFfmpeg = (args) =>
   new Promise((resolve, reject) => {
     const child = spawn(ffmpegPath, args, { stdio: 'ignore' });
-    child.on('error', reject);
+    let settled = false;
+    const timeoutMs = Math.max(Number(appConfig.videoTranscodingJobTimeoutMs || 0), 60_000);
+    const timeout = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      child.kill('SIGKILL');
+      reject(new Error(`ffmpeg timed out after ${Math.round(timeoutMs / 1000)} seconds`));
+    }, timeoutMs);
+    child.on('error', (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      reject(error);
+    });
     child.on('close', (code) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
       if (code === 0) {
         resolve();
         return;
@@ -80,6 +117,21 @@ const waitForFfmpeg = (args) =>
       reject(new Error(`ffmpeg exited with code ${code}`));
     });
   });
+
+const createHlsKeyInfoFile = (variantDir) => {
+  if (!appConfig.privateVideoHlsAesEncryptionEnabled) {
+    return null;
+  }
+
+  const keyFilePath = path.join(variantDir, 'enc.key');
+  const keyInfoPath = path.join(variantDir, 'enc.keyinfo');
+  const iv = crypto.randomBytes(16).toString('hex');
+
+  fs.writeFileSync(keyFilePath, crypto.randomBytes(16));
+  fs.writeFileSync(keyInfoPath, `enc.key\n${keyFilePath}\n${iv}\n`);
+
+  return keyInfoPath;
+};
 
 const writeMasterManifest = ({ outputDirectory, variants }) => {
   const lines = ['#EXTM3U', '#EXT-X-VERSION:3'];
@@ -91,6 +143,8 @@ const writeMasterManifest = ({ outputDirectory, variants }) => {
 };
 
 const renditionProfiles = {
+  '240p': { width: 426, height: 240, videoBitrate: '320k', maxRate: '342k', bufferSize: '480k', bandwidth: 400000, resolution: '426x240' },
+  '360p': { width: 640, height: 360, videoBitrate: '550k', maxRate: '588k', bufferSize: '825k', bandwidth: 650000, resolution: '640x360' },
   '480p': { width: 854, height: 480, videoBitrate: '900k', maxRate: '963k', bufferSize: '1350k', bandwidth: 1000000, resolution: '854x480' },
   '720p': { width: 1280, height: 720, videoBitrate: '2200k', maxRate: '2354k', bufferSize: '3300k', bandwidth: 2500000, resolution: '1280x720' },
 };
@@ -100,6 +154,7 @@ const hlsAssetMimeTypeByExtension = {
   '.ts': 'video/mp2t',
   '.m4s': 'video/iso.segment',
   '.mp4': 'video/mp4',
+  '.key': 'application/octet-stream',
 };
 
 const createTemporaryWorkspace = (jobId) => fs.mkdtempSync(path.join(os.tmpdir(), `edumaster-video-${jobId.replace(/[^a-zA-Z0-9_-]/g, '_')}-`));
@@ -117,17 +172,16 @@ const downloadStorageSourceToLocal = async ({ lesson, workspaceDirectory }) => {
     throw new Error('Source video file not found for HLS processing.');
   }
 
-  const sourceBuffer = await getPrivateStorageObjectBuffer({
-    storageProvider: lesson.storageProvider,
-    storagePath: lesson.storagePath,
-  });
-  if (!sourceBuffer) {
-    throw new Error('Source video file could not be downloaded from object storage.');
-  }
-
   const extension = path.extname(String(lesson.originalFilename || lesson.storagePath || 'video.mp4')) || '.mp4';
   const downloadedSourcePath = path.join(workspaceDirectory, `source${extension}`);
-  fs.writeFileSync(downloadedSourcePath, sourceBuffer);
+  const downloaded = await downloadPrivateStorageObjectToFile({
+    storageProvider: lesson.storageProvider,
+    storagePath: lesson.storagePath,
+    destinationPath: downloadedSourcePath,
+  });
+  if (!downloaded) {
+    throw new Error('Source video file could not be downloaded from object storage.');
+  }
 
   return {
     sourcePath: downloadedSourcePath,
@@ -182,6 +236,7 @@ const transcodeToHls = async ({ sourcePath, outputDirectory, qualities }) => {
     fs.mkdirSync(variantDir, { recursive: true });
     const playlistPath = path.join(variantDir, 'index.m3u8');
     const segmentPattern = path.join(variantDir, 'segment_%03d.ts');
+    const keyInfoPath = createHlsKeyInfoFile(variantDir);
 
     const args = [
       '-y',
@@ -192,6 +247,7 @@ const transcodeToHls = async ({ sourcePath, outputDirectory, qualities }) => {
       '-ar', '48000',
       '-b:a', '128k',
       '-c:v', 'libx264',
+      '-preset', 'veryfast',
       '-profile:v', 'main',
       '-crf', '23',
       '-sc_threshold', '0',
@@ -201,12 +257,17 @@ const transcodeToHls = async ({ sourcePath, outputDirectory, qualities }) => {
       '-maxrate', profile.maxRate,
       '-bufsize', profile.bufferSize,
       '-hls_time', String(appConfig.videoHlsSegmentDurationSeconds),
+      '-hls_flags', 'independent_segments',
       '-hls_playlist_type', 'vod',
+      ...(keyInfoPath ? ['-hls_key_info_file', keyInfoPath] : []),
       '-hls_segment_filename', segmentPattern,
       playlistPath,
     ];
 
     await waitForFfmpeg(args);
+    if (keyInfoPath && fs.existsSync(keyInfoPath)) {
+      fs.unlinkSync(keyInfoPath);
+    }
     variants.push({
       name: quality,
       bandwidth: profile.bandwidth,
@@ -215,6 +276,29 @@ const transcodeToHls = async ({ sourcePath, outputDirectory, qualities }) => {
   }
 
   writeMasterManifest({ outputDirectory, variants });
+};
+
+const runQueuedVideoJob = (job) => {
+  activeTranscodingJobs += 1;
+  void job().finally(() => {
+    activeTranscodingJobs = Math.max(activeTranscodingJobs - 1, 0);
+    drainVideoProcessingQueue();
+  });
+};
+
+const drainVideoProcessingQueue = () => {
+  const maxConcurrency = Math.max(Number(appConfig.videoTranscodingConcurrency || 1), 1);
+  while (activeTranscodingJobs < maxConcurrency && queuedJobs.length > 0) {
+    const nextJob = queuedJobs.shift();
+    if (nextJob) {
+      runQueuedVideoJob(nextJob);
+    }
+  }
+};
+
+const enqueueVideoProcessingJob = (job) => {
+  queuedJobs.push(job);
+  drainVideoProcessingQueue();
 };
 
 const scheduleVideoProcessing = ({ courseId, lessonId }) => {
@@ -228,7 +312,7 @@ const scheduleVideoProcessing = ({ courseId, lessonId }) => {
   }
   activeJobs.add(jobId);
 
-  setTimeout(async () => {
+  enqueueVideoProcessingJob(async () => {
     const { coursesRepository } = require('./repositories.js');
     try {
       const course = await coursesRepository.findById(courseId);
@@ -263,6 +347,7 @@ const scheduleVideoProcessing = ({ courseId, lessonId }) => {
       const outputRootPath = path.posix.dirname(outputKey);
       const manifestBundleKey = buildManifestBundleStorageKey(outputKey);
       const localOutputDirectory = path.join(workspaceDirectory, 'hls');
+      const outputStorageProvider = getRecordedHlsStorageProvider();
       const { sourcePath, cleanup } = await downloadStorageSourceToLocal({
         lesson,
         workspaceDirectory,
@@ -278,7 +363,7 @@ const scheduleVideoProcessing = ({ courseId, lessonId }) => {
         const manifestBundle = createManifestBundleFromDirectory({
           outputDirectory: localOutputDirectory,
           manifestKey: outputKey,
-          storageProvider: lesson.storageProvider || 'local',
+          storageProvider: outputStorageProvider,
           version: manifestVersion,
         });
         writeManifestBundleToDirectory({
@@ -286,7 +371,7 @@ const scheduleVideoProcessing = ({ courseId, lessonId }) => {
           bundle: manifestBundle,
         });
 
-        if ((lesson.storageProvider || 'local') === 's3') {
+        if (outputStorageProvider === 's3') {
           await deleteStoredPrivateVideoPrefix({
             storageProvider: 's3',
             storagePathPrefix: path.posix.dirname(outputKey),
@@ -306,6 +391,26 @@ const scheduleVideoProcessing = ({ courseId, lessonId }) => {
         cleanupDirectory(workspaceDirectory);
       }
 
+      const updatedLesson = await coursesRepository.updateLesson(courseId, lessonId, (current) => ({
+        ...current,
+        storagePath: appConfig.videoKeepSourceAfterProcessing ? current.storagePath : null,
+        deliveryStrategy: 'hls',
+        hlsStorageProvider: outputStorageProvider,
+        hlsProcessingStatus: 'ready',
+        hlsProcessingCompletedAt: new Date().toISOString(),
+        hlsManifestPath: outputKey,
+        hlsPlaybackPath: outputKey,
+        hlsManifestBundlePath: manifestBundleKey,
+        hlsManifestRootPath: outputRootPath,
+        hlsManifestVersion: manifestVersion,
+        hlsProcessingError: null,
+      }));
+
+      if (!updatedLesson) {
+        await deleteProcessedHlsAssets(outputKey, outputStorageProvider);
+        throw new Error(`Lesson ${lessonId} disappeared before HLS metadata could be saved.`);
+      }
+
       if (!appConfig.videoKeepSourceAfterProcessing && lesson.storagePath) {
         if ((lesson.storageProvider || 'local') === 's3') {
           const { deleteStoredPrivateVideo } = require('./private-video-storage.js');
@@ -317,21 +422,6 @@ const scheduleVideoProcessing = ({ courseId, lessonId }) => {
           fs.unlinkSync(sourcePath);
         }
       }
-
-      await coursesRepository.updateLesson(courseId, lessonId, (current) => ({
-        ...current,
-        storagePath: appConfig.videoKeepSourceAfterProcessing ? current.storagePath : null,
-        deliveryStrategy: 'hls',
-        hlsStorageProvider: lesson.storageProvider || 'local',
-        hlsProcessingStatus: 'ready',
-        hlsProcessingCompletedAt: new Date().toISOString(),
-        hlsManifestPath: outputKey,
-        hlsPlaybackPath: outputKey,
-        hlsManifestBundlePath: manifestBundleKey,
-        hlsManifestRootPath: outputRootPath,
-        hlsManifestVersion: manifestVersion,
-        hlsProcessingError: null,
-      }));
     } catch (error) {
       const { coursesRepository } = require('./repositories.js');
       await coursesRepository.updateLesson(courseId, lessonId, (current) => ({
@@ -343,11 +433,241 @@ const scheduleVideoProcessing = ({ courseId, lessonId }) => {
     } finally {
       activeJobs.delete(jobId);
     }
-  }, 25);
+  });
+};
+
+const recoverPendingCourseVideoProcessingJobs = async () => {
+  const cloudflareStreamEnabled = String(appConfig.videoProcessingProvider || '').toLowerCase() === 'cloudflare-stream';
+  if (!appConfig.enableVideoTranscoding && !cloudflareStreamEnabled) {
+    return { scanned: 0, scheduled: 0 };
+  }
+
+  const { coursesRepository } = require('./repositories.js');
+  const courses = await coursesRepository.list();
+  let scanned = 0;
+  let scheduled = 0;
+
+  for (const course of courses || []) {
+    for (const moduleEntry of course.modules || []) {
+      const lessons = [
+        ...(moduleEntry.lessons || []),
+        ...((moduleEntry.chapters || []).flatMap((chapter) => chapter.lessons || [])),
+      ];
+
+      for (const lesson of lessons) {
+        scanned += 1;
+        const status = String(lesson.hlsProcessingStatus || '').toLowerCase();
+        const provider = String(lesson.storageProvider || '').toLowerCase();
+        const streamProvider = String(lesson.streamProvider || '').toLowerCase();
+        const cloudflareUid = lesson.cloudflareStreamUid || lesson.streamUid || null;
+        if ((provider === 'cloudflare-stream' || streamProvider === 'cloudflare-stream') && cloudflareUid) {
+          if (['queued', 'processing', 'upload-pending', ''].includes(status) || !lesson.playbackReady) {
+            const { scheduleCloudflareStreamStatusPolling } = require('./cloudflare-stream.js');
+            scheduleCloudflareStreamStatusPolling({ uid: cloudflareUid });
+            scheduled += 1;
+          }
+          continue;
+        }
+
+        const hasSource = Boolean(lesson.storagePath);
+        const needsHls = lesson.type === 'private-video'
+          && appConfig.enableVideoTranscoding
+          && lesson.deliveryStrategy === 'hls'
+          && hasSource
+          && !lesson.hlsPlaybackPath
+          && ['queued', 'processing', 'failed'].includes(status)
+          && provider !== 'bunny-stream';
+
+        if (!needsHls) {
+          continue;
+        }
+
+        await coursesRepository.updateLesson(course._id, lesson.id, (current) => ({
+          ...current,
+          hlsProcessingStatus: 'queued',
+          hlsProcessingQueuedAt: current.hlsProcessingQueuedAt || new Date().toISOString(),
+          hlsProcessingStartedAt: null,
+          hlsProcessingError: null,
+        }));
+        scheduleVideoProcessing({ courseId: course._id, lessonId: lesson.id });
+        scheduled += 1;
+      }
+    }
+  }
+
+  return { scanned, scheduled };
+};
+
+const maybeRecoverStaleCourseVideoProcessingJob = async ({ courseId, lesson }) => {
+  if (!appConfig.enableVideoTranscoding || !lesson) {
+    return false;
+  }
+
+  const status = String(lesson.hlsProcessingStatus || '').toLowerCase();
+  const staleAfterMs = Math.max(Number(appConfig.videoProcessingStaleAfterMs || 0), 60_000);
+  const startedAt = Date.parse(lesson.hlsProcessingStartedAt || lesson.hlsProcessingQueuedAt || lesson.uploadedAt || 0);
+  const stale = Number.isFinite(startedAt) && startedAt > 0 && Date.now() - startedAt > staleAfterMs;
+  const needsHls = lesson.type === 'private-video'
+    && lesson.deliveryStrategy === 'hls'
+    && Boolean(lesson.storagePath)
+    && !lesson.hlsPlaybackPath
+    && ['queued', 'processing', 'failed'].includes(status)
+    && String(lesson.storageProvider || '').toLowerCase() !== 'bunny-stream';
+
+  if (!needsHls || !stale) {
+    return false;
+  }
+
+  const { coursesRepository } = require('./repositories.js');
+  const updatedLesson = await coursesRepository.updateLesson(courseId, lesson.id, (current) => ({
+    ...current,
+    hlsProcessingStatus: 'queued',
+    hlsProcessingQueuedAt: new Date().toISOString(),
+    hlsProcessingStartedAt: null,
+    hlsProcessingError: null,
+  }));
+
+  if (!updatedLesson) {
+    return false;
+  }
+
+  scheduleVideoProcessing({ courseId, lessonId: lesson.id });
+  return true;
+};
+
+const scheduleTestVideoProcessing = ({ testId }) => {
+  if (!appConfig.enableVideoTranscoding) {
+    return;
+  }
+
+  const jobId = `test:${testId}`;
+  if (activeJobs.has(jobId)) {
+    return;
+  }
+  activeJobs.add(jobId);
+
+  enqueueVideoProcessingJob(async () => {
+    const { testsRepository } = require('./repositories.js');
+    try {
+      const test = await testsRepository.findById(testId);
+      const video = test?.companionVideo || null;
+
+      if (!video || !video.storagePath) {
+        await testsRepository.updateCompanionVideo(testId, (current) => ({
+          ...(current || {}),
+          hlsProcessingStatus: 'failed',
+          hlsProcessingCompletedAt: new Date().toISOString(),
+          hlsProcessingError: 'Source video file is missing for HLS processing.',
+        }));
+        return;
+      }
+
+      await testsRepository.updateCompanionVideo(testId, (current) => ({
+        ...(current || {}),
+        hlsProcessingStatus: 'processing',
+        hlsProcessingStartedAt: new Date().toISOString(),
+        hlsProcessingError: null,
+      }));
+
+      if (!ffmpegPath) {
+        throw new Error('ffmpeg runtime is unavailable.');
+      }
+
+      const workspaceDirectory = createTemporaryWorkspace(jobId);
+      const videoId = String(video.id || `test-video-${testId}`);
+      const outputKey = buildPrivateHlsAssetKey({ courseId: 'tests', moduleId: testId, lessonId: videoId, assetName: 'master.m3u8' });
+      const outputRootPath = path.posix.dirname(outputKey);
+      const manifestBundleKey = buildManifestBundleStorageKey(outputKey);
+      const localOutputDirectory = path.join(workspaceDirectory, 'hls');
+      const outputStorageProvider = getRecordedHlsStorageProvider();
+      const { sourcePath, cleanup } = await downloadStorageSourceToLocal({
+        lesson: video,
+        workspaceDirectory,
+      });
+      const manifestVersion = Date.now().toString(36);
+
+      try {
+        await transcodeToHls({
+          sourcePath,
+          outputDirectory: localOutputDirectory,
+          qualities: Array.isArray(video.targetQualities) && video.targetQualities.length > 0 ? video.targetQualities : getTargetQualities(),
+        });
+        const manifestBundle = createManifestBundleFromDirectory({
+          outputDirectory: localOutputDirectory,
+          manifestKey: outputKey,
+          storageProvider: outputStorageProvider,
+          version: manifestVersion,
+        });
+        writeManifestBundleToDirectory({
+          outputDirectory: localOutputDirectory,
+          bundle: manifestBundle,
+        });
+
+        if (outputStorageProvider === 's3') {
+          await deleteStoredPrivateVideoPrefix({
+            storageProvider: 's3',
+            storagePathPrefix: path.posix.dirname(outputKey),
+          });
+          await uploadProcessedHlsDirectory({
+            outputDirectory: localOutputDirectory,
+            manifestKey: outputKey,
+          });
+        } else {
+          const resolvedOutputDirectory = path.dirname(resolvePrivateHlsPath(outputKey));
+          cleanupDirectory(resolvedOutputDirectory);
+          fs.mkdirSync(path.dirname(resolvedOutputDirectory), { recursive: true });
+          fs.renameSync(localOutputDirectory, resolvedOutputDirectory);
+        }
+      } finally {
+        cleanup();
+        cleanupDirectory(workspaceDirectory);
+      }
+
+      if (!appConfig.videoKeepSourceAfterProcessing && video.storagePath) {
+        if ((video.storageProvider || 'local') === 's3') {
+          const { deleteStoredPrivateVideo } = require('./private-video-storage.js');
+          await deleteStoredPrivateVideo({
+            storageProvider: video.storageProvider,
+            storagePath: video.storagePath,
+          });
+        } else if (sourcePath && fs.existsSync(sourcePath)) {
+          fs.unlinkSync(sourcePath);
+        }
+      }
+
+      await testsRepository.updateCompanionVideo(testId, (current) => ({
+        ...(current || {}),
+        storagePath: appConfig.videoKeepSourceAfterProcessing ? current?.storagePath : null,
+        deliveryStrategy: 'hls',
+        hlsStorageProvider: outputStorageProvider,
+        hlsProcessingStatus: 'ready',
+        hlsProcessingCompletedAt: new Date().toISOString(),
+        hlsManifestPath: outputKey,
+        hlsPlaybackPath: outputKey,
+        hlsManifestBundlePath: manifestBundleKey,
+        hlsManifestRootPath: outputRootPath,
+        hlsManifestVersion: manifestVersion,
+        hlsProcessingError: null,
+      }));
+    } catch (error) {
+      const { testsRepository } = require('./repositories.js');
+      await testsRepository.updateCompanionVideo(testId, (current) => ({
+        ...(current || {}),
+        hlsProcessingStatus: 'failed',
+        hlsProcessingCompletedAt: new Date().toISOString(),
+        hlsProcessingError: error instanceof Error ? error.message : 'Video processing failed.',
+      }));
+    } finally {
+      activeJobs.delete(jobId);
+    }
+  });
 };
 
 module.exports = {
   createInitialVideoDeliveryState,
   scheduleVideoProcessing,
+  scheduleTestVideoProcessing,
+  recoverPendingCourseVideoProcessingJobs,
+  maybeRecoverStaleCourseVideoProcessingJob,
   deleteProcessedHlsAssets,
 };

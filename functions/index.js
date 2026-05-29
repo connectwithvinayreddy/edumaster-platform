@@ -266,7 +266,11 @@ const phonePeReturnHtml = (payload) => `<!DOCTYPE html>
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', true);
-app.use(express.json());
+app.use(express.json({
+  verify: (req, _res, buffer) => {
+    req.rawBody = Buffer.from(buffer);
+  },
+}));
 app.use(addRootSecurityHeaders);
 app.use('/backend', backendApp);
 

@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { pipeline } = require('stream/promises');
 const {
   S3Client,
   PutObjectCommand,
@@ -27,6 +28,12 @@ const hasS3Credentials = () => Boolean(
   && appConfig.s3SecretAccessKey,
 );
 
+const assertS3StorageConfigured = () => {
+  if (!hasS3Credentials()) {
+    throw new Error('Cloudflare R2 / S3-compatible object storage is not fully configured.');
+  }
+};
+
 const inferStorageProvider = ({ storageProvider, storagePath }) => {
   if (storageProvider) {
     return storageProvider;
@@ -40,7 +47,7 @@ const inferStorageProvider = ({ storageProvider, storagePath }) => {
 };
 
 const getPrivateVideoStorageProvider = () => (
-  appConfig.privateVideoStorageProvider === 's3' && hasS3Credentials() ? 's3' : 'local'
+  appConfig.privateVideoStorageProvider === 's3' ? 's3' : 'local'
 );
 
 const isS3Provider = (value) => String(value || '').toLowerCase() === 's3';
@@ -94,6 +101,7 @@ const storePrivateVideoUpload = async ({
   const provider = getPrivateVideoStorageProvider();
 
   if (provider === 's3') {
+    assertS3StorageConfigured();
     await getS3Client().send(new PutObjectCommand({
       Bucket: appConfig.storageBucket,
       Key: storageKey,
@@ -212,8 +220,15 @@ const uploadPrivateStorageFile = async ({
 const getPrivateStorageObjectBuffer = async ({ storageProvider, storagePath }) => {
   const provider = inferStorageProvider({ storageProvider, storagePath });
   if (provider !== 's3' || !hasS3Credentials()) {
-    const localPath = resolvePrivateVideoPath(storagePath) || resolvePrivateHlsPath(storagePath);
-    if (!localPath || !fs.existsSync(localPath)) {
+    if (provider === 's3') {
+      throw new Error('Cloudflare R2 / S3-compatible object storage is not fully configured.');
+    }
+    const localVideoPath = resolvePrivateVideoPath(storagePath);
+    const localHlsPath = resolvePrivateHlsPath(storagePath);
+    const localPath = (localVideoPath && fs.existsSync(localVideoPath))
+      ? localVideoPath
+      : ((localHlsPath && fs.existsSync(localHlsPath)) ? localHlsPath : null);
+    if (!localPath) {
       return null;
     }
     return fs.readFileSync(localPath);
@@ -234,6 +249,43 @@ const getPrivateStorageObjectBuffer = async ({ storageProvider, storagePath }) =
   }
 
   return Buffer.concat(chunks);
+};
+
+const downloadPrivateStorageObjectToFile = async ({ storageProvider, storagePath, destinationPath }) => {
+  const provider = inferStorageProvider({ storageProvider, storagePath });
+  if (!destinationPath) {
+    throw new Error('Destination path is required for object download.');
+  }
+
+  ensureStorageDirectory(destinationPath);
+
+  if (provider !== 's3' || !hasS3Credentials()) {
+    if (provider === 's3') {
+      throw new Error('Cloudflare R2 / S3-compatible object storage is not fully configured.');
+    }
+    const localVideoPath = resolvePrivateVideoPath(storagePath);
+    const localHlsPath = resolvePrivateHlsPath(storagePath);
+    const localPath = (localVideoPath && fs.existsSync(localVideoPath))
+      ? localVideoPath
+      : ((localHlsPath && fs.existsSync(localHlsPath)) ? localHlsPath : null);
+    if (!localPath) {
+      return false;
+    }
+    fs.copyFileSync(localPath, destinationPath);
+    return true;
+  }
+
+  const response = await getS3Client().send(new GetObjectCommand({
+    Bucket: appConfig.storageBucket,
+    Key: storagePath,
+  }));
+
+  if (!response.Body) {
+    return false;
+  }
+
+  await pipeline(response.Body, fs.createWriteStream(destinationPath));
+  return true;
 };
 
 const getPrivateStorageObjectText = async ({ storageProvider, storagePath, encoding = 'utf8' }) => {
@@ -260,6 +312,9 @@ const getSignedPrivateVideoUrl = async ({ storagePath, mimeType }) => {
   }
 
   if (getPrivateVideoStorageProvider() !== 's3' || !hasS3Credentials()) {
+    if (getPrivateVideoStorageProvider() === 's3') {
+      throw new Error('Cloudflare R2 / S3-compatible object storage is not fully configured.');
+    }
     return null;
   }
 
@@ -304,6 +359,7 @@ module.exports = {
   deleteStoredPrivateVideo,
   deleteStoredPrivateVideoPrefix,
   uploadPrivateStorageFile,
+  downloadPrivateStorageObjectToFile,
   getPrivateStorageObjectBuffer,
   getPrivateStorageObjectText,
   getPrivateStorageObjectJson,

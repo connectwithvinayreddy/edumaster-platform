@@ -3,12 +3,75 @@ import Hls from 'hls.js';
 import { BookOpen, CalendarClock, ChevronLeft, ChevronRight, Clock3, LoaderCircle, Lock, Maximize2, MessageSquare, Minimize2, PlayCircle, Radio, Search, Sparkles, Video, Wallet } from 'lucide-react';
 import { useAuth } from '../AuthContext';
 import { ProtectedLivePlayback } from './ProtectedLivePlayback';
-import { EduService, type CoursePaymentProvider } from '../EduService';
+import { ResilientHlsVideo } from './ResilientHlsVideo';
+import { EduService } from '../EduService';
+import { openRazorpayCheckout } from '../lib/razorpayCheckout';
 import { cn } from '../lib/utils';
 import { wireHlsPlaybackMetrics } from '../lib/hlsPlaybackMetrics';
+import {
+  createProtectedVodHlsConfig,
+  getDefaultRecordedVideoQualityHeight,
+  getRecordedVideoQualityLevel,
+  getRecordedVideoQualityOptions,
+  type RecordedVideoQualityOption,
+  scheduleAutoLevelRelease,
+  shouldFallbackToSourceFromHlsError,
+} from '../lib/hlsPlaybackTuning';
 import { CourseCard, CourseLesson, LiveClass, LiveClassAccess, PlatformOverview, ProtectedLessonPlayback } from '../types';
 
 const currency = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 });
+
+const getDiscountedCoursePrice = (course: CourseCard) => {
+  const basePrice = Math.max(Number(course.price || 0), 1);
+  const offerPercentage = Math.min(Math.max(Number(course.offerPercentage || 0), 0), 100);
+  const discountedPrice = basePrice * (1 - (offerPercentage / 100));
+  return Math.max(Number(discountedPrice.toFixed(2)), 1);
+};
+
+const getCoursePriceSummary = (course: CourseCard) => {
+  const finalPrice = getDiscountedCoursePrice(course);
+  const offerPercentage = Number(course.offerPercentage || 0);
+  return offerPercentage > 0
+    ? `${currency.format(finalPrice)} • ${offerPercentage}% off`
+    : currency.format(finalPrice);
+};
+
+const getCourseFeeSummary = (course: CourseCard) => {
+  const basePrice = Math.max(Number(course.price || 0), 1);
+  const finalPrice = getDiscountedCoursePrice(course);
+  const offerPercentage = Number(course.offerPercentage || 0);
+
+  return offerPercentage > 0
+    ? `Course fee ${currency.format(basePrice)} • ${offerPercentage}% off • Pay ${currency.format(finalPrice)}`
+    : `Course fee ${currency.format(basePrice)}`;
+};
+
+const getCourseSavingsSummary = (course: CourseCard) => {
+  const basePrice = Math.max(Number(course.price || 0), 1);
+  const finalPrice = getDiscountedCoursePrice(course);
+  const savings = Math.max(basePrice - finalPrice, 0);
+  const offerPercentage = Number(course.offerPercentage || 0);
+
+  if (offerPercentage <= 0 || savings <= 0) {
+    return null;
+  }
+
+  return `You save ${currency.format(savings)} on this offer`;
+};
+
+const getCoursePricingMeta = (course: CourseCard) => {
+  const basePrice = Math.max(Number(course.price || 0), 1);
+  const finalPrice = getDiscountedCoursePrice(course);
+  const offerPercentage = Number(course.offerPercentage || 0);
+  const savings = Math.max(basePrice - finalPrice, 0);
+
+  return {
+    basePrice,
+    finalPrice,
+    offerPercentage,
+    savings,
+  };
+};
 
 const formatPlaybackTime = (seconds: number) => {
   const safeSeconds = Math.max(Math.floor(seconds || 0), 0);
@@ -24,7 +87,7 @@ const formatPlaybackTime = (seconds: number) => {
 };
 
 const getCoursePurchaseLabel = (course: CourseCard) =>
-  course.price === 0 ? 'Start free course' : `Buy course for ${currency.format(course.price)}`;
+  `Buy course for ${getCoursePriceSummary(course)}`;
 
 let youtubeIframeApiPromise: Promise<void> | null = null;
 
@@ -83,6 +146,14 @@ const getYouTubeVideoIdFromEmbedUrl = (embedUrl?: string | null) => {
   }
 };
 
+const isDemoPreviewLesson = (lesson?: CourseLesson | null) =>
+  Boolean(
+    lesson
+    && !lesson.locked
+    && !lesson.premium
+    && ['youtube', 'private-video', 'video'].includes(String(lesson.type || '')),
+  );
+
 const buildSequentialAccessMap = (
   course: CourseCard | null,
   lessonProgressMap: Map<string, ResumeRecord>,
@@ -93,6 +164,14 @@ const buildSequentialAccessMap = (
 
   lessonEntries.forEach((entry, index) => {
     if (!hasCourseAccess) {
+      if (isDemoPreviewLesson(entry.lesson)) {
+        accessMap.set(entry.lesson.id, {
+          unlocked: true,
+          reason: 'Demo preview available before purchase.',
+        });
+        return;
+      }
+
       accessMap.set(entry.lesson.id, {
         unlocked: false,
         reason: 'Enroll in this course to access the lesson player.',
@@ -861,7 +940,7 @@ export const CoursesTab = ({
   }>>({});
   const [courseView, setCourseView] = useState<'my' | 'catalog'>(enrolledCourseCount > 0 ? 'my' : 'catalog');
   const [courseQuery, setCourseQuery] = useState('');
-  const [accessFilter, setAccessFilter] = useState<'all' | 'unlocked' | 'premium' | 'free'>('all');
+  const [accessFilter, setAccessFilter] = useState<'all' | 'unlocked' | 'premium'>('all');
   const [categoryFilter, setCategoryFilter] = useState<string>('all');
   const [selectedCourseId, setSelectedCourseId] = useState<string | null>(defaultCourseId);
   const [selectedLessonId, setSelectedLessonId] = useState<string | null>(initialLessonId || null);
@@ -869,12 +948,18 @@ export const CoursesTab = ({
   const [selectedModuleId, setSelectedModuleId] = useState<string | null>(null);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [busyCourseId, setBusyCourseId] = useState<string | null>(null);
+  const [courseAccessMessage, setCourseAccessMessage] = useState<string | null>(null);
   const [lessonDoubt, setLessonDoubt] = useState('');
   const [lessonDoubtAnswer, setLessonDoubtAnswer] = useState<string | null>(null);
   const [askingLessonDoubt, setAskingLessonDoubt] = useState(false);
   const [protectedLessonPlayback, setProtectedLessonPlayback] = useState<ProtectedLessonPlayback | null>(null);
   const [loadingProtectedLesson, setLoadingProtectedLesson] = useState(false);
   const [protectedLessonError, setProtectedLessonError] = useState<string | null>(null);
+  const [useProtectedSourceFallback, setUseProtectedSourceFallback] = useState(false);
+  const [privateVideoQualityOptions, setPrivateVideoQualityOptions] = useState<RecordedVideoQualityOption[]>([]);
+  const [selectedPrivateVideoQuality, setSelectedPrivateVideoQuality] = useState<number>(480);
+  const [courseCaptureWarning, setCourseCaptureWarning] = useState('');
+  const [coursePrivacyShieldActive, setCoursePrivacyShieldActive] = useState(false);
   const [selectedRecordingId, setSelectedRecordingId] = useState<string | null>(null);
   const [selectedRecordingAccess, setSelectedRecordingAccess] = useState<LiveClassAccess | null>(null);
   const [loadingRecordingAccess, setLoadingRecordingAccess] = useState(false);
@@ -959,8 +1044,7 @@ export const CoursesTab = ({
         ? true
         : accessFilter === 'all'
         || (accessFilter === 'unlocked' && Boolean(course.enrolled))
-        || (accessFilter === 'premium' && !course.enrolled && course.price > 0)
-        || (accessFilter === 'free' && course.price === 0);
+        || (accessFilter === 'premium' && !course.enrolled && course.price > 0);
 
       const matchesCategory = courseView === 'my' || categoryFilter === 'all' || course.category === categoryFilter;
 
@@ -1110,7 +1194,7 @@ export const CoursesTab = ({
     setShowReplayPlayer(false);
   }, [selectedRecordingId, courseWorkspaceTab, selectedCourse?._id, selectedLessonId]);
 
-  const handleUnlock = async (course: CourseCard, provider: CoursePaymentProvider = 'stripe') => {
+  const handleUnlock = async (course: CourseCard) => {
     if (!user) {
       return;
     }
@@ -1136,91 +1220,49 @@ export const CoursesTab = ({
     };
 
     setBusyCourseId(course._id);
+    setCourseAccessMessage(null);
     try {
-      if (course.price === 0) {
-        await EduService.enrollInCourse(course._id, 'free-course');
-        await onRefresh();
-        openUnlockedCourse(course);
-        return;
+      const checkout = await EduService.unlockCourse(course);
+      const keyId = String(import.meta.env.VITE_RAZORPAY_KEY_ID || '').trim();
+      const orderId = String(checkout.order_id || '').trim();
+      const amount = Number(checkout.amount || 0);
+      const currencyCode = String(checkout.currency || 'INR').trim();
+
+      if (!keyId) {
+        throw new Error('Razorpay key is missing from the frontend environment.');
       }
 
-      const checkout = await EduService.unlockCourse(course, provider);
-      const popup = window.open(checkout.url, `varonenglish-${provider}-checkout`, 'popup=yes,width=520,height=760');
-
-      if (!popup) {
-        throw new Error('Payment popup was blocked. Please allow popups and try again.');
+      if (!orderId || !amount || !currencyCode) {
+        throw new Error('Razorpay order details are incomplete.');
       }
 
-      await new Promise<void>((resolve, reject) => {
-        let settled = false;
-        const timeoutId = window.setTimeout(() => {
-          if (settled) return;
-          settled = true;
-          window.removeEventListener('message', handleMessage);
-          reject(new Error('Payment confirmation timed out. If payment succeeded, refresh and try again.'));
-        }, 5 * 60 * 1000);
+      const result = await openRazorpayCheckout({
+        key: keyId,
+        orderId,
+        amount,
+        currency: currencyCode,
+        courseId: course._id,
+        courseTitle: course.title,
+        prefill: {
+          name: user.name,
+          email: user.email,
+          contact: user.mobileNumber || '',
+        },
+      });
 
-        const closeWatcher = window.setInterval(() => {
-          if (popup.closed && !settled) {
-            settled = true;
-            window.clearTimeout(timeoutId);
-            window.clearInterval(closeWatcher);
-            window.removeEventListener('message', handleMessage);
-            reject(new Error('Payment window was closed before confirmation.'));
-          }
-        }, 500);
-
-        const handleMessage = async (event: MessageEvent) => {
-          if (event.origin !== window.location.origin) {
-            return;
-          }
-
-          const data = event.data || {};
-          const isStripeSuccess = provider === 'stripe'
-            && data.type === 'STRIPE_PAYMENT_SUCCESS'
-            && data.courseId === course._id
-            && data.sessionId;
-          const isPhonePeReturn = provider === 'phonepe'
-            && data.type === 'PHONEPE_PAYMENT_RETURN'
-            && data.courseId === course._id
-            && data.orderId;
-
-          if (!isStripeSuccess && !isPhonePeReturn) {
-            return;
-          }
-
-          try {
-            if (provider === 'phonepe') {
-              await EduService.confirmPhonePeCoursePayment(data.orderId, course._id, data.paymentId);
-            } else {
-              await EduService.confirmCoursePayment(data.sessionId, course._id);
-            }
-            if (!popup.closed) {
-              popup.close();
-            }
-            if (!settled) {
-              settled = true;
-              window.clearTimeout(timeoutId);
-              window.clearInterval(closeWatcher);
-              window.removeEventListener('message', handleMessage);
-              resolve();
-            }
-          } catch (error) {
-            if (!settled) {
-              settled = true;
-              window.clearTimeout(timeoutId);
-              window.clearInterval(closeWatcher);
-              window.removeEventListener('message', handleMessage);
-              reject(error instanceof Error ? error : new Error('Payment confirmation failed.'));
-            }
-          }
-        };
-
-        window.addEventListener('message', handleMessage);
+      await EduService.verifyRazorpayCoursePayment({
+        courseId: course._id,
+        paymentId: checkout.paymentId,
+        razorpay_order_id: result.razorpay_order_id,
+        razorpay_payment_id: result.razorpay_payment_id,
+        razorpay_signature: result.razorpay_signature,
       });
 
       await onRefresh();
       openUnlockedCourse(course);
+      setCourseAccessMessage('Payment confirmed. Course access is active.');
+    } catch (error) {
+      setCourseAccessMessage(error instanceof Error ? error.message : 'Unable to unlock this course right now.');
     } finally {
       setBusyCourseId(null);
     }
@@ -1241,7 +1283,19 @@ export const CoursesTab = ({
     : null;
   const hasCourseAccess = Boolean(user && (user.role === 'admin' || selectedCourse?.enrolled));
   const hostedVideoUrl = selectedLesson?.type === 'video' ? selectedLesson.videoUrl || null : null;
-  const privateVideoStreamUrl = selectedLesson?.type === 'private-video' ? protectedLessonPlayback?.streamUrl || null : null;
+  const privateVideoFallbackUrl = selectedLesson?.type === 'private-video' ? protectedLessonPlayback?.fallbackStreamUrl || null : null;
+  const privateVideoDrmConfig = selectedLesson?.type === 'private-video' ? protectedLessonPlayback?.drmConfig || null : null;
+  const privateVideoDrmManifestUrl = privateVideoDrmConfig?.enabled ? privateVideoDrmConfig.manifestUrl || null : null;
+  const privateVideoStreamUrl = selectedLesson?.type === 'private-video'
+    ? (useProtectedSourceFallback && privateVideoFallbackUrl
+      ? privateVideoFallbackUrl
+      : protectedLessonPlayback?.streamUrl || null)
+    : null;
+  const privateVideoStreamFormat = selectedLesson?.type === 'private-video'
+    ? (useProtectedSourceFallback && privateVideoFallbackUrl
+      ? protectedLessonPlayback?.fallbackStreamFormat || 'source'
+      : protectedLessonPlayback?.streamFormat || null)
+    : null;
   const effectiveLessonProgress = useMemo(() => {
     const merged = new Map<string, ResumeRecord>();
 
@@ -1273,9 +1327,14 @@ export const CoursesTab = ({
   const selectedLessonAccess = selectedLesson ? sequentialAccessMap.get(selectedLesson.id) : null;
   const canAccessLesson = Boolean(
     selectedLesson
-      && hasCourseAccess
       && !selectedLesson.locked
-      && (!['youtube', 'private-video'].includes(selectedLesson.type) || selectedLessonAccess?.unlocked),
+      && (
+        isDemoPreviewLesson(selectedLesson)
+        || (
+          hasCourseAccess
+          && (!['youtube', 'private-video'].includes(selectedLesson.type) || selectedLessonAccess?.unlocked)
+        )
+      ),
   );
   const selectedCourseSnapshot = useMemo(
     () => selectedCourse ? getCourseProgressSnapshot(selectedCourse, lessonProgressOverrides) : { totalLessons: 0, completedLessons: 0, progressPercent: 0 },
@@ -1295,7 +1354,15 @@ export const CoursesTab = ({
   const immersiveCourseView = Boolean(selectedCourse && courseWorkspaceTab === 'player');
   const firstAccessibleLessonEntry = useMemo(
     () => lessonEntries.find((entry) => {
-      if (!hasCourseAccess || entry.lesson.locked) {
+      if (entry.lesson.locked) {
+        return false;
+      }
+
+      if (isDemoPreviewLesson(entry.lesson)) {
+        return true;
+      }
+
+      if (!hasCourseAccess) {
         return false;
       }
 
@@ -1346,6 +1413,10 @@ export const CoursesTab = ({
   }, [selectedLesson, selectedCourse?._id, canAccessLesson]);
 
   useEffect(() => {
+    setUseProtectedSourceFallback(false);
+  }, [selectedLesson?.id, protectedLessonPlayback?.streamUrl, protectedLessonPlayback?.fallbackStreamUrl]);
+
+  useEffect(() => {
     if (!selectedLesson || !['youtube', 'private-video'].includes(selectedLesson.type) || !selectedCourse?._id) {
       setProtectedLessonPlayback(null);
       setProtectedLessonError(null);
@@ -1390,6 +1461,70 @@ export const CoursesTab = ({
       cancelled = true;
     };
   }, [selectedCourse?._id, selectedLesson?.id, selectedLesson?.type, selectedLessonAccess?.reason, canAccessLesson]);
+
+  useEffect(() => {
+    if (!selectedCourse?._id || !canAccessLesson) {
+      return;
+    }
+
+    const prefetchLessons = [selectedLesson, nextLessonEntry?.lesson]
+      .filter((lesson): lesson is CourseLesson => Boolean(
+        lesson?.id && ['youtube', 'private-video'].includes(String(lesson.type || '')),
+      ));
+
+    const timers = prefetchLessons.map((lesson, index) => (
+      window.setTimeout(() => {
+        void EduService.prefetchProtectedLessonPlayback(selectedCourse._id, lesson.id);
+      }, index === 0 ? 0 : 350)
+    ));
+
+    return () => {
+      timers.forEach((timer) => window.clearTimeout(timer));
+    };
+  }, [canAccessLesson, nextLessonEntry?.lesson, selectedCourse?._id, selectedLesson]);
+
+  useEffect(() => {
+    if (
+      !selectedCourse?._id
+      || !selectedLesson?.id
+      || selectedLesson.type !== 'private-video'
+      || !canAccessLesson
+      || !protectedLessonPlayback
+    ) {
+      return undefined;
+    }
+
+    const playbackStatus = String(protectedLessonPlayback.playbackStatus || '').toLowerCase();
+    const shouldRetry = !protectedLessonPlayback.streamUrl
+      && !protectedLessonPlayback.drmConfig?.manifestUrl
+      && ['queued', 'processing'].includes(playbackStatus);
+    if (!shouldRetry) {
+      return undefined;
+    }
+
+    const timer = window.setTimeout(() => {
+      setLoadingProtectedLesson(true);
+      setProtectedLessonError(null);
+      void EduService.getProtectedLessonPlayback(selectedCourse._id, selectedLesson.id, { forceRefresh: true })
+        .then((payload) => {
+          setProtectedLessonPlayback(payload);
+        })
+        .catch((error) => {
+          setProtectedLessonError(error instanceof Error ? error.message : 'Unable to prepare protected playback.');
+        })
+        .finally(() => {
+          setLoadingProtectedLesson(false);
+        });
+    }, 4000);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    canAccessLesson,
+    protectedLessonPlayback,
+    selectedCourse?._id,
+    selectedLesson?.id,
+    selectedLesson?.type,
+  ]);
 
   useEffect(() => {
     if (courseWorkspaceTab !== 'sessions' || !selectedRecordingId || !user) {
@@ -1445,10 +1580,77 @@ export const CoursesTab = ({
   }, [user?._id, selectedCourse?._id]);
 
   useEffect(() => {
+    setPrivateVideoQualityOptions([]);
+    setSelectedPrivateVideoQuality(480);
+  }, [selectedLesson?.id, privateVideoStreamUrl]);
+
+  useEffect(() => {
     if (videoRef.current) {
       videoRef.current.playbackRate = playbackSpeed;
     }
   }, [playbackSpeed, hostedVideoUrl, privateVideoStreamUrl]);
+
+  useEffect(() => {
+    if (!selectedLesson || !['youtube', 'private-video', 'video'].includes(String(selectedLesson.type || ''))) {
+      return;
+    }
+
+    let timeoutId: number | null = null;
+    const showCaptureWarning = (message: string) => {
+      setCourseCaptureWarning(message);
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+      timeoutId = window.setTimeout(() => {
+        setCourseCaptureWarning('');
+        timeoutId = null;
+      }, 2600);
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const key = String(event.key || '').toLowerCase();
+      const isPrintScreen = key === 'printscreen';
+      const isMacCaptureCombo = (event.metaKey || event.ctrlKey) && event.shiftKey && ['3', '4', '5'].includes(key);
+      const isSaveCombo = (event.metaKey || event.ctrlKey) && key === 's';
+      const isDevtoolsCombo = event.key === 'F12' || ((event.metaKey || event.ctrlKey) && event.shiftKey && ['i', 'j', 'c'].includes(key));
+
+      if (isPrintScreen || isMacCaptureCombo || isSaveCombo || isDevtoolsCombo) {
+        event.preventDefault();
+        event.stopPropagation();
+        showCaptureWarning('Protected course video shortcuts are disabled during playback.');
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown, true);
+    const handleVisibilityProtection = () => {
+      if (document.hidden) {
+        setCoursePrivacyShieldActive(true);
+        showCaptureWarning('Protected course playback was hidden while the page was not active.');
+        return;
+      }
+      setCoursePrivacyShieldActive(false);
+    };
+    const handleWindowBlur = () => {
+      setCoursePrivacyShieldActive(true);
+    };
+    const handleWindowFocus = () => {
+      setCoursePrivacyShieldActive(false);
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityProtection);
+    window.addEventListener('blur', handleWindowBlur);
+    window.addEventListener('focus', handleWindowFocus);
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown, true);
+      document.removeEventListener('visibilitychange', handleVisibilityProtection);
+      window.removeEventListener('blur', handleWindowBlur);
+      window.removeEventListener('focus', handleWindowFocus);
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+    };
+  }, [selectedLesson?.id, selectedLesson?.type]);
 
   useEffect(() => {
     if (hlsRef.current) {
@@ -1457,30 +1659,65 @@ export const CoursesTab = ({
     }
 
     const currentVideo = videoRef.current;
-    if (!currentVideo || !privateVideoStreamUrl || protectedLessonPlayback?.streamFormat !== 'hls') {
+    if (!currentVideo || !privateVideoStreamUrl || privateVideoStreamFormat !== 'hls') {
       return;
     }
 
-    if (currentVideo.canPlayType('application/vnd.apple.mpegurl')) {
-      currentVideo.src = privateVideoStreamUrl;
-      return wireHlsPlaybackMetrics({
-        video: currentVideo,
-        src: privateVideoStreamUrl,
-        title: selectedLesson?.title || 'Recorded lesson',
-        trackVideoId: selectedLesson?.id || null,
-      });
-    }
+    const trySourceFallback = () => {
+      if (!privateVideoFallbackUrl || useProtectedSourceFallback) {
+        return false;
+      }
+      setUseProtectedSourceFallback(true);
+      return true;
+    };
 
-    if (!Hls.isSupported()) {
+    const canUseHlsJs = Hls.isSupported();
+    if (!canUseHlsJs) {
+      if (currentVideo.canPlayType('application/vnd.apple.mpegurl')) {
+        setPrivateVideoQualityOptions([]);
+        currentVideo.src = privateVideoStreamUrl;
+        const cleanupMetrics = wireHlsPlaybackMetrics({
+          video: currentVideo,
+          src: privateVideoStreamUrl,
+          title: selectedLesson?.title || 'Recorded lesson',
+          trackVideoId: selectedLesson?.id || null,
+        });
+        const handleNativeError = () => {
+          if (trySourceFallback()) {
+            currentVideo.pause();
+            currentVideo.removeAttribute('src');
+            currentVideo.load();
+          }
+        };
+        currentVideo.addEventListener('error', handleNativeError);
+        return () => {
+          currentVideo.removeEventListener('error', handleNativeError);
+          cleanupMetrics();
+        };
+      }
+
+      trySourceFallback();
       return;
     }
 
-    const hls = new Hls({
-      enableWorker: true,
-      maxBufferLength: 30,
-      backBufferLength: 30,
-    });
+    const hls = new Hls(createProtectedVodHlsConfig());
     hlsRef.current = hls;
+    let releaseAutoLevel = () => undefined;
+    hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
+      const qualityOptions = getRecordedVideoQualityOptions(data.levels || []);
+      setPrivateVideoQualityOptions(qualityOptions);
+      setSelectedPrivateVideoQuality((current) => getDefaultRecordedVideoQualityHeight(qualityOptions, current));
+      releaseAutoLevel();
+      releaseAutoLevel = scheduleAutoLevelRelease(hls);
+    });
+    hls.on(Hls.Events.ERROR, (_event, data) => {
+      if (shouldFallbackToSourceFromHlsError(data) && trySourceFallback()) {
+        hls.destroy();
+        if (hlsRef.current === hls) {
+          hlsRef.current = null;
+        }
+      }
+    });
     hls.loadSource(privateVideoStreamUrl);
     hls.attachMedia(currentVideo);
     const cleanupMetrics = wireHlsPlaybackMetrics({
@@ -1492,13 +1729,37 @@ export const CoursesTab = ({
     });
 
     return () => {
+      releaseAutoLevel();
       cleanupMetrics();
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;
       }
     };
-  }, [privateVideoStreamUrl, protectedLessonPlayback?.streamFormat, selectedLesson?.id]);
+  }, [
+    privateVideoFallbackUrl,
+    privateVideoStreamFormat,
+    privateVideoStreamUrl,
+    selectedLesson?.id,
+    selectedLesson?.title,
+    useProtectedSourceFallback,
+  ]);
+
+  useEffect(() => {
+    const hls = hlsRef.current;
+    if (!hls) {
+      return;
+    }
+
+    const selectedLevel = getRecordedVideoQualityLevel(privateVideoQualityOptions, selectedPrivateVideoQuality);
+    if (selectedLevel < 0) {
+      return;
+    }
+
+    hls.currentLevel = selectedLevel;
+    hls.nextLevel = selectedLevel;
+    hls.autoLevelCapping = selectedLevel;
+  }, [privateVideoQualityOptions, selectedPrivateVideoQuality]);
 
   const persistLessonProgress = async (
     courseId: string,
@@ -1559,6 +1820,7 @@ export const CoursesTab = ({
         progressPercent,
         safeSeconds,
         derivedCompleted,
+        {},
         force ? { keepalive: true } : {},
       );
       if (derivedCompleted && !alreadyCompleted) {
@@ -1757,7 +2019,6 @@ export const CoursesTab = ({
   };
 
   const handleSelectLesson = (lessonId: string) => {
-    debugger
     void flushTrackedPlayback();
     setSelectedLessonId(lessonId);
     setCourseWorkspaceTab('player');
@@ -1896,7 +2157,6 @@ export const CoursesTab = ({
                     <option value="all">All access types</option>
                     <option value="unlocked">Unlocked</option>
                     <option value="premium">Premium</option>
-                    <option value="free">Free</option>
                   </select>
                   <select
                     value={categoryFilter}
@@ -2019,7 +2279,7 @@ export const CoursesTab = ({
                       key={course._id}
                       onClick={() => handleSelectCourse(course._id)}
                       className={cn(
-                        'rounded-[28px] border p-4 text-left transition duration-200 hover:-translate-y-0.5',
+                        'rounded-[28px] border p-4 text-left transition duration-200 hover:-translate-y-0.5 lg:min-h-[372px]',
                         selectedCourse?._id === course._id
                           ? 'border-[var(--accent-rust)] bg-[var(--accent-cream)] shadow-[0_16px_30px_rgba(201,106,43,0.12)]'
                           : 'border-[var(--line)] bg-white hover:border-[var(--accent-rust)]/35',
@@ -2034,11 +2294,9 @@ export const CoursesTab = ({
                               'rounded-full px-3 py-1 text-xs font-semibold',
                               course.enrolled
                                 ? 'bg-[var(--success-soft)] text-[var(--success)]'
-                                : course.price === 0
-                                  ? 'bg-[#eef7ff] text-[#2484d8]'
-                                  : 'bg-[#fff3eb] text-[var(--accent-rust)]',
+                                : 'bg-[#fff3eb] text-[var(--accent-rust)]',
                             )}>
-                              {course.enrolled ? 'Active' : course.price === 0 ? 'Free' : currency.format(course.price)}
+                              {course.enrolled ? 'Active' : getCoursePriceSummary(course)}
                             </span>
                           </div>
                           <h3 className="mt-2 line-clamp-2 text-lg font-semibold text-[var(--ink)]">{course.title}</h3>
@@ -2059,20 +2317,48 @@ export const CoursesTab = ({
                           </div>
                         </div>
                       ) : (
-                        <div className="mt-4 rounded-[18px] bg-white/80 px-4 py-4">
-                          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--ink-soft)]">Course access</p>
-                          <p className="mt-2 text-sm leading-6 text-[var(--ink-soft)]">
-                            {course.price === 0 ? 'Start this free course instantly.' : 'Buy this course here to access subjects, lessons, and video.'}
+                        <div className="mt-4 rounded-[20px] border border-[#ffd8b4] bg-[linear-gradient(135deg,#fff8ef_0%,#ffffff_100%)] px-4 py-4 shadow-[0_12px_28px_rgba(201,106,43,0.08)]">
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--accent-rust)]">Course offer</p>
+                              <p className="mt-2 text-[22px] font-bold leading-none text-[var(--ink)]">
+                                {currency.format(getCoursePricingMeta(course).finalPrice)}
+                              </p>
+                            </div>
+                            {getCoursePricingMeta(course).offerPercentage > 0 && (
+                              <span className="rounded-full bg-[#ffedd5] px-3 py-1 text-[11px] font-bold text-[#c96a2b] shadow-[0_6px_16px_rgba(201,106,43,0.10)]">
+                                {getCoursePricingMeta(course).offerPercentage}% OFF
+                              </span>
+                            )}
+                          </div>
+                          <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                            <span className="rounded-full bg-white px-3 py-1 font-semibold text-[var(--ink-soft)] line-through decoration-[#c96a2b]/55">
+                              {currency.format(getCoursePricingMeta(course).basePrice)}
+                            </span>
+                            {getCoursePricingMeta(course).savings > 0 && (
+                              <span className="rounded-full bg-[#fff1e4] px-3 py-1 font-semibold text-[#c96a2b]">
+                                Save {currency.format(getCoursePricingMeta(course).savings)}
+                              </span>
+                            )}
+                          </div>
+                          <p className="mt-3 text-sm leading-6 text-[var(--ink-soft)]">
+                            Buy this course here to access subjects, lessons, and video.
                           </p>
                         </div>
                       )}
 
-                      <div className="mt-4 flex items-center justify-between gap-3">
+                      <div className="mt-5 flex items-center justify-between gap-3">
                         <span className="text-sm text-[var(--ink-soft)]">
-                          {course.enrolled ? 'Tap to open subjects and lessons' : 'Tap to preview details and buy'}
+                          {course.enrolled
+                            ? 'Tap to open subjects and lessons'
+                            : 'Tap to preview details and buy'}
                         </span>
                         <span className="rounded-full bg-[#172033] px-4 py-2 text-sm font-semibold text-white">
-                          {selectedCourse?._id === course._id ? 'Opened' : 'Open'}
+                          {selectedCourse?._id === course._id
+                            ? 'Opened'
+                            : course.enrolled
+                              ? 'Open'
+                              : 'Buy Course'}
                         </span>
                       </div>
                     </button>
@@ -2111,6 +2397,11 @@ export const CoursesTab = ({
                 <p className="mt-2 text-sm text-white/78">
                   {selectedCourse.subject} • {selectedCourse.instructor} • {selectedCourse.validityDays} day access
                 </p>
+                {!selectedCourse.enrolled && (
+                  <p className="mt-2 text-sm font-semibold text-[#ffd58a]">
+                    {getCourseFeeSummary(selectedCourse)}
+                  </p>
+                )}
                 <div className={cn('h-2 w-full max-w-[420px] overflow-hidden rounded-full bg-white/15', immersiveCourseView ? 'mt-4' : 'mt-5')}>
                   <div className="h-full rounded-full bg-[#72ff9b]" style={{ width: `${selectedCourseSnapshot.progressPercent}%` }} />
                 </div>
@@ -2123,31 +2414,15 @@ export const CoursesTab = ({
               <div className="flex flex-wrap items-center gap-3">
                 {selectedCourse.enrolled ? (
                   <span className="rounded-full bg-white/12 px-4 py-3 text-sm font-semibold text-white">Access active</span>
-                ) : selectedCourse.price === 0 ? (
-                  <button
-                    onClick={() => handleUnlock(selectedCourse)}
-                    disabled={busyCourseId === selectedCourse._id}
-                    className="inline-flex items-center gap-2 rounded-full bg-white px-5 py-3 font-semibold text-[#2638d8] transition hover:bg-white/90 disabled:opacity-60"
-                  >
-                    {busyCourseId === selectedCourse._id ? <LoaderCircle className="h-5 w-5 animate-spin" /> : <Wallet className="h-5 w-5" />}
-                    {getCoursePurchaseLabel(selectedCourse)}
-                  </button>
                 ) : (
                   <div className="flex flex-wrap gap-2">
                     <button
-                      onClick={() => handleUnlock(selectedCourse, 'phonepe')}
+                      onClick={() => handleUnlock(selectedCourse)}
                       disabled={busyCourseId === selectedCourse._id}
                       className="inline-flex items-center gap-2 rounded-full bg-white px-5 py-3 font-semibold text-[#2638d8] transition hover:bg-white/90 disabled:opacity-60"
                     >
                       {busyCourseId === selectedCourse._id ? <LoaderCircle className="h-5 w-5 animate-spin" /> : <Wallet className="h-5 w-5" />}
-                      Pay with PhonePe
-                    </button>
-                    <button
-                      onClick={() => handleUnlock(selectedCourse, 'stripe')}
-                      disabled={busyCourseId === selectedCourse._id}
-                      className="inline-flex items-center gap-2 rounded-full border border-white/25 px-5 py-3 font-semibold text-white transition hover:bg-white/10 disabled:opacity-60"
-                    >
-                      Pay with Stripe
+                      Pay with Razorpay
                     </button>
                   </div>
                 )}
@@ -2163,6 +2438,9 @@ export const CoursesTab = ({
                 )}
               </div>
             </div>
+            {courseAccessMessage && !selectedCourse.enrolled && (
+              <p className="mt-3 text-sm text-[#ffd58a]">{courseAccessMessage}</p>
+            )}
           </div>
 
           <div className="border-b border-[var(--line)] bg-white px-4 sm:px-6">
@@ -2821,17 +3099,10 @@ export const CoursesTab = ({
                       </div>
                     </div>
                     <div className="flex flex-wrap items-center gap-3">
-                      <label className="rounded-full border border-[#dbe4ef] bg-[#f8fbff] px-4 py-2 text-sm text-[#172033]">
-                        <span className="mr-2">Speed</span>
-                        <select value={playbackSpeed} onChange={(event) => setPlaybackSpeed(Number(event.target.value))} className="bg-transparent outline-none">
-                          {[0.75, 1, 1.25, 1.5, 2].map((speed) => (
-                            <option key={speed} value={speed}>{speed}x</option>
-                          ))}
-                        </select>
-                      </label>
                       <button
+                        type="button"
                         onClick={() => void togglePlayerFullscreen()}
-                        className="inline-flex items-center gap-2 rounded-full border border-[#dbe4ef] bg-white px-4 py-2 text-sm font-semibold text-[#172033]"
+                        className="inline-flex items-center gap-2 rounded-full border border-[#dbe4ef] bg-[#f8fbff] px-4 py-2 text-sm font-semibold text-[#172033]"
                       >
                         {isPlayerFullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
                         {isPlayerFullscreen ? 'Exit full screen' : 'Expand player'}
@@ -2843,11 +3114,17 @@ export const CoursesTab = ({
                     <div
                       ref={playerViewportRef}
                       className={cn(
-                        'overflow-hidden rounded-[20px] bg-black',
+                        'relative overflow-hidden rounded-[20px] bg-black',
                         isPlayerFullscreen && 'flex h-screen items-center justify-center rounded-none border-0 bg-black',
                       )}
+                      onContextMenu={(event) => {
+                        if (selectedLesson && ['youtube', 'private-video', 'video'].includes(String(selectedLesson.type || ''))) {
+                          event.preventDefault();
+                          setCourseCaptureWarning('Protected course video options are disabled during playback.');
+                        }
+                      }}
                     >
-                      <div className={cn('w-full', isPlayerFullscreen && 'mx-auto max-w-[min(100vw,1600px)]')}>
+                      <div className={cn('w-full', isPlayerFullscreen && 'flex h-full items-center justify-center')}>
                         {securityBlocked ? (
                           <div className="flex aspect-video flex-col items-center justify-center gap-4 px-6 text-center text-white">
                             <Lock className="h-10 w-10 text-[var(--accent-rust)]" />
@@ -2880,63 +3157,127 @@ export const CoursesTab = ({
                               void persistLessonProgress(selectedCourse._id, canAccessLesson, selectedLesson, progressSeconds, completed, completed, durationSeconds);
                             }}
                           />
-                        ) : canAccessLesson && selectedLesson.type === 'private-video' && privateVideoStreamUrl ? (
-                          <video
-                            key={`${selectedLesson.id}:${privateVideoStreamUrl}`}
-                            ref={videoRef}
-                            src={protectedLessonPlayback?.streamFormat === 'source' ? privateVideoStreamUrl : undefined}
-                            onLoadedMetadata={(event) => {
-                              const resumeSeconds = protectedLessonPlayback?.resumeSeconds || selectedLessonProgress?.progressSeconds || 0;
-                              if (resumeSeconds > 0) {
-                                seekHostedVideoToResume(event.currentTarget, selectedLesson.id, resumeSeconds, appliedResumeRef);
-                              }
-                            }}
-                            onCanPlay={(event) => {
-                              const resumeSeconds = protectedLessonPlayback?.resumeSeconds || selectedLessonProgress?.progressSeconds || 0;
-                              if (resumeSeconds > 0) {
-                                seekHostedVideoToResume(event.currentTarget, selectedLesson.id, resumeSeconds, appliedResumeRef);
-                              }
-                            }}
-                            onTimeUpdate={(event) => {
-                              playbackSnapshotRef.current = {
-                                lesson: selectedLesson,
-                                courseId: selectedCourse._id,
-                                canAccess: canAccessLesson,
-                                progressSeconds: event.currentTarget.currentTime,
-                                mediaDurationSeconds: event.currentTarget.duration || 0,
-                                completed: false,
-                              };
-                              void persistLessonProgress(selectedCourse._id, canAccessLesson, selectedLesson, event.currentTarget.currentTime, false, false, event.currentTarget.duration);
-                            }}
-                            onPause={(event) => {
-                              playbackSnapshotRef.current = {
-                                lesson: selectedLesson,
-                                courseId: selectedCourse._id,
-                                canAccess: canAccessLesson,
-                                progressSeconds: event.currentTarget.currentTime,
-                                mediaDurationSeconds: event.currentTarget.duration || 0,
-                                completed: false,
-                              };
-                              void persistLessonProgress(selectedCourse._id, canAccessLesson, selectedLesson, event.currentTarget.currentTime, false, true, event.currentTarget.duration);
-                            }}
-                            onEnded={(event) => {
-                              playbackSnapshotRef.current = {
-                                lesson: selectedLesson,
-                                courseId: selectedCourse._id,
-                                canAccess: canAccessLesson,
-                                progressSeconds: event.currentTarget.currentTime,
-                                mediaDurationSeconds: event.currentTarget.duration || 0,
-                                completed: true,
-                              };
-                              void persistLessonProgress(selectedCourse._id, canAccessLesson, selectedLesson, event.currentTarget.currentTime, true, true, event.currentTarget.duration);
-                            }}
-                            controls
-                            controlsList="nodownload noplaybackrate"
-                            disablePictureInPicture
-                            playsInline
-                            preload="metadata"
-                            className="aspect-video w-full bg-black"
-                          />
+                        ) : canAccessLesson && selectedLesson.type === 'private-video' && (privateVideoDrmManifestUrl || privateVideoStreamUrl) ? (
+                          <div>
+                            {privateVideoDrmManifestUrl ? (
+                              <ResilientHlsVideo
+                                key={`${selectedLesson.id}:${privateVideoDrmManifestUrl}`}
+                                src={privateVideoDrmManifestUrl}
+                                drmConfig={privateVideoDrmConfig}
+                                title={selectedLesson.title}
+                                trackVideoId={selectedLesson.id}
+                                trackCourseId={selectedCourse._id}
+                                trackLessonId={selectedLesson.id}
+                                streamFormat={privateVideoDrmConfig?.manifestFormat || privateVideoStreamFormat || 'hls'}
+                                resumeSeconds={protectedLessonPlayback?.resumeSeconds || selectedLessonProgress?.progressSeconds || 0}
+                                defaultQualityHeight={480}
+                                selectedQualityHeight={selectedPrivateVideoQuality}
+                                onQualityOptionsChange={(options) => {
+                                  setPrivateVideoQualityOptions(options);
+                                  setSelectedPrivateVideoQuality((current) => getDefaultRecordedVideoQualityHeight(options, current));
+                                }}
+                                className={cn(
+                                  'w-full bg-black',
+                                  isPlayerFullscreen ? 'h-screen rounded-none border-0' : 'aspect-video',
+                                )}
+                                onProgress={(progressSeconds, durationSeconds, completed) => {
+                                  playbackSnapshotRef.current = {
+                                    lesson: selectedLesson,
+                                    courseId: selectedCourse._id,
+                                    canAccess: canAccessLesson,
+                                    progressSeconds,
+                                    mediaDurationSeconds: durationSeconds || 0,
+                                    completed,
+                                  };
+                                  void persistLessonProgress(
+                                    selectedCourse._id,
+                                    canAccessLesson,
+                                    selectedLesson,
+                                    progressSeconds,
+                                    completed,
+                                    completed,
+                                    durationSeconds,
+                                  );
+                                }}
+                              />
+                            ) : (
+                              <video
+                                key={`${selectedLesson.id}:${privateVideoStreamUrl}`}
+                                ref={videoRef}
+                                src={privateVideoStreamFormat === 'source' ? privateVideoStreamUrl : undefined}
+                                onLoadedMetadata={(event) => {
+                                  const resumeSeconds = protectedLessonPlayback?.resumeSeconds || selectedLessonProgress?.progressSeconds || 0;
+                                  if (resumeSeconds > 0) {
+                                    seekHostedVideoToResume(event.currentTarget, selectedLesson.id, resumeSeconds, appliedResumeRef);
+                                  }
+                                }}
+                                onCanPlay={(event) => {
+                                  const resumeSeconds = protectedLessonPlayback?.resumeSeconds || selectedLessonProgress?.progressSeconds || 0;
+                                  if (resumeSeconds > 0) {
+                                    seekHostedVideoToResume(event.currentTarget, selectedLesson.id, resumeSeconds, appliedResumeRef);
+                                  }
+                                }}
+                                onTimeUpdate={(event) => {
+                                  playbackSnapshotRef.current = {
+                                    lesson: selectedLesson,
+                                    courseId: selectedCourse._id,
+                                    canAccess: canAccessLesson,
+                                    progressSeconds: event.currentTarget.currentTime,
+                                    mediaDurationSeconds: event.currentTarget.duration || 0,
+                                    completed: false,
+                                  };
+                                  void persistLessonProgress(selectedCourse._id, canAccessLesson, selectedLesson, event.currentTarget.currentTime, false, false, event.currentTarget.duration);
+                                }}
+                                onPause={(event) => {
+                                  playbackSnapshotRef.current = {
+                                    lesson: selectedLesson,
+                                    courseId: selectedCourse._id,
+                                    canAccess: canAccessLesson,
+                                    progressSeconds: event.currentTarget.currentTime,
+                                    mediaDurationSeconds: event.currentTarget.duration || 0,
+                                    completed: false,
+                                  };
+                                  void persistLessonProgress(selectedCourse._id, canAccessLesson, selectedLesson, event.currentTarget.currentTime, false, true, event.currentTarget.duration);
+                                }}
+                                onEnded={(event) => {
+                                  playbackSnapshotRef.current = {
+                                    lesson: selectedLesson,
+                                    courseId: selectedCourse._id,
+                                    canAccess: canAccessLesson,
+                                    progressSeconds: event.currentTarget.currentTime,
+                                    mediaDurationSeconds: event.currentTarget.duration || 0,
+                                    completed: true,
+                                  };
+                                  void persistLessonProgress(selectedCourse._id, canAccessLesson, selectedLesson, event.currentTarget.currentTime, true, true, event.currentTarget.duration);
+                                }}
+                                controls
+                                controlsList="nodownload noplaybackrate"
+                                disablePictureInPicture
+                                playsInline
+                                preload="metadata"
+                                className={cn(
+                                  'w-full bg-black object-contain',
+                                  isPlayerFullscreen ? 'h-screen' : 'aspect-video',
+                                )}
+                              />
+                            )}
+                            {privateVideoStreamFormat === 'hls' && privateVideoQualityOptions.length > 0 ? (
+                              <div className="flex items-center justify-end gap-3 border-t border-[var(--line)] bg-[var(--panel)] px-4 py-3">
+                                <span className="text-xs font-semibold uppercase tracking-[0.16em] text-[var(--ink-soft)]">Quality</span>
+                                <select
+                                  value={String(selectedPrivateVideoQuality)}
+                                  onChange={(event) => setSelectedPrivateVideoQuality(Number(event.target.value))}
+                                  className="rounded-xl border border-[var(--line)] bg-white px-3 py-2 text-sm text-[var(--ink)]"
+                                >
+                                  {privateVideoQualityOptions.map((option) => (
+                                    <option key={option.height} value={String(option.height)}>
+                                      {option.label}
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                            ) : null}
+                          </div>
                         ) : canAccessLesson && hostedVideoUrl ? (
                           <video
                             key={`${selectedLesson.id}:${hostedVideoUrl}`}
@@ -2991,8 +3332,19 @@ export const CoursesTab = ({
                             controlsList="nodownload"
                             playsInline
                             preload="metadata"
-                            className="aspect-video w-full bg-black"
+                            className={cn(
+                              'w-full bg-black object-contain',
+                              isPlayerFullscreen ? 'h-screen' : 'aspect-video',
+                            )}
                           />
+                        ) : canAccessLesson && selectedLesson.type === 'private-video' && protectedLessonPlayback?.statusMessage ? (
+                          <div className="flex aspect-video flex-col items-center justify-center gap-4 px-6 text-center text-white">
+                            <LoaderCircle className="h-10 w-10 animate-spin text-white/70" />
+                            <div>
+                              <p className="text-lg font-semibold">Video is still preparing</p>
+                              <p className="mt-2 text-sm leading-7 text-white/68">{protectedLessonPlayback.statusMessage}</p>
+                            </div>
+                          </div>
                         ) : canAccessLesson && ['youtube', 'private-video'].includes(selectedLesson.type) && protectedLessonError ? (
                           <div className="flex aspect-video flex-col items-center justify-center gap-4 px-6 text-center text-white">
                             <Lock className="h-10 w-10 text-[var(--accent-rust)]" />
@@ -3015,6 +3367,21 @@ export const CoursesTab = ({
                             </div>
                           </div>
                         )}
+                        {coursePrivacyShieldActive ? (
+                          <div className="absolute inset-0 z-20 flex items-center justify-center bg-black text-white">
+                            <div className="flex max-w-[420px] flex-col items-center gap-3 px-6 text-center">
+                              <p className="text-lg font-semibold">Protected playback hidden</p>
+                              <p className="text-sm text-white/72">Return to the active player window to continue watching this lesson.</p>
+                            </div>
+                          </div>
+                        ) : null}
+                        {courseCaptureWarning ? (
+                          <div className="pointer-events-none absolute inset-x-0 top-4 z-30 flex justify-center px-4">
+                            <div className="rounded-full bg-[#111827]/88 px-4 py-2 text-xs font-semibold text-white shadow-[0_10px_24px_rgba(0,0,0,0.26)]">
+                              {courseCaptureWarning}
+                            </div>
+                          </div>
+                        ) : null}
                       </div>
                     </div>
 
@@ -3025,34 +3392,15 @@ export const CoursesTab = ({
                           {selectedLessonAccess?.reason || 'Unlock the course to access protected playback, notes, and synced progress.'}
                         </p>
                         <div className="mt-4 flex flex-wrap gap-3">
-                          {!selectedCourse.enrolled && selectedCourse.price === 0 && (
+                          {!selectedCourse.enrolled && (
                             <button
                               onClick={() => handleUnlock(selectedCourse)}
                               disabled={busyCourseId === selectedCourse._id}
                               className="inline-flex items-center gap-2 rounded-full bg-[var(--accent-rust)] px-4 py-2 text-sm font-semibold text-white disabled:opacity-60"
                             >
                               {busyCourseId === selectedCourse._id ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Wallet className="h-4 w-4" />}
-                              {getCoursePurchaseLabel(selectedCourse)}
+                              Pay with Razorpay
                             </button>
-                          )}
-                          {!selectedCourse.enrolled && selectedCourse.price > 0 && (
-                            <>
-                              <button
-                                onClick={() => handleUnlock(selectedCourse, 'phonepe')}
-                                disabled={busyCourseId === selectedCourse._id}
-                                className="inline-flex items-center gap-2 rounded-full bg-[var(--accent-rust)] px-4 py-2 text-sm font-semibold text-white disabled:opacity-60"
-                              >
-                                {busyCourseId === selectedCourse._id ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Wallet className="h-4 w-4" />}
-                                Pay with PhonePe
-                              </button>
-                              <button
-                                onClick={() => handleUnlock(selectedCourse, 'stripe')}
-                                disabled={busyCourseId === selectedCourse._id}
-                                className="inline-flex items-center gap-2 rounded-full border border-[#d7e5f1] bg-white px-4 py-2 text-sm font-semibold text-[#172033] disabled:opacity-60"
-                              >
-                                Pay with Stripe
-                              </button>
-                            </>
                           )}
                           {previousLessonEntry && (
                             <button
@@ -3153,7 +3501,7 @@ export const CoursesTab = ({
                         </div>
                         <div className="rounded-[18px] bg-[#f8fbff] p-4">
                           <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[#8a9ab0]">Access</p>
-                          <p className="mt-2 text-sm font-semibold text-[#172033]">{selectedCourse.enrolled ? 'Unlocked course access' : selectedCourse.price === 0 ? 'Free course preview' : 'Premium course'}</p>
+                          <p className="mt-2 text-sm font-semibold text-[#172033]">{selectedCourse.enrolled ? 'Unlocked course access' : 'Premium course'}</p>
                         </div>
                         <div className="rounded-[18px] bg-[#f8fbff] p-4">
                           <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[#8a9ab0]">Continue learning</p>

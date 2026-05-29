@@ -52,11 +52,77 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+html.app-protected-active,
+body.app-protected-active {
+  background: #000 !important;
+}
+
+html.content-protection-enabled,
+html.content-protection-enabled body,
+html.content-protection-enabled #root {
+  -webkit-touch-callout: none;
+}
+
+html.content-protection-enabled body {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+html.content-protection-enabled input,
+html.content-protection-enabled textarea,
+html.content-protection-enabled [contenteditable="true"],
+html.content-protection-enabled [contenteditable=""],
+html.content-protection-enabled [data-allow-selection="true"],
+html.content-protection-enabled [data-allow-copy="true"] {
+  user-select: text;
+  -webkit-user-select: text;
+  -webkit-touch-callout: default;
+}
+
 #root {
   min-height: 100vh;
   width: 100%;
   max-width: 100%;
   overflow-x: hidden;
+}
+
+html.app-protected-active #root {
+  opacity: 0;
+  pointer-events: none;
+  user-select: none;
+}
+
+.app-content-protection-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 999999;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: #000;
+  color: #fff;
+  text-align: center;
+  padding: 24px;
+  pointer-events: auto;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+
+.app-content-protection-message {
+  font-family: "Literata", Georgia, serif;
+  font-size: clamp(1.5rem, 2vw + 1rem, 2.3rem);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.app-content-protection-subtitle {
+  max-width: 28rem;
+  font-size: 0.98rem;
+  line-height: 1.6;
+  color: rgba(255, 255, 255, 0.76);
 }
 
 h1,

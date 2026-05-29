@@ -49,7 +49,7 @@ const cleanupLessons = async (lessons = []) => {
 
     if (lesson.hlsManifestPath) {
       try {
-        await deleteProcessedHlsAssets(lesson.hlsManifestPath);
+        await deleteProcessedHlsAssets(lesson.hlsManifestPath, lesson.hlsStorageProvider || null);
       } catch (err) {
         console.error(`Failed to delete processed HLS assets: ${lesson.hlsManifestPath}`, err);
       }
@@ -217,7 +217,8 @@ const updateCourse = asyncHandler(async (req, res) => {
   if (req.body.subject !== undefined) course.subject = optionalString(req.body.subject, 'General', { maxLength: 120 });
   if (req.body.instructor !== undefined) course.instructor = optionalString(req.body.instructor, 'VARONENGLISH Faculty', { maxLength: 120 });
   if (req.body.officialChannelUrl !== undefined) course.officialChannelUrl = optionalString(req.body.officialChannelUrl, '', { maxLength: 500 }) || null;
-  if (req.body.price !== undefined) course.price = optionalNumber(req.body.price, 0, { min: 0 });
+  if (req.body.price !== undefined) course.price = optionalNumber(req.body.price, course.price || 1, { min: 1 });
+  if (req.body.offerPercentage !== undefined) course.offerPercentage = optionalNumber(req.body.offerPercentage, course.offerPercentage || 0, { min: 0, max: 100 });
   if (req.body.validityDays !== undefined) course.validityDays = optionalNumber(req.body.validityDays, 365, { min: 1, max: 3650, integer: true });
   if (req.body.level !== undefined) course.level = optionalString(req.body.level, 'Full Course', { maxLength: 80 });
   if (req.body.thumbnailUrl !== undefined) course.thumbnailUrl = optionalString(req.body.thumbnailUrl, '', { maxLength: 500 });

@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://app.varonenglishapp.in/sitemap.xml
+

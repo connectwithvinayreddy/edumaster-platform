@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Hls from 'hls.js';
 import {
   Bell,
@@ -17,6 +17,7 @@ import {
   Lock,
   LoaderCircle,
   Maximize2,
+  Minimize2,
   MoreVertical,
   Pause,
   Play,
@@ -29,22 +30,84 @@ import {
   Video,
   Wallet,
 } from 'lucide-react';
-import { CourseCard, CourseLesson, MockTest, PlatformOverview, ProtectedLessonPlayback } from '../types';
+import {
+  CourseCard,
+  CourseLesson,
+  LessonDoubtMessage,
+  LessonDoubtThread,
+  MockTest,
+  PlatformOverview,
+  ProtectedLessonPlayback,
+} from '../types';
 import { cn } from '../lib/utils';
 import { wireHlsPlaybackMetrics } from '../lib/hlsPlaybackMetrics';
+import { openRazorpayCheckout } from '../lib/razorpayCheckout';
+import { ResilientHlsVideo } from './ResilientHlsVideo';
+import {
+  createProtectedVodHlsConfig,
+  getDefaultRecordedVideoQualityHeight,
+  getRecordedVideoQualityLevel,
+  getRecordedVideoQualityOptions,
+  type RecordedVideoQualityOption,
+  scheduleAutoLevelRelease,
+  shouldFallbackToSourceFromHlsError,
+} from '../lib/hlsPlaybackTuning';
 import { useAuth } from '../AuthContext';
-import { EduService, type CoursePaymentProvider } from '../EduService';
+import { EduService } from '../EduService';
 
 const currency = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 });
+const WATERMARK_VISIBLE_DURATION_MS = 5000;
+const WATERMARK_HIDDEN_INTERVAL_MS = 10000;
+const LESSON_DOUBT_POLL_INTERVAL_MS = 10000;
+
+const getDiscountedCoursePrice = (course: CourseCard) => {
+  const basePrice = Math.max(Number(course.price || 0), 1);
+  const offerPercentage = Math.min(Math.max(Number(course.offerPercentage || 0), 0), 100);
+  const discountedPrice = basePrice * (1 - (offerPercentage / 100));
+  return Math.max(Number(discountedPrice.toFixed(2)), 1);
+};
+
+const getCoursePriceSummary = (course: CourseCard) => {
+  const finalPrice = getDiscountedCoursePrice(course);
+  const offerPercentage = Number(course.offerPercentage || 0);
+  return offerPercentage > 0
+    ? `${currency.format(finalPrice)} • ${offerPercentage}% off`
+    : currency.format(finalPrice);
+};
+
+const getCourseFeeSummary = (course: CourseCard) => {
+  const basePrice = Math.max(Number(course.price || 0), 1);
+  const finalPrice = getDiscountedCoursePrice(course);
+  const offerPercentage = Number(course.offerPercentage || 0);
+
+  return offerPercentage > 0
+    ? `Fee ${currency.format(basePrice)} • ${offerPercentage}% off • Pay ${currency.format(finalPrice)}`
+    : `Fee ${currency.format(basePrice)}`;
+};
+
+const getCoursePricingMeta = (course: CourseCard) => {
+  const basePrice = Math.max(Number(course.price || 0), 1);
+  const finalPrice = getDiscountedCoursePrice(course);
+  const offerPercentage = Number(course.offerPercentage || 0);
+  const savings = Math.max(basePrice - finalPrice, 0);
+
+  return {
+    basePrice,
+    finalPrice,
+    offerPercentage,
+    savings,
+  };
+};
 
 const getCoursePurchaseLabel = (course: CourseCard) =>
-  course.price === 0 ? 'Start free course' : `Buy course for ${currency.format(course.price)}`;
+  `Buy course for ${getCoursePriceSummary(course)}`;
 
 type CourseFigmaTabProps = {
   overview: PlatformOverview;
   onRefresh: () => Promise<void>;
   initialCourseId?: string | null;
   initialLessonId?: string | null;
+  initialDoubtThreadId?: string | null;
   onResumeNavigationHandled?: () => void;
   savedTopicIds: string[];
   onToggleSavedTopic: (courseId: string, lessonId: string) => void;
@@ -62,6 +125,17 @@ type MobileWatchPanel = 'rating' | 'chat' | 'report' | null;
 type LessonStage = 'video' | 'exam' | 'explanation';
 type MobileLessonStage = 'watch' | 'completed' | 'exam' | 'exam-complete' | 'explanation' | 'explanation-complete';
 type CatalogTone = 'blue' | 'teal' | 'orange' | 'purple';
+type WatermarkPosition = {
+  top: string;
+  left: string;
+  rotate: string;
+};
+
+const createRandomWatermarkPosition = (): WatermarkPosition => ({
+  top: `${12 + Math.random() * 64}%`,
+  left: `${14 + Math.random() * 68}%`,
+  rotate: `${-20 + Math.random() * 40}deg`,
+});
 
 type StoredProgress = {
   lessonId: string;
@@ -120,14 +194,6 @@ type LessonCopy = {
   quickTip: string;
 };
 
-type LessonDoubtMessage = {
-  id: string;
-  name: string;
-  time: string;
-  message: string;
-  self?: boolean;
-};
-
 const uiFontStyle = {
   fontFamily: 'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
 } as React.CSSProperties;
@@ -141,6 +207,7 @@ const EXAM_STAGE_PROGRESS = 67;
 const EXPLANATION_DURATION_SECONDS = 120;
 const MAX_VIDEO_WATCHES = 2;
 const MAX_EXPLANATION_WATCHES = 1;
+const VIDEO_COMPLETION_MIN_WATCH_RATIO = 0.9;
 
 const courseTabs: CourseTab[] = ['Lessons'];
 const lessonTabs: LessonTab[] = ['Video'];
@@ -148,6 +215,21 @@ const mobileLessonTabLabels: Record<LessonTab, string> = {
   Video: 'Video',
   'CBT Exam': 'Quiz',
   Explanation: 'Discussion',
+};
+
+const buildLessonDoubtDraftKey = (lessonId: string, threadId?: string | null) =>
+  `${String(lessonId)}::${String(threadId || 'compose')}`;
+
+const formatLessonDoubtTime = (value?: string | null) => {
+  const target = value ? new Date(value) : null;
+  if (!target || Number.isNaN(target.getTime())) {
+    return 'Now';
+  }
+
+  return new Intl.DateTimeFormat('en-IN', {
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(target);
 };
 
 const toneStyles: Record<CatalogTone, {
@@ -250,6 +332,53 @@ const getMobileCourseTitle = (course?: CourseCard | null) => {
 };
 
 const buildStorageKey = (courseId: string) => `${PLAYER_STORAGE_PREFIX}.${courseId}`;
+const getLessonStagePriority = (stage?: LessonStage | null) => {
+  switch (stage) {
+    case 'explanation':
+      return 3;
+    case 'exam':
+      return 2;
+    case 'video':
+      return 1;
+    default:
+      return 0;
+  }
+};
+
+const mergeStoredProgress = (
+  existing?: StoredProgress | null,
+  incoming?: StoredProgress | null,
+): StoredProgress | null => {
+  if (!existing && !incoming) {
+    return null;
+  }
+
+  if (!existing) {
+    return incoming || null;
+  }
+
+  if (!incoming) {
+    return existing;
+  }
+
+  return {
+    ...existing,
+    ...incoming,
+    lessonId: incoming.lessonId || existing.lessonId,
+    progressPercent: Math.max(Number(existing.progressPercent || 0), Number(incoming.progressPercent || 0)),
+    progressSeconds: Math.max(Number(existing.progressSeconds || 0), Number(incoming.progressSeconds || 0)),
+    completed: Boolean(existing.completed) || Boolean(incoming.completed),
+    lessonStage: getLessonStagePriority(existing.lessonStage) >= getLessonStagePriority(incoming.lessonStage)
+      ? existing.lessonStage
+      : incoming.lessonStage,
+    examSubmitted: Boolean(existing.examSubmitted) || Boolean(incoming.examSubmitted),
+    examSelectedOption: incoming.examSelectedOption ?? existing.examSelectedOption ?? null,
+    explanationSeconds: Math.max(Number(existing.explanationSeconds || 0), Number(incoming.explanationSeconds || 0)),
+    videoWatchCount: Math.max(Number(existing.videoWatchCount || 0), Number(incoming.videoWatchCount || 0)),
+    explanationWatchCount: Math.max(Number(existing.explanationWatchCount || 0), Number(incoming.explanationWatchCount || 0)),
+    updatedAt: incoming.updatedAt || existing.updatedAt,
+  };
+};
 
 const readStoredProgress = (courseId: string) => {
   if (typeof window === 'undefined' || !courseId) {
@@ -392,15 +521,15 @@ const buildProgressMap = (
   const progressMap = new Map<string, StoredProgress>();
 
   (course?.lessonProgress || []).forEach((entry) => {
-    progressMap.set(entry.lessonId, entry);
+    progressMap.set(entry.lessonId, mergeStoredProgress(progressMap.get(entry.lessonId), entry as StoredProgress) as StoredProgress);
   });
 
   Object.values(localProgress || {}).forEach((entry) => {
-    progressMap.set(entry.lessonId, entry);
+    progressMap.set(entry.lessonId, mergeStoredProgress(progressMap.get(entry.lessonId), entry) as StoredProgress);
   });
 
   if (transientProgress?.lessonId) {
-    progressMap.set(transientProgress.lessonId, transientProgress);
+    progressMap.set(transientProgress.lessonId, mergeStoredProgress(progressMap.get(transientProgress.lessonId), transientProgress) as StoredProgress);
   }
 
   return progressMap;
@@ -429,14 +558,21 @@ const buildCourseSnapshot = (
   };
 };
 
+const isDemoPreviewLesson = (lesson?: CourseLesson | null) =>
+  Boolean(
+    lesson
+    && !lesson.locked
+    && !lesson.premium
+    && ['youtube', 'private-video', 'video'].includes(String(lesson.type || '')),
+  );
+
 const buildUnlockMap = (course: CourseCard | null, progressMap: Map<string, StoredProgress>, hasCourseAccessOverride = false) => {
   const sections = buildCourseSections(course);
   const lessons = sections.flatMap((section) => section.lessons);
   const accessMap = new Map<string, { unlocked: boolean; reason: string | null }>();
   const hasCourseAccess = Boolean(
     hasCourseAccessOverride
-    || course?.enrolled
-    || course?.price === 0,
+    || course?.enrolled,
   );
 
   lessons.forEach((entry) => {
@@ -449,6 +585,14 @@ const buildUnlockMap = (course: CourseCard | null, progressMap: Map<string, Stor
     }
 
     if (!hasCourseAccess) {
+      if (isDemoPreviewLesson(entry.lesson)) {
+        accessMap.set(entry.lesson.id, {
+          unlocked: true,
+          reason: 'Demo preview available before purchase.',
+        });
+        return;
+      }
+
       accessMap.set(entry.lesson.id, {
         unlocked: false,
         reason: 'Unlock the course to watch lessons and sync progress.',
@@ -485,7 +629,7 @@ const getVideoWatchCount = (progress?: StoredProgress | null) => {
     return progress.videoWatchCount;
   }
 
-  return hasLessonVideoMilestone(progress) ? 1 : 0;
+  return 0;
 };
 
 const getExplanationWatchCount = (progress?: StoredProgress | null) => {
@@ -498,6 +642,20 @@ const getExplanationWatchCount = (progress?: StoredProgress | null) => {
   }
 
   return progress.completed ? 1 : 0;
+};
+
+const getPlayedSeconds = (video: HTMLVideoElement) => {
+  const ranges = video.played;
+  if (!ranges || ranges.length === 0) {
+    return 0;
+  }
+
+  let totalSeconds = 0;
+  for (let index = 0; index < ranges.length; index += 1) {
+    totalSeconds += Math.max(Number(ranges.end(index) || 0) - Number(ranges.start(index) || 0), 0);
+  }
+
+  return totalSeconds;
 };
 
 const buildLessonCopy = (entry: CourseLessonEntry | null, course: CourseCard | null): LessonCopy => {
@@ -599,20 +757,16 @@ const HeaderTools = ({
   searchValue,
   onSearchChange,
   placeholder,
-  userName,
-  notificationCount,
   testId,
 }: {
   searchValue: string;
   onSearchChange: (value: string) => void;
   placeholder: string;
-  userName: string;
-  notificationCount: number;
   testId?: string;
 }) => (
-  <div className="flex w-full flex-col gap-3 sm:flex-row sm:items-center sm:justify-end">
+  <div className="flex w-full">
     <label
-      className="flex h-[42px] min-w-0 items-center gap-[10px] rounded-[14px] border border-[#d8e0ef] bg-white px-[14px] text-[15px] text-[#7a8dab] shadow-[0_8px_22px_rgba(60,86,134,0.05)] sm:w-[240px]"
+      className="flex h-[42px] min-w-0 flex-1 items-center gap-[10px] rounded-[14px] border border-[#d8e0ef] bg-white px-[14px] text-[15px] text-[#7a8dab] shadow-[0_8px_22px_rgba(60,86,134,0.05)] sm:max-w-[280px]"
       data-testid={testId}
     >
       <Search className="h-[16px] w-[16px]" />
@@ -623,23 +777,6 @@ const HeaderTools = ({
         className="w-full bg-transparent text-[#263b63] outline-none placeholder:text-[#93a1ba]"
       />
     </label>
-
-    <div className="flex items-center gap-[14px] text-[#38527e]">
-      <div className="flex h-[38px] w-[38px] items-center justify-center overflow-hidden rounded-full bg-[linear-gradient(180deg,#eef3ff_0%,#d8e4fa_100%)] shadow-[0_8px_18px_rgba(64,89,142,0.10)]">
-        <span className="text-[13px] font-semibold">{buildInitials(userName)}</span>
-      </div>
-      <button
-        type="button"
-        className="relative flex h-[38px] w-[38px] items-center justify-center rounded-full border border-[#d8e0ef] bg-[#f9fbff] shadow-[0_8px_18px_rgba(64,89,142,0.06)]"
-      >
-        <Bell className="h-[17px] w-[17px]" />
-        {notificationCount > 0 && (
-          <span className="absolute -right-[1px] -top-[4px] flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-[#3d82ef] px-[4px] text-[10px] font-semibold text-white">
-            {Math.min(notificationCount, 9)}
-          </span>
-        )}
-      </button>
-    </div>
   </div>
 );
 
@@ -737,8 +874,13 @@ const CatalogCourseCard = ({
   onOpen: () => void;
 }) => {
   const styles = toneStyles[tone];
-  const actionLabel = snapshot.progressPercent > 0 ? 'Continue' : course.enrolled ? 'Start Course' : course.price === 0 ? 'Open Course' : 'Explore';
+  const actionLabel = snapshot.progressPercent > 0
+    ? 'Continue'
+    : course.enrolled
+      ? 'Start Course'
+      : 'Buy Course';
   const chipLabel = course.exam || course.category || 'Course';
+  const pricing = getCoursePricingMeta(course);
 
   return (
     <button
@@ -746,7 +888,7 @@ const CatalogCourseCard = ({
       data-testid={`course-catalog-card-${slugify(course._id)}`}
       onClick={onOpen}
       className={cn(
-        'group relative flex h-[246px] flex-col overflow-hidden rounded-[22px] border border-white/70 px-[18px] pb-[16px] pt-[14px] text-left shadow-[0_18px_40px_rgba(45,68,117,0.10)] transition hover:-translate-y-0.5',
+        'group relative flex min-h-[320px] flex-col overflow-hidden rounded-[22px] border border-white/70 px-[18px] pb-[16px] pt-[14px] text-left shadow-[0_18px_40px_rgba(45,68,117,0.10)] transition hover:-translate-y-0.5',
         styles.surface,
       )}
     >
@@ -756,12 +898,38 @@ const CatalogCourseCard = ({
           {chipLabel}
         </span>
 
-        <div className="mt-[16px] min-h-[76px]">
+        <div className="mt-[16px] min-h-[64px]">
           <p className="text-[20px] font-semibold leading-[1.1] tracking-[-0.02em] text-[#142140]">{course.title}</p>
           <p className="mt-[6px] line-clamp-2 text-[15px] leading-[1.18] text-[#32466c]">{course.subject}</p>
         </div>
 
-        <div className="mt-[6px] flex items-end justify-between gap-4">
+        {!course.enrolled && (
+          <div className="mt-[4px] rounded-[16px] border border-[#ffd9b6] bg-[linear-gradient(135deg,rgba(255,247,237,0.96)_0%,rgba(255,255,255,0.98)_100%)] px-[14px] py-[12px] shadow-[0_12px_26px_rgba(201,106,43,0.10)]">
+            <div className="flex items-start justify-between gap-[10px]">
+              <div>
+                <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#c96a2b]">Offer price</p>
+                <p className="mt-[4px] text-[24px] font-bold leading-none text-[#17233d]">{currency.format(pricing.finalPrice)}</p>
+              </div>
+              {pricing.offerPercentage > 0 && (
+                <span className="rounded-full bg-[#ffedd5] px-[10px] py-[6px] text-[11px] font-bold text-[#c96a2b]">
+                  {pricing.offerPercentage}% OFF
+                </span>
+              )}
+            </div>
+            <div className="mt-[8px] flex flex-wrap items-center gap-[8px] text-[11px]">
+              <span className="font-semibold text-[#7a8aa7] line-through decoration-[#c96a2b]/55">
+                {currency.format(pricing.basePrice)}
+              </span>
+              {pricing.savings > 0 && (
+                <span className="rounded-full bg-[#fff3e6] px-[8px] py-[3px] font-semibold text-[#c96a2b]">
+                  Save {currency.format(pricing.savings)}
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+
+        <div className="mt-[12px] flex items-end justify-between gap-4">
           <div className="min-w-0 flex-1">
             <p className="text-[15px] leading-none text-[#2d3d62]">{snapshot.progressPercent}% Completed</p>
             <div className="mt-[11px] h-[8px] w-full max-w-[162px] overflow-hidden rounded-full bg-[#d8e4f7]">
@@ -775,7 +943,7 @@ const CatalogCourseCard = ({
 
         <div className="mt-[16px] border-t border-[#dde6f4]" />
 
-        <div className="mt-[10px] grid grid-cols-3 gap-[8px] text-[#31456a]">
+        <div className="mt-[12px] grid grid-cols-3 gap-[8px] text-[#31456a]">
           <div>
             <p className="text-[13px] leading-[1.1]">{snapshot.totalLessons} Lessons</p>
             <p className="mt-[6px] text-[11px] text-[#8193b0]">Course flow</p>
@@ -845,6 +1013,7 @@ export const CourseFigmaTab = ({
   onRefresh,
   initialCourseId,
   initialLessonId,
+  initialDoubtThreadId,
   onResumeNavigationHandled,
   savedTopicIds,
   onToggleSavedTopic,
@@ -875,12 +1044,22 @@ export const CourseFigmaTab = ({
   const [isVideoReplayMode, setIsVideoReplayMode] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [completedVideoPlaybackKey, setCompletedVideoPlaybackKey] = useState<string | null>(null);
+  const [isWatermarkVisible, setIsWatermarkVisible] = useState(false);
+  const [watermarkPosition, setWatermarkPosition] = useState<WatermarkPosition>(() => createRandomWatermarkPosition());
+  const [watermarkTimestamp, setWatermarkTimestamp] = useState(() => new Date().toLocaleString('en-IN'));
   const [mobileLessonStageOverride, setMobileLessonStageOverride] = useState<MobileLessonStage | null>(null);
   const [isMobileLayout, setIsMobileLayout] = useState(false);
   const [quizSelections, setQuizSelections] = useState<Record<string, number | null>>({});
   const [quizSubmitted, setQuizSubmitted] = useState<Record<string, boolean>>({});
   const [lessonDoubtDrafts, setLessonDoubtDrafts] = useState<Record<string, string>>({});
-  const [lessonDoubtThreads, setLessonDoubtThreads] = useState<Record<string, LessonDoubtMessage[]>>({});
+  const [lessonDoubtThreads, setLessonDoubtThreads] = useState<LessonDoubtThread[]>([]);
+  const [lessonDoubtViewerRole, setLessonDoubtViewerRole] = useState<'student' | 'admin'>(() =>
+    user?.role === 'admin' ? 'admin' : 'student');
+  const [selectedLessonDoubtThreadId, setSelectedLessonDoubtThreadId] = useState<string | null>(null);
+  const [loadingLessonDoubts, setLoadingLessonDoubts] = useState(false);
+  const [sendingLessonDoubt, setSendingLessonDoubt] = useState(false);
+  const [lessonDoubtError, setLessonDoubtError] = useState<string | null>(null);
   const [lessonRatings, setLessonRatings] = useState<Record<string, number>>({});
   const [lessonReportDrafts, setLessonReportDrafts] = useState<Record<string, string>>({});
   const [lessonReportSent, setLessonReportSent] = useState<Record<string, boolean>>({});
@@ -892,6 +1071,9 @@ export const CourseFigmaTab = ({
   const [protectedLessonPlayback, setProtectedLessonPlayback] = useState<ProtectedLessonPlayback | null>(null);
   const [loadingProtectedLesson, setLoadingProtectedLesson] = useState(false);
   const [protectedLessonError, setProtectedLessonError] = useState<string | null>(null);
+  const [useProtectedSourceFallback, setUseProtectedSourceFallback] = useState(false);
+  const [privateVideoQualityOptions, setPrivateVideoQualityOptions] = useState<RecordedVideoQualityOption[]>([]);
+  const [selectedPrivateVideoQuality, setSelectedPrivateVideoQuality] = useState<number>(480);
   const [localProgressByCourse, setLocalProgressByCourse] = useState<Record<string, Record<string, StoredProgress>>>(() =>
     overview.courses.reduce<Record<string, Record<string, StoredProgress>>>((accumulator, course) => {
       accumulator[course._id] = readStoredProgress(course._id);
@@ -901,6 +1083,7 @@ export const CourseFigmaTab = ({
   const playerViewportRef = useRef<HTMLDivElement | null>(null);
   const autoplayHandledRef = useRef<string | null>(null);
   const handledResumeNavigationRef = useRef<string | null>(null);
+  const pendingLessonDoubtThreadIdRef = useRef<string | null>(initialDoubtThreadId || null);
   const lessonVideoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
 
@@ -951,8 +1134,8 @@ export const CourseFigmaTab = ({
   }, [defaultCourseId, overview.courses, selectedCourseId]);
 
   useEffect(() => {
-    const resumeKey = `${initialCourseId || ''}::${initialLessonId || ''}`;
-    if ((!initialCourseId && !initialLessonId) || handledResumeNavigationRef.current === resumeKey) {
+    const resumeKey = `${initialCourseId || ''}::${initialLessonId || ''}::${initialDoubtThreadId || ''}`;
+    if ((!initialCourseId && !initialLessonId && !initialDoubtThreadId) || handledResumeNavigationRef.current === resumeKey) {
       return;
     }
 
@@ -968,10 +1151,15 @@ export const CourseFigmaTab = ({
     if (initialLessonId) {
       setSelectedLessonId(initialLessonId);
     }
+    if (initialDoubtThreadId) {
+      pendingLessonDoubtThreadIdRef.current = initialDoubtThreadId;
+      setExpandedSupportPanel('doubts');
+      setMobileSupportTab('doubts');
+    }
 
     handledResumeNavigationRef.current = resumeKey;
     onResumeNavigationHandled?.();
-  }, [defaultCourseId, initialCourseId, initialLessonId, onResumeNavigationHandled, overview.courses]);
+  }, [defaultCourseId, initialCourseId, initialDoubtThreadId, initialLessonId, onResumeNavigationHandled, overview.courses]);
 
   const selectedCourse = useMemo(
     () => overview.courses.find((course) => course._id === selectedCourseId) || overview.courses[0] || null,
@@ -1033,13 +1221,35 @@ export const CourseFigmaTab = ({
   const selectedLessonExamSubmitted = selectedLessonEntry
     ? Boolean(quizSubmitted[selectedLessonEntry.lesson.id] ?? selectedLessonStoredProgress?.examSubmitted)
     : false;
+  const selectedLessonVideoWatchLimit = Math.max(
+    Number(
+      protectedLessonPlayback?.watchLimit
+      ?? selectedLessonEntry?.lesson.watchLimit
+      ?? MAX_VIDEO_WATCHES,
+    ),
+    1,
+  );
+  const selectedLessonWatchCompletionPercent = Math.min(
+    Math.max(
+      Number(
+        protectedLessonPlayback?.watchCompletionPercent
+        ?? selectedLessonEntry?.lesson.watchCompletionPercent
+        ?? (VIDEO_COMPLETION_MIN_WATCH_RATIO * 100),
+      ),
+      50,
+    ),
+    100,
+  );
+  const selectedLessonCompletionRatio = selectedLessonWatchCompletionPercent / 100;
   const selectedLessonVideoWatchCount = getVideoWatchCount(selectedLessonStoredProgress);
   const selectedLessonExplanationWatchCount = getExplanationWatchCount(selectedLessonStoredProgress);
-  const canRewatchLessonVideo = selectedLessonVideoWatchCount > 0 && selectedLessonVideoWatchCount < MAX_VIDEO_WATCHES;
-  const hasReachedLessonVideoWatchLimit = selectedLessonVideoWatchCount >= MAX_VIDEO_WATCHES;
+  const hasCompletedLessonVideo = selectedLessonVideoWatchCount > 0 || hasLessonVideoMilestone(selectedLessonStoredProgress);
+  const canRewatchLessonVideo = selectedLessonVideoWatchCount > 0 && selectedLessonVideoWatchCount < selectedLessonVideoWatchLimit;
+  const hasReachedLessonVideoWatchLimit = selectedLessonVideoWatchCount >= selectedLessonVideoWatchLimit;
   const hasReachedExplanationWatchLimit = selectedLessonExplanationWatchCount >= MAX_EXPLANATION_WATCHES;
   const canWatchExplanation = selectedLessonExamSubmitted && !hasReachedExplanationWatchLimit;
-  const selectedLessonStage: LessonStage = selectedLessonStoredProgress?.lessonStage || (selectedLessonStoredProgress?.completed ? 'explanation' : 'video');
+  const selectedLessonStage: LessonStage = selectedLessonStoredProgress?.lessonStage
+    || (selectedLessonStoredProgress?.completed ? 'explanation' : selectedLessonExamSubmitted ? 'exam' : 'video');
   const lessonProgressTab: LessonTab = activeLessonTab;
   const transientProgress = selectedLessonEntry
     ? (() => {
@@ -1094,8 +1304,7 @@ export const CourseFigmaTab = ({
   );
   const selectedCourseHasAccess = Boolean(
     user?.role === 'admin'
-    || selectedCourse?.enrolled
-    || selectedCourse?.price === 0,
+    || selectedCourse?.enrolled,
   );
   const selectedLesson = selectedLessonEntry?.lesson || null;
   const selectedLessonHasSecurePlayback = Boolean(
@@ -1103,10 +1312,49 @@ export const CourseFigmaTab = ({
     && (selectedLesson.requiresSecurePlayback || ['youtube', 'private-video'].includes(String(selectedLesson.type || ''))),
   );
   const selectedLessonDirectVideoUrl = selectedLesson?.type === 'video' ? selectedLesson.videoUrl || null : null;
+  const currentPlaybackWatermarkText = [
+    user?.name,
+    user?.email,
+    user?.mobileNumber,
+    user?._id,
+    watermarkTimestamp,
+  ].filter(Boolean).join(' • ');
+
+  useEffect(() => {
+    if (!currentPlaybackWatermarkText) {
+      setIsWatermarkVisible(false);
+      return undefined;
+    }
+
+    const timeoutIds: number[] = [];
+    const showWatermark = () => {
+      setWatermarkPosition(createRandomWatermarkPosition());
+      setWatermarkTimestamp(new Date().toLocaleString('en-IN'));
+      setIsWatermarkVisible(true);
+      const hideId = window.setTimeout(() => {
+        setIsWatermarkVisible(false);
+      }, WATERMARK_VISIBLE_DURATION_MS);
+      timeoutIds.push(hideId);
+    };
+
+    showWatermark();
+    const intervalId = window.setInterval(() => {
+      showWatermark();
+    }, WATERMARK_HIDDEN_INTERVAL_MS + WATERMARK_VISIBLE_DURATION_MS);
+
+    return () => {
+      timeoutIds.forEach((timeoutId) => window.clearTimeout(timeoutId));
+      window.clearInterval(intervalId);
+    };
+  }, [selectedLesson?.id, user?._id]);
 
   const unlockMap = useMemo(
     () => buildUnlockMap(selectedCourse, selectedCourseProgressMap, selectedCourseHasAccess),
     [selectedCourse, selectedCourseHasAccess, selectedCourseProgressMap],
+  );
+  const selectedLessonUnlocked = Boolean(
+    selectedLesson
+    && unlockMap.get(selectedLesson.id)?.unlocked,
   );
 
   const selectedCourseSnapshot = useMemo(
@@ -1156,26 +1404,111 @@ export const CourseFigmaTab = ({
     selectedLesson ? String(selectedLesson.type).replace(/-/g, ' ') : null,
   ].filter(Boolean).slice(0, 4);
 
+  const activeLessonDoubtThread = useMemo(() => {
+    if (!lessonDoubtThreads.length) {
+      return null;
+    }
+
+    if (selectedLessonDoubtThreadId) {
+      return lessonDoubtThreads.find((thread) => thread._id === selectedLessonDoubtThreadId) || lessonDoubtThreads[0];
+    }
+
+    return lessonDoubtThreads[0] || null;
+  }, [lessonDoubtThreads, selectedLessonDoubtThreadId]);
+
+  const activeLessonDoubtDraftKey = selectedLessonEntry
+    ? buildLessonDoubtDraftKey(
+      selectedLessonEntry.lesson.id,
+      activeLessonDoubtThread?._id || (lessonDoubtViewerRole === 'admin' ? 'admin' : 'student'),
+    )
+    : '';
+  const activeLessonDoubtDraft = activeLessonDoubtDraftKey ? lessonDoubtDrafts[activeLessonDoubtDraftKey] || '' : '';
+
+  const loadLessonDoubts = useCallback(async (options: { silent?: boolean } = {}) => {
+    if (screen !== 'lesson' || !selectedCourse?._id || !selectedLessonEntry?.lesson.id) {
+      setLessonDoubtThreads([]);
+      setSelectedLessonDoubtThreadId(null);
+      setLessonDoubtError(null);
+      setLoadingLessonDoubts(false);
+      return;
+    }
+
+    if (!options.silent) {
+      setLoadingLessonDoubts(true);
+    }
+
+    try {
+      const response = await EduService.listLessonDoubts(selectedCourse._id, selectedLessonEntry.lesson.id);
+      setLessonDoubtViewerRole(response.viewerRole);
+      setLessonDoubtThreads(response.threads || []);
+      setLessonDoubtError(null);
+      setSelectedLessonDoubtThreadId((current) => {
+        const pendingThreadId = pendingLessonDoubtThreadIdRef.current;
+        if (pendingThreadId && response.threads.some((thread) => thread._id === pendingThreadId)) {
+          pendingLessonDoubtThreadIdRef.current = null;
+          return pendingThreadId;
+        }
+
+        if (current && response.threads.some((thread) => thread._id === current)) {
+          return current;
+        }
+
+        return response.threads[0]?._id || null;
+      });
+    } catch (error) {
+      setLessonDoubtError(error instanceof Error ? error.message : 'Unable to load lesson discussion.');
+    } finally {
+      if (!options.silent) {
+        setLoadingLessonDoubts(false);
+      }
+    }
+  }, [screen, selectedCourse?._id, selectedLessonEntry?.lesson.id]);
+
   useEffect(() => {
     if (!selectedLessonEntry) {
       return;
     }
 
     const lessonId = selectedLessonEntry.lesson.id;
+    const pendingThreadId = pendingLessonDoubtThreadIdRef.current;
+    const draftKey = buildLessonDoubtDraftKey(
+      lessonId,
+      pendingThreadId || (lessonDoubtViewerRole === 'admin' ? 'admin' : 'student'),
+    );
 
     setLessonDoubtDrafts((current) => (
-      Object.prototype.hasOwnProperty.call(current, lessonId)
+      Object.prototype.hasOwnProperty.call(current, draftKey)
         ? current
-        : { ...current, [lessonId]: '' }
+        : { ...current, [draftKey]: '' }
     ));
-  }, [
-    selectedLessonEntry,
-  ]);
+  }, [lessonDoubtViewerRole, selectedLessonEntry]);
 
   useEffect(() => {
+    if (pendingLessonDoubtThreadIdRef.current) {
+      setMobileSupportTab('doubts');
+      setExpandedSupportPanel('doubts');
+      return;
+    }
+
     setMobileSupportTab('notes');
     setExpandedSupportPanel(null);
   }, [selectedLessonEntry?.lesson.id]);
+
+  useEffect(() => {
+    void loadLessonDoubts();
+  }, [loadLessonDoubts]);
+
+  useEffect(() => {
+    if (screen !== 'lesson' || !selectedCourse?._id || !selectedLessonEntry?.lesson.id) {
+      return undefined;
+    }
+
+    const intervalId = window.setInterval(() => {
+      void loadLessonDoubts({ silent: true });
+    }, LESSON_DOUBT_POLL_INTERVAL_MS);
+
+    return () => window.clearInterval(intervalId);
+  }, [loadLessonDoubts, screen, selectedCourse?._id, selectedLessonEntry?.lesson.id]);
 
   useEffect(() => {
     const shouldLoadProtectedLesson = Boolean(
@@ -1183,7 +1516,7 @@ export const CourseFigmaTab = ({
       && activeLessonTab === 'Video'
       && selectedCourse?._id
       && selectedLesson?.id
-      && selectedCourseHasAccess
+      && selectedLessonUnlocked
       && selectedLessonHasSecurePlayback,
     );
 
@@ -1219,12 +1552,99 @@ export const CourseFigmaTab = ({
     return () => {
       cancelled = true;
     };
-  }, [activeLessonTab, screen, selectedCourse?._id, selectedCourseHasAccess, selectedLesson?.id, selectedLessonHasSecurePlayback]);
+  }, [activeLessonTab, screen, selectedCourse?._id, selectedLesson?.id, selectedLessonHasSecurePlayback, selectedLessonUnlocked]);
+
+  useEffect(() => {
+    if (
+      screen !== 'lesson'
+      || activeLessonTab !== 'Video'
+      || !selectedCourse?._id
+      || !selectedLesson?.id
+      || selectedLesson.type !== 'private-video'
+      || !selectedLessonUnlocked
+      || !protectedLessonPlayback
+    ) {
+      return undefined;
+    }
+
+    const playbackStatus = String(protectedLessonPlayback.playbackStatus || '').toLowerCase();
+    const shouldRetry = !protectedLessonPlayback.streamUrl
+      && !protectedLessonPlayback.drmConfig?.manifestUrl
+      && ['queued', 'processing'].includes(playbackStatus);
+    if (!shouldRetry) {
+      return undefined;
+    }
+
+    const timer = window.setTimeout(() => {
+      setLoadingProtectedLesson(true);
+      setProtectedLessonError(null);
+      void EduService.getProtectedLessonPlayback(selectedCourse._id, selectedLesson.id, { forceRefresh: true })
+        .then((payload) => {
+          setProtectedLessonPlayback(payload);
+        })
+        .catch((error) => {
+          setProtectedLessonError(error instanceof Error ? error.message : 'Unable to prepare lesson playback.');
+        })
+        .finally(() => {
+          setLoadingProtectedLesson(false);
+        });
+    }, 4000);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    activeLessonTab,
+    protectedLessonPlayback,
+    screen,
+    selectedCourse?._id,
+    selectedLesson?.id,
+    selectedLesson?.type,
+    selectedLessonUnlocked,
+  ]);
+
+  useEffect(() => {
+    setUseProtectedSourceFallback(false);
+  }, [selectedLesson?.id, protectedLessonPlayback?.streamUrl, protectedLessonPlayback?.fallbackStreamUrl]);
 
   const selectedLessonIndex = selectedCourseEntries.findIndex((entry) => entry.lesson.id === selectedLessonEntry?.lesson.id);
   const nextLessonEntry = selectedLessonIndex >= 0 && selectedLessonIndex < selectedCourseEntries.length - 1
     ? selectedCourseEntries[selectedLessonIndex + 1]
     : null;
+
+  useEffect(() => {
+    if (
+      screen !== 'lesson'
+      || activeLessonTab !== 'Video'
+      || !selectedCourse?._id
+      || !selectedLessonUnlocked
+    ) {
+      return;
+    }
+
+    const prefetchTargets = [selectedLessonEntry, nextLessonEntry]
+      .filter((entry): entry is CourseLessonEntry => Boolean(
+        entry?.lesson?.id
+        && unlockMap.get(entry.lesson.id)?.unlocked
+        && (entry.lesson.requiresSecurePlayback || ['youtube', 'private-video'].includes(String(entry.lesson.type || ''))),
+      ));
+
+    const timers = prefetchTargets.map((entry, index) => (
+      window.setTimeout(() => {
+        void EduService.prefetchProtectedLessonPlayback(selectedCourse._id, entry.lesson.id);
+      }, index === 0 ? 0 : 350)
+    ));
+
+    return () => {
+      timers.forEach((timer) => window.clearTimeout(timer));
+    };
+  }, [
+    activeLessonTab,
+    nextLessonEntry,
+    screen,
+    selectedCourse?._id,
+    selectedLessonUnlocked,
+    selectedLessonEntry,
+    unlockMap,
+  ]);
 
   const filteredCourseSections = useMemo(() => {
     const query = normalize(searchQuery);
@@ -1273,7 +1693,7 @@ export const CourseFigmaTab = ({
         ].some((value) => normalize(value).includes(query));
         const matchesCategory = categoryFilter === 'all' || normalize(course.exam || course.category) === normalize(categoryFilter);
         const matchesStatus = statusFilter === 'all'
-          || (statusFilter === 'unlocked' && Boolean(course.enrolled || course.price === 0))
+          || (statusFilter === 'unlocked' && Boolean(course.enrolled))
           || (statusFilter === 'progress' && snapshot.progressPercent > 0 && snapshot.progressPercent < 100)
           || (statusFilter === 'completed' && snapshot.progressPercent >= 100)
           || (statusFilter === 'not-started' && snapshot.progressPercent === 0);
@@ -1355,13 +1775,14 @@ export const CourseFigmaTab = ({
   ]);
 
   const mobileLessonStage = mobileLessonStageOverride || derivedMobileLessonStage;
-  const isLessonReadyForExam = selectedLessonStage !== 'video';
+  const isLessonReadyForExam = hasCompletedLessonVideo;
   const isExplanationUnlocked = canWatchExplanation;
   const isLessonFlowComplete = Boolean(selectedLessonStoredProgress?.completed);
 
   useEffect(() => {
     setMobileLessonStageOverride(null);
     setIsVideoReplayMode(false);
+    setCompletedVideoPlaybackKey(null);
   }, [selectedLessonEntry?.lesson.id, selectedCourse?._id]);
 
   useEffect(() => {
@@ -1430,18 +1851,14 @@ export const CourseFigmaTab = ({
       return;
     }
 
-    const shouldTickVideo = lessonProgressTab === 'Video' && isVideoPlaying;
     const shouldTickExplanation = lessonProgressTab === 'Explanation' && isExplanationPlaying;
 
-    if (!shouldTickVideo && !shouldTickExplanation) {
+    if (!shouldTickExplanation) {
       return;
     }
 
     const intervalId = window.setInterval(() => {
       const delta = Math.max(Math.round(PLAYER_TICK_STEP_SECONDS * playbackSpeed), 8);
-      if (shouldTickVideo) {
-        setVideoPlaybackSeconds((current) => Math.min(current + delta, selectedLessonVideoDurationSeconds));
-      }
       if (shouldTickExplanation) {
         setExplanationPlaybackSeconds((current) => Math.min(current + delta, selectedLessonExplanationDurationSeconds));
       }
@@ -1452,13 +1869,11 @@ export const CourseFigmaTab = ({
     autoplayCountdown,
     explanationPlaybackSeconds,
     isExplanationPlaying,
-    isVideoPlaying,
     lessonProgressTab,
     playbackSpeed,
     screen,
     selectedLessonEntry,
     selectedLessonExplanationDurationSeconds,
-    selectedLessonVideoDurationSeconds,
   ]);
 
   const persistProgress = (courseId: string, lessonId: string, nextRecord: StoredProgressPatch) => {
@@ -1469,25 +1884,30 @@ export const CourseFigmaTab = ({
       return;
     }
 
+    const serverProgress = (targetCourse.lessonProgress || []).find((entry) => entry.lessonId === lessonId) as StoredProgress | undefined;
+    const localProgress = localProgressByCourse[courseId]?.[lessonId];
+    const baselineRecord = mergeStoredProgress(serverProgress || null, localProgress || null);
+    const mergedRecord = mergeStoredProgress(baselineRecord, {
+      lessonId,
+      progressPercent: Number(nextRecord.progressPercent ?? baselineRecord?.progressPercent ?? 0),
+      progressSeconds: Number(nextRecord.progressSeconds ?? baselineRecord?.progressSeconds ?? 0),
+      completed: Boolean(nextRecord.completed ?? baselineRecord?.completed ?? false),
+      lessonStage: nextRecord.lessonStage ?? baselineRecord?.lessonStage,
+      examSubmitted: nextRecord.examSubmitted ?? baselineRecord?.examSubmitted ?? false,
+      examSelectedOption: Object.prototype.hasOwnProperty.call(nextRecord, 'examSelectedOption')
+        ? nextRecord.examSelectedOption ?? null
+        : baselineRecord?.examSelectedOption ?? null,
+      explanationSeconds: nextRecord.explanationSeconds ?? baselineRecord?.explanationSeconds ?? 0,
+      videoWatchCount: nextRecord.videoWatchCount ?? baselineRecord?.videoWatchCount ?? 0,
+      explanationWatchCount: nextRecord.explanationWatchCount ?? baselineRecord?.explanationWatchCount ?? 0,
+      updatedAt: nextRecord.updatedAt || new Date().toISOString(),
+    });
+
+    if (!mergedRecord) {
+      return;
+    }
+
     setLocalProgressByCourse((current) => {
-      const serverProgress = (targetCourse.lessonProgress || []).find((entry) => entry.lessonId === lessonId) as StoredProgress | undefined;
-      const existingRecord: StoredProgress | undefined = current[courseId]?.[lessonId] || serverProgress;
-      const mergedRecord: StoredProgress = {
-        lessonId,
-        progressPercent: Number(existingRecord?.progressPercent || 0),
-        progressSeconds: Number(existingRecord?.progressSeconds || 0),
-        completed: Boolean(existingRecord?.completed),
-        updatedAt: nextRecord.updatedAt || new Date().toISOString(),
-        ...(existingRecord || {}),
-        ...nextRecord,
-        explanationSeconds: nextRecord.explanationSeconds ?? existingRecord?.explanationSeconds ?? 0,
-        examSubmitted: nextRecord.examSubmitted ?? existingRecord?.examSubmitted ?? false,
-        examSelectedOption: Object.prototype.hasOwnProperty.call(nextRecord, 'examSelectedOption')
-          ? nextRecord.examSelectedOption ?? null
-          : existingRecord?.examSelectedOption ?? null,
-        videoWatchCount: nextRecord.videoWatchCount ?? getVideoWatchCount(existingRecord),
-        explanationWatchCount: nextRecord.explanationWatchCount ?? getExplanationWatchCount(existingRecord),
-      };
       const nextCourseProgress = {
         ...(current[courseId] || {}),
         [lessonId]: mergedRecord,
@@ -1497,6 +1917,28 @@ export const CourseFigmaTab = ({
         ...current,
         [courseId]: nextCourseProgress,
       };
+    });
+
+    if (!user?._id) {
+      return;
+    }
+
+    void EduService.updateWatchProgress(
+      courseId,
+      lessonId,
+      Math.max(Math.min(Number(mergedRecord.progressPercent || 0), 100), 0),
+      Math.max(Number(mergedRecord.progressSeconds || 0), 0),
+      Boolean(mergedRecord.completed),
+      {
+        lessonStage: mergedRecord.lessonStage ?? null,
+        examSubmitted: mergedRecord.examSubmitted ?? null,
+        examSelectedOption: mergedRecord.examSelectedOption ?? null,
+        explanationSeconds: mergedRecord.explanationSeconds ?? 0,
+        videoWatchCount: mergedRecord.videoWatchCount ?? 0,
+        explanationWatchCount: mergedRecord.explanationWatchCount ?? 0,
+      },
+    ).catch((error) => {
+      console.error('Failed to sync course figma progress:', error);
     });
   };
 
@@ -1526,13 +1968,14 @@ export const CourseFigmaTab = ({
     }
 
     if (lessonProgressTab === 'Video') {
-      if (videoPlaybackSeconds < selectedLessonVideoDurationSeconds) {
+      if (!completedVideoPlaybackKey || !completedVideoPlaybackKey.startsWith(`${selectedLessonEntry.lesson.id}::`)) {
         return;
       }
 
-      if (!isVideoReplayMode && hasLessonVideoMilestone(selectedLessonStoredProgress)) {
+      if (!isVideoReplayMode && hasCompletedLessonVideo) {
         autoplayHandledRef.current = autoplayKey;
         setIsVideoPlaying(false);
+        setCompletedVideoPlaybackKey(null);
         if (isMobileLayout) {
           setMobileLessonStageOverride('completed');
         } else {
@@ -1541,7 +1984,7 @@ export const CourseFigmaTab = ({
         return;
       }
 
-      const nextVideoWatchCount = Math.min(selectedLessonVideoWatchCount + 1, MAX_VIDEO_WATCHES);
+      const nextVideoWatchCount = Math.min(selectedLessonVideoWatchCount + 1, selectedLessonVideoWatchLimit);
       const preserveCompletion = Boolean(selectedLessonStoredProgress?.completed);
       const nextLessonStage: LessonStage = selectedLessonExamSubmitted || preserveCompletion ? 'explanation' : 'exam';
       const nextProgressPercent = preserveCompletion
@@ -1553,6 +1996,7 @@ export const CourseFigmaTab = ({
       autoplayHandledRef.current = autoplayKey;
       setIsVideoPlaying(false);
       setIsVideoReplayMode(false);
+      setCompletedVideoPlaybackKey(null);
       persistProgress(selectedCourse._id, selectedLessonEntry.lesson.id, {
         lessonId: selectedLessonEntry.lesson.id,
         progressSeconds: preserveCompletion ? selectedLessonExplanationDurationSeconds : selectedLessonVideoDurationSeconds,
@@ -1613,6 +2057,8 @@ export const CourseFigmaTab = ({
     nextLessonEntry,
     isMobileLayout,
     isVideoReplayMode,
+    hasCompletedLessonVideo,
+    completedVideoPlaybackKey,
     selectedLessonExplanationWatchCount,
     screen,
     selectedCourse,
@@ -1625,7 +2071,6 @@ export const CourseFigmaTab = ({
     selectedLessonStoredProgress?.explanationSeconds,
     selectedLessonVideoDurationSeconds,
     selectedLessonVideoWatchCount,
-    videoPlaybackSeconds,
   ]);
 
   useEffect(() => {
@@ -1635,7 +2080,19 @@ export const CourseFigmaTab = ({
     }
 
     currentVideo.playbackRate = playbackSpeed;
-  }, [playbackSpeed, protectedLessonPlayback?.streamUrl, selectedLessonDirectVideoUrl, selectedLesson?.id]);
+  }, [
+    playbackSpeed,
+    protectedLessonPlayback?.fallbackStreamUrl,
+    protectedLessonPlayback?.streamUrl,
+    selectedLessonDirectVideoUrl,
+    selectedLesson?.id,
+    useProtectedSourceFallback,
+  ]);
+
+  useEffect(() => {
+    setPrivateVideoQualityOptions([]);
+    setSelectedPrivateVideoQuality(480);
+  }, [selectedLesson?.id, protectedLessonPlayback?.streamUrl, protectedLessonPlayback?.fallbackStreamUrl]);
 
   useEffect(() => {
     if (hlsRef.current) {
@@ -1644,31 +2101,72 @@ export const CourseFigmaTab = ({
     }
 
     const currentVideo = lessonVideoRef.current;
-    const streamUrl = protectedLessonPlayback?.streamUrl || null;
-    if (!currentVideo || !streamUrl || protectedLessonPlayback?.streamFormat !== 'hls') {
+    const fallbackStreamUrl = protectedLessonPlayback?.fallbackStreamUrl || null;
+    const streamUrl = useProtectedSourceFallback && fallbackStreamUrl
+      ? fallbackStreamUrl
+      : protectedLessonPlayback?.streamUrl || null;
+    const streamFormat = useProtectedSourceFallback && fallbackStreamUrl
+      ? protectedLessonPlayback?.fallbackStreamFormat || 'source'
+      : protectedLessonPlayback?.streamFormat || null;
+    if (!currentVideo || !streamUrl || streamFormat !== 'hls') {
       return;
     }
 
-    if (currentVideo.canPlayType('application/vnd.apple.mpegurl')) {
-      currentVideo.src = streamUrl;
-      return wireHlsPlaybackMetrics({
-        video: currentVideo,
-        src: streamUrl,
-        title: selectedLesson?.title || 'Recorded lesson',
-        trackVideoId: selectedLesson?.id || null,
-      });
-    }
+    const trySourceFallback = () => {
+      if (!fallbackStreamUrl || useProtectedSourceFallback) {
+        return false;
+      }
+      setUseProtectedSourceFallback(true);
+      return true;
+    };
 
-    if (!Hls.isSupported()) {
+    const canUseHlsJs = Hls.isSupported();
+    if (!canUseHlsJs) {
+      if (currentVideo.canPlayType('application/vnd.apple.mpegurl')) {
+        setPrivateVideoQualityOptions([]);
+        currentVideo.src = streamUrl;
+        const cleanupMetrics = wireHlsPlaybackMetrics({
+          video: currentVideo,
+          src: streamUrl,
+          title: selectedLesson?.title || 'Recorded lesson',
+          trackVideoId: selectedLesson?.id || null,
+        });
+        const handleNativeError = () => {
+          if (trySourceFallback()) {
+            currentVideo.pause();
+            currentVideo.removeAttribute('src');
+            currentVideo.load();
+          }
+        };
+        currentVideo.addEventListener('error', handleNativeError);
+        return () => {
+          currentVideo.removeEventListener('error', handleNativeError);
+          cleanupMetrics();
+        };
+      }
+
+      trySourceFallback();
       return;
     }
 
-    const hls = new Hls({
-      enableWorker: true,
-      maxBufferLength: 30,
-      backBufferLength: 30,
-    });
+    const hls = new Hls(createProtectedVodHlsConfig());
     hlsRef.current = hls;
+    let releaseAutoLevel = () => undefined;
+    hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
+      const qualityOptions = getRecordedVideoQualityOptions(data.levels || []);
+      setPrivateVideoQualityOptions(qualityOptions);
+      setSelectedPrivateVideoQuality((current) => getDefaultRecordedVideoQualityHeight(qualityOptions, current));
+      releaseAutoLevel();
+      releaseAutoLevel = scheduleAutoLevelRelease(hls);
+    });
+    hls.on(Hls.Events.ERROR, (_event, data) => {
+      if (shouldFallbackToSourceFromHlsError(data) && trySourceFallback()) {
+        hls.destroy();
+        if (hlsRef.current === hls) {
+          hlsRef.current = null;
+        }
+      }
+    });
     hls.loadSource(streamUrl);
     hls.attachMedia(currentVideo);
     const cleanupMetrics = wireHlsPlaybackMetrics({
@@ -1680,6 +2178,7 @@ export const CourseFigmaTab = ({
     });
 
     return () => {
+      releaseAutoLevel();
       cleanupMetrics();
       if (hlsRef.current) {
         hlsRef.current.destroy();
@@ -1688,13 +2187,32 @@ export const CourseFigmaTab = ({
     };
   }, [
     activeLessonTab,
+    protectedLessonPlayback?.fallbackStreamUrl,
     isMobileLayout,
     mobileLessonStageOverride,
     protectedLessonPlayback?.streamFormat,
     protectedLessonPlayback?.streamUrl,
     screen,
     selectedLesson?.id,
+    selectedLesson?.title,
+    useProtectedSourceFallback,
   ]);
+
+  useEffect(() => {
+    const hls = hlsRef.current;
+    if (!hls) {
+      return;
+    }
+
+    const selectedLevel = getRecordedVideoQualityLevel(privateVideoQualityOptions, selectedPrivateVideoQuality);
+    if (selectedLevel < 0) {
+      return;
+    }
+
+    hls.currentLevel = selectedLevel;
+    hls.nextLevel = selectedLevel;
+    hls.autoLevelCapping = selectedLevel;
+  }, [privateVideoQualityOptions, selectedPrivateVideoQuality]);
 
   useEffect(() => {
     if (autoplayCountdown === null) {
@@ -1889,7 +2407,7 @@ export const CourseFigmaTab = ({
     }));
   };
 
-  const handleUnlockCourse = async (course: CourseCard, provider: CoursePaymentProvider = 'stripe') => {
+  const handleUnlockCourse = async (course: CourseCard) => {
     if (!user) {
       setCourseAccessMessage('Login is required before enrolling in this course.');
       return;
@@ -1899,87 +2417,40 @@ export const CourseFigmaTab = ({
     setCourseAccessMessage(null);
 
     try {
-      if (course.price === 0) {
-        await EduService.enrollInCourse(course._id, 'free-course');
-        await onRefresh();
-        setCourseAccessMessage('Course access is active. You can start watching lessons now.');
-        return;
+      const checkout = await EduService.unlockCourse(course);
+      const keyId = String(import.meta.env.VITE_RAZORPAY_KEY_ID || '').trim();
+      const orderId = String(checkout.order_id || '').trim();
+      const amount = Number(checkout.amount || 0);
+      const currencyCode = String(checkout.currency || 'INR').trim();
+
+      if (!keyId) {
+        throw new Error('Razorpay key is missing from the frontend environment.');
       }
 
-      const checkout = await EduService.unlockCourse(course, provider);
-      const popup = window.open(checkout.url, `varonenglish-${provider}-checkout`, 'popup=yes,width=520,height=760');
-
-      if (!popup) {
-        throw new Error('Payment popup was blocked. Please allow popups and try again.');
+      if (!orderId || !amount || !currencyCode) {
+        throw new Error('Razorpay order details are incomplete.');
       }
 
-      await new Promise<void>((resolve, reject) => {
-        let settled = false;
-        const timeoutId = window.setTimeout(() => {
-          if (settled) return;
-          settled = true;
-          window.removeEventListener('message', handleMessage);
-          window.clearInterval(closeWatcher);
-          reject(new Error('Payment confirmation timed out. If payment succeeded, refresh and try again.'));
-        }, 5 * 60 * 1000);
+      const result = await openRazorpayCheckout({
+        key: keyId,
+        orderId,
+        amount,
+        currency: currencyCode,
+        courseId: course._id,
+        courseTitle: course.title,
+        prefill: {
+          name: user.name,
+          email: user.email,
+          contact: user.mobileNumber || '',
+        },
+      });
 
-        const closeWatcher = window.setInterval(() => {
-          if (popup.closed && !settled) {
-            settled = true;
-            window.clearTimeout(timeoutId);
-            window.clearInterval(closeWatcher);
-            window.removeEventListener('message', handleMessage);
-            reject(new Error('Payment window was closed before confirmation.'));
-          }
-        }, 500);
-
-        const handleMessage = async (event: MessageEvent) => {
-          if (event.origin !== window.location.origin) {
-            return;
-          }
-
-          const data = event.data || {};
-          const isStripeSuccess = provider === 'stripe'
-            && data.type === 'STRIPE_PAYMENT_SUCCESS'
-            && data.courseId === course._id
-            && data.sessionId;
-          const isPhonePeReturn = provider === 'phonepe'
-            && data.type === 'PHONEPE_PAYMENT_RETURN'
-            && data.courseId === course._id
-            && data.orderId;
-
-          if (!isStripeSuccess && !isPhonePeReturn) {
-            return;
-          }
-
-          try {
-            if (provider === 'phonepe') {
-              await EduService.confirmPhonePeCoursePayment(data.orderId, course._id, data.paymentId);
-            } else {
-              await EduService.confirmCoursePayment(data.sessionId, course._id);
-            }
-            if (!popup.closed) {
-              popup.close();
-            }
-            if (!settled) {
-              settled = true;
-              window.clearTimeout(timeoutId);
-              window.clearInterval(closeWatcher);
-              window.removeEventListener('message', handleMessage);
-              resolve();
-            }
-          } catch (error) {
-            if (!settled) {
-              settled = true;
-              window.clearTimeout(timeoutId);
-              window.clearInterval(closeWatcher);
-              window.removeEventListener('message', handleMessage);
-              reject(error instanceof Error ? error : new Error('Payment confirmation failed.'));
-            }
-          }
-        };
-
-        window.addEventListener('message', handleMessage);
+      await EduService.verifyRazorpayCoursePayment({
+        courseId: course._id,
+        paymentId: checkout.paymentId,
+        razorpay_order_id: result.razorpay_order_id,
+        razorpay_payment_id: result.razorpay_payment_id,
+        razorpay_signature: result.razorpay_signature,
       });
 
       await onRefresh();
@@ -2005,49 +2476,19 @@ export const CourseFigmaTab = ({
       );
     }
 
-    if (course.price === 0) {
-      return (
-        <button
-          type="button"
-          onClick={() => handleUnlockCourse(course)}
-          disabled={busyCourseId === course._id}
-          className={cn(
-            'inline-flex items-center justify-center gap-[8px] bg-[#2f6fe4] font-semibold text-white shadow-[0_12px_24px_rgba(45,110,229,0.2)] disabled:opacity-60',
-            variant === 'mobile' ? 'h-[30px] rounded-[10px] px-[8px] text-[9.5px]' : 'h-[42px] rounded-[12px] px-[16px] text-[13px]',
-          )}
-        >
-          {busyCourseId === course._id ? <LoaderCircle className="h-[14px] w-[14px] animate-spin" /> : <Wallet className="h-[14px] w-[14px]" />}
-          {getCoursePurchaseLabel(course)}
-        </button>
-      );
-    }
-
     return (
-      <div className={cn('flex flex-wrap gap-[8px]', variant === 'mobile' && 'justify-end')}>
-        <button
-          type="button"
-          onClick={() => handleUnlockCourse(course, 'phonepe')}
-          disabled={busyCourseId === course._id}
-          className={cn(
-            'inline-flex items-center justify-center gap-[8px] rounded-[12px] bg-[#5b3df5] font-semibold text-white shadow-[0_12px_24px_rgba(91,61,245,0.2)] disabled:opacity-60',
-            variant === 'mobile' ? 'h-[30px] px-[8px] text-[9.5px]' : 'h-[42px] px-[16px] text-[13px]',
-          )}
-        >
-          {busyCourseId === course._id ? <LoaderCircle className="h-[14px] w-[14px] animate-spin" /> : <Wallet className="h-[14px] w-[14px]" />}
-          PhonePe
-        </button>
-        <button
-          type="button"
-          onClick={() => handleUnlockCourse(course, 'stripe')}
-          disabled={busyCourseId === course._id}
-          className={cn(
-            'inline-flex items-center justify-center rounded-[12px] border border-[#cfd9ec] bg-white font-semibold text-[#172033] disabled:opacity-60',
-            variant === 'mobile' ? 'h-[30px] px-[8px] text-[9.5px]' : 'h-[42px] px-[16px] text-[13px]',
-          )}
-        >
-          Stripe
-        </button>
-      </div>
+      <button
+        type="button"
+        onClick={() => handleUnlockCourse(course)}
+        disabled={busyCourseId === course._id}
+        className={cn(
+          'inline-flex items-center justify-center gap-[8px] rounded-[12px] bg-[#2f6fe4] font-semibold text-white shadow-[0_12px_24px_rgba(45,110,229,0.2)] disabled:opacity-60',
+          variant === 'mobile' ? 'h-[30px] px-[8px] text-[9.5px]' : 'h-[42px] px-[16px] text-[13px]',
+        )}
+      >
+        {busyCourseId === course._id ? <LoaderCircle className="h-[14px] w-[14px] animate-spin" /> : <Wallet className="h-[14px] w-[14px]" />}
+        Pay with Razorpay
+      </button>
     );
   };
 
@@ -2386,21 +2827,56 @@ export const CourseFigmaTab = ({
     ? ['Courses', selectedCourse?.title, selectedLessonEntry.sectionLabel, selectedLessonEntry.lesson.title].filter(Boolean).join(' / ')
     : ['Courses', selectedCourse?.title].filter(Boolean).join(' / ');
 
+  const renderMovingWatermark = (variant: 'mobile' | 'desktop') => {
+    if (!currentPlaybackWatermarkText || !isWatermarkVisible) {
+      return null;
+    }
+
+    return (
+      <div
+        className={cn(
+          'pointer-events-none absolute z-20 rounded-full bg-black/58 px-4 py-2 font-semibold uppercase tracking-[0.14em] text-white/84 shadow-[0_8px_22px_rgba(0,0,0,0.28)] transition-all duration-500',
+          variant === 'mobile' ? 'text-[9px]' : 'text-xs',
+        )}
+        style={{
+          top: watermarkPosition.top,
+          left: watermarkPosition.left,
+          transform: `translate(-50%, -50%) rotate(${watermarkPosition.rotate})`,
+          maxWidth: variant === 'mobile' ? '78%' : '68%',
+        }}
+      >
+        <span className="block truncate">{currentPlaybackWatermarkText}</span>
+      </div>
+    );
+  };
+
   const renderActualLessonMedia = (variant: 'mobile' | 'desktop') => {
     if (!selectedLesson) {
       return null;
     }
 
-    const playerUrl = selectedLessonDirectVideoUrl || protectedLessonPlayback?.streamUrl || null;
+    const playerDrmConfig = selectedLesson?.type === 'private-video' ? protectedLessonPlayback?.drmConfig || null : null;
+    const drmManifestUrl = playerDrmConfig?.enabled ? playerDrmConfig.manifestUrl || null : null;
+    const playerUrl = drmManifestUrl || selectedLessonDirectVideoUrl
+      || (useProtectedSourceFallback && protectedLessonPlayback?.fallbackStreamUrl
+        ? protectedLessonPlayback.fallbackStreamUrl
+        : protectedLessonPlayback?.streamUrl || null);
+    const playerFormat = useProtectedSourceFallback && protectedLessonPlayback?.fallbackStreamUrl
+      ? protectedLessonPlayback?.fallbackStreamFormat || 'source'
+      : protectedLessonPlayback?.streamFormat || null;
     const isYouTube = selectedLesson.type === 'youtube';
     const isPrivateVideo = selectedLesson.type === 'private-video';
     const isHostedVideo = selectedLesson.type === 'video';
+    const shouldUseHlsPlayer = Boolean(
+      drmManifestUrl
+      || (playerUrl && playerFormat === 'hls'),
+    );
 
     if (loadingProtectedLesson && selectedLessonHasSecurePlayback) {
       return (
         <div className={cn('flex items-center justify-center gap-3 bg-[#0f1726] px-6 text-center text-white', variant === 'mobile' ? 'h-full' : 'min-h-[260px]')}>
           <LoaderCircle className="h-5 w-5 animate-spin text-white/64" />
-          <span className="text-[13px] font-medium text-white/58">Preparing video...</span>
+          <span className="text-[13px] font-medium text-white/58">Loading video...</span>
         </div>
       );
     }
@@ -2410,7 +2886,21 @@ export const CourseFigmaTab = ({
         <div className="flex min-h-[260px] items-center justify-center bg-[#0f1726] px-6 text-center">
           <div>
             <p className="text-base font-semibold text-white">Lesson video unavailable</p>
-            <p className="mt-2 text-sm leading-6 text-white/72">{protectedLessonError}</p>
+            <p className="mt-2 text-sm leading-6 text-white/72">
+              {user?.role === 'admin' ? protectedLessonError : 'This lesson is not available for playback right now.'}
+            </p>
+          </div>
+        </div>
+      );
+    }
+
+    if (isPrivateVideo && protectedLessonPlayback?.statusMessage && !playerUrl && user?.role === 'admin') {
+      return (
+        <div className={cn('flex flex-col items-center justify-center gap-3 bg-[#0f1726] px-6 text-center text-white', variant === 'mobile' ? 'h-full' : 'min-h-[260px]')}>
+          <LoaderCircle className="h-5 w-5 animate-spin text-white/64" />
+          <div>
+            <p className="text-base font-semibold text-white">Video is still preparing</p>
+            <p className="mt-2 text-sm leading-6 text-white/72">{protectedLessonPlayback.statusMessage}</p>
           </div>
         </div>
       );
@@ -2433,42 +2923,117 @@ export const CourseFigmaTab = ({
     if ((isPrivateVideo || isHostedVideo) && playerUrl) {
       return (
         <div className={cn('relative bg-black', variant === 'mobile' && 'h-full')}>
-          <video
-            key={`${selectedLesson.id}:${playerUrl}`}
-            ref={lessonVideoRef}
-            src={protectedLessonPlayback?.streamFormat === 'source' || isHostedVideo ? playerUrl : undefined}
-            controls
-            controlsList="nodownload"
-            playsInline
-            className={cn(
-              'w-full bg-black',
-              variant === 'mobile'
-                ? 'h-full min-h-0 object-cover'
-                : 'aspect-video min-h-[420px] object-contain',
-            )}
-            onPlay={() => setIsVideoPlaying(true)}
-            onPause={() => setIsVideoPlaying(false)}
-            onLoadedMetadata={(event) => {
-              const resumeSeconds = protectedLessonPlayback?.resumeSeconds || selectedLessonStoredProgress?.progressSeconds || 0;
-              if (resumeSeconds > 0) {
-                event.currentTarget.currentTime = resumeSeconds;
-              }
-              setVideoPlaybackSeconds(event.currentTarget.currentTime || 0);
-            }}
-            onCanPlay={(event) => {
-              const resumeSeconds = protectedLessonPlayback?.resumeSeconds || selectedLessonStoredProgress?.progressSeconds || 0;
-              if (resumeSeconds > 0 && event.currentTarget.currentTime < 1) {
-                event.currentTarget.currentTime = resumeSeconds;
-              }
-            }}
-            onTimeUpdate={(event) => {
-              setVideoPlaybackSeconds(event.currentTarget.currentTime || 0);
-            }}
-            onEnded={(event) => {
-              setIsVideoPlaying(false);
-              setVideoPlaybackSeconds(event.currentTarget.duration || selectedLessonVideoDurationSeconds);
-            }}
-          />
+          {shouldUseHlsPlayer ? (
+            <ResilientHlsVideo
+              key={`${selectedLesson.id}:${drmManifestUrl || playerUrl}`}
+              src={drmManifestUrl || playerUrl || ''}
+              drmConfig={playerDrmConfig}
+              title={selectedLesson.title}
+              watermarkText={currentPlaybackWatermarkText}
+              trackVideoId={selectedLesson.id}
+              trackCourseId={selectedCourse._id}
+              trackLessonId={selectedLesson.id}
+              streamFormat={playerDrmConfig?.manifestFormat || playerFormat || 'hls'}
+              resumeSeconds={protectedLessonPlayback?.resumeSeconds || selectedLessonStoredProgress?.progressSeconds || 0}
+              defaultQualityHeight={480}
+              selectedQualityHeight={selectedPrivateVideoQuality}
+              onQualityOptionsChange={(options) => {
+                setPrivateVideoQualityOptions(options);
+                setSelectedPrivateVideoQuality((current) => getDefaultRecordedVideoQualityHeight(options, current));
+              }}
+              className={cn(
+                'w-full bg-black',
+                isFullscreen
+                  ? 'h-screen min-h-0 rounded-none border-0 object-contain'
+                  : variant === 'mobile'
+                  ? 'h-full min-h-0 object-cover'
+                  : 'aspect-video min-h-[420px] object-contain',
+              )}
+              onReady={() => setIsVideoPlaying(false)}
+              onProgress={(progressSeconds, durationSeconds, completed) => {
+                const safeDurationSeconds = Math.max(Number(durationSeconds || selectedLessonVideoDurationSeconds || 0), 1);
+                setVideoPlaybackSeconds(progressSeconds || 0);
+                setIsVideoPlaying(!completed);
+                if (completed) {
+                  const minimumWatchedSeconds = Math.min(
+                    safeDurationSeconds,
+                    Math.max(60, safeDurationSeconds * selectedLessonCompletionRatio),
+                  );
+                  if ((progressSeconds || 0) >= minimumWatchedSeconds) {
+                    setCompletedVideoPlaybackKey(`${selectedLesson.id}::${Date.now()}`);
+                  }
+                }
+              }}
+            />
+          ) : (
+            <video
+              key={`${selectedLesson.id}:${playerUrl}`}
+              ref={lessonVideoRef}
+              data-testid="course-player-video"
+              src={playerFormat === 'source' || isHostedVideo ? playerUrl : undefined}
+              controls
+              controlsList="nodownload nofullscreen noremoteplayback"
+              playsInline
+              disablePictureInPicture
+              disableRemotePlayback
+              className={cn(
+                'w-full bg-black',
+                isFullscreen
+                  ? 'h-screen min-h-0 object-contain'
+                  : variant === 'mobile'
+                  ? 'h-full min-h-0 object-cover'
+                  : 'aspect-video min-h-[420px] object-contain',
+              )}
+              onPlay={() => setIsVideoPlaying(true)}
+              onPause={() => setIsVideoPlaying(false)}
+              onLoadedMetadata={(event) => {
+                const resumeSeconds = protectedLessonPlayback?.resumeSeconds || selectedLessonStoredProgress?.progressSeconds || 0;
+                if (resumeSeconds > 0) {
+                  event.currentTarget.currentTime = resumeSeconds;
+                }
+                setVideoPlaybackSeconds(event.currentTarget.currentTime || 0);
+              }}
+              onCanPlay={(event) => {
+                const resumeSeconds = protectedLessonPlayback?.resumeSeconds || selectedLessonStoredProgress?.progressSeconds || 0;
+                if (resumeSeconds > 0 && event.currentTarget.currentTime < 1) {
+                  event.currentTarget.currentTime = resumeSeconds;
+                }
+              }}
+              onTimeUpdate={(event) => {
+                setVideoPlaybackSeconds(event.currentTarget.currentTime || 0);
+              }}
+              onEnded={(event) => {
+                const durationSeconds = Math.max(Number(event.currentTarget.duration || selectedLessonVideoDurationSeconds || 0), 1);
+                const playedSeconds = getPlayedSeconds(event.currentTarget);
+                const minimumWatchedSeconds = Math.min(
+                  durationSeconds,
+                  Math.max(60, durationSeconds * selectedLessonCompletionRatio),
+                );
+                setIsVideoPlaying(false);
+                setVideoPlaybackSeconds(event.currentTarget.duration || selectedLessonVideoDurationSeconds);
+                if (playedSeconds >= minimumWatchedSeconds) {
+                  setCompletedVideoPlaybackKey(`${selectedLesson.id}::${Date.now()}`);
+                }
+              }}
+            />
+          )}
+          {!drmManifestUrl ? renderMovingWatermark(variant) : null}
+          {isPrivateVideo && playerFormat === 'hls' && privateVideoQualityOptions.length > 0 ? (
+            <div className="flex items-center justify-end gap-3 border-t border-white/10 bg-[#0f1726] px-4 py-3">
+              <span className="text-[11px] font-semibold uppercase tracking-[0.16em] text-white/58">Quality</span>
+              <select
+                value={String(selectedPrivateVideoQuality)}
+                onChange={(event) => setSelectedPrivateVideoQuality(Number(event.target.value))}
+                className="rounded-xl border border-white/12 bg-white/8 px-3 py-2 text-sm text-white outline-none"
+              >
+                {privateVideoQualityOptions.map((option) => (
+                  <option key={option.height} value={String(option.height)}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          ) : null}
         </div>
       );
     }
@@ -2502,22 +3067,11 @@ export const CourseFigmaTab = ({
         data-course-view="catalog"
         className="mobile-safe-screen min-h-[100dvh] overflow-x-hidden bg-[#f4f7ff] pb-[76px]"
       >
-        <div className="mobile-safe-content mx-auto pb-[10px] pt-[10px]" style={uiFontStyle}>
+          <div className="mobile-safe-content mx-auto pb-[10px] pt-[10px]" style={uiFontStyle}>
 
-          <header>
+            <header>
             <div className="flex items-center justify-between gap-[12px]">
               <h1 className="text-[19px] font-semibold leading-none tracking-[-0.02em] text-[#1c2844]">All Courses</h1>
-              <div className="flex items-center gap-[12px] text-[#1d3158]">
-                <Search className="h-[21px] w-[21px]" />
-                <button
-                  type="button"
-                  className="relative flex h-[24px] w-[24px] items-center justify-center"
-                  data-testid="course-catalog-notification"
-                >
-                  <Bell className="h-[21px] w-[21px]" />
-                  <span className="absolute right-0 top-0 h-[8px] w-[8px] rounded-full bg-[#ff4d5f]" />
-                </button>
-              </div>
             </div>
 
             <label
@@ -2539,7 +3093,11 @@ export const CourseFigmaTab = ({
               const tone = getMobileCatalogTone(course);
               const styles = toneStyles[tone];
               const snapshot = courseSnapshots[course._id] || { totalLessons: 0, completedLessons: 0, progressPercent: 0 };
-              const actionLabel = snapshot.progressPercent > 0 ? 'Continue' : course.enrolled ? 'Start Course' : course.price === 0 ? 'Open Course' : 'Explore';
+              const actionLabel = snapshot.progressPercent > 0
+                ? 'Continue'
+                : course.enrolled
+                  ? 'Start Course'
+                  : 'Buy Course';
               const icon = index % 3 === 0
                 ? <BookOpen className="h-[26px] w-[26px]" />
                 : index % 3 === 1
@@ -2567,6 +3125,9 @@ export const CourseFigmaTab = ({
                           </span>
                           <p className="mt-[6px] text-[13px] font-semibold leading-[1.16] text-[#1f2d4e]">{getMobileCourseTitle(course)}</p>
                           <p className="mt-[2px] text-[11px] text-[#6d7c93]">{course.subject || course.category || 'Competitive Exam'}</p>
+                          {!course.enrolled && (
+                            <p className="mt-[4px] text-[10px] font-semibold text-[#cf7a21]">{getCourseFeeSummary(course)}</p>
+                          )}
                         </div>
                         <MoreVertical className="h-[17px] w-[17px] shrink-0 text-[#7f8fb0]" />
                       </div>
@@ -2615,8 +3176,6 @@ export const CourseFigmaTab = ({
           searchValue={searchQuery}
           onSearchChange={setSearchQuery}
           placeholder="Search courses..."
-          userName={userName}
-          notificationCount={notificationCount}
           testId="course-catalog-search"
         />
       </header>
@@ -2857,6 +3416,34 @@ export const CourseFigmaTab = ({
             data-testid="course-figma-hero"
             className="mt-[10px] rounded-[18px] border border-[#dbe4f3] bg-white px-[10px] py-[9px] shadow-[0_12px_24px_rgba(54,78,123,0.06)]"
           >
+            {selectedCourse && !selectedCourseHasAccess ? (() => {
+              const pricing = getCoursePricingMeta(selectedCourse);
+              return (
+                <div className="mb-[10px] rounded-[16px] border border-[#ffd9b6] bg-[linear-gradient(135deg,rgba(255,247,237,0.96)_0%,rgba(255,255,255,0.98)_100%)] px-[12px] py-[12px] shadow-[0_12px_26px_rgba(201,106,43,0.10)]">
+                  <div className="flex items-start justify-between gap-[10px]">
+                    <div>
+                      <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#c96a2b]">Offer price</p>
+                      <p className="mt-[4px] text-[26px] font-bold leading-none text-[#17233d]">{currency.format(pricing.finalPrice)}</p>
+                    </div>
+                    {pricing.offerPercentage > 0 && (
+                      <span className="rounded-full bg-[#ffedd5] px-[10px] py-[6px] text-[11px] font-bold text-[#c96a2b]">
+                        {pricing.offerPercentage}% OFF
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-[8px] flex flex-wrap items-center gap-[8px] text-[11px]">
+                    <span className="font-semibold text-[#7a8aa7] line-through decoration-[#c96a2b]/55">
+                      {currency.format(pricing.basePrice)}
+                    </span>
+                    {pricing.savings > 0 && (
+                      <span className="rounded-full bg-[#fff3e6] px-[8px] py-[3px] font-semibold text-[#c96a2b]">
+                        Save {currency.format(pricing.savings)}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })() : null}
             <div className="grid grid-cols-[52px_repeat(3,minmax(0,1fr))_96px] items-center gap-[1px]">
               <div className="shrink-0">
                 <ProgressDonut
@@ -2878,14 +3465,19 @@ export const CourseFigmaTab = ({
                 <p className="text-[14px] font-semibold leading-none text-[#1f2d4e]">{Math.max(selectedCourseEntries.length - selectedCourseVideoCompletedDisplayCount, 0)}</p>
                 <p className="mt-[2px] text-[8px] leading-none text-[#7b879d]">Left</p>
               </div>
-              <button
-                type="button"
-                onClick={() => selectedLessonEntry && openLesson(selectedLessonEntry.lesson.id)}
-                disabled={!selectedCourseHasAccess}
-                className="inline-flex h-[30px] w-full items-center justify-center rounded-[10px] bg-[#2f6fe4] px-[7px] text-[9.5px] font-semibold whitespace-nowrap text-white shadow-[0_12px_24px_rgba(45,110,229,0.2)]"
-              >
-                Continue Course
-              </button>
+              {selectedCourseHasAccess ? (
+                <button
+                  type="button"
+                  onClick={() => selectedLessonEntry && openLesson(selectedLessonEntry.lesson.id)}
+                  className="inline-flex h-[30px] w-full items-center justify-center rounded-[10px] bg-[#2f6fe4] px-[7px] text-[9.5px] font-semibold whitespace-nowrap text-white shadow-[0_12px_24px_rgba(45,110,229,0.2)]"
+                >
+                  {selectedCourseSnapshot.progressPercent > 0 ? 'Continue Course' : 'Start Course'}
+                </button>
+              ) : (
+                <span className="inline-flex h-[30px] w-full items-center justify-center rounded-[10px] bg-[#eef2f8] px-[7px] text-[9.5px] font-semibold whitespace-nowrap text-[#8a9ab3]">
+                  Locked
+                </span>
+              )}
             </div>
             {selectedCourse && !selectedCourseHasAccess && (
               <div className="mt-[8px] flex justify-end">
@@ -3090,15 +3682,19 @@ export const CourseFigmaTab = ({
           searchValue={searchQuery}
           onSearchChange={setSearchQuery}
           placeholder="Search lessons..."
-          userName={userName}
-          notificationCount={notificationCount}
         />
       </header>
 
       <div className="grid gap-[14px] px-[14px] py-[14px] xl:grid-cols-[minmax(0,1fr)_300px] xl:gap-[18px] xl:px-[24px] xl:py-[20px]">
         <div className="min-w-0">
           <section className="overflow-hidden rounded-[20px] border border-[#dbe4f3] bg-white shadow-[0_16px_34px_rgba(54,78,123,0.08)] xl:rounded-[24px]">
-            <div data-testid="course-figma-hero" className="relative h-[160px] overflow-hidden xl:h-[220px]">
+            <div
+              data-testid="course-figma-hero"
+              className={cn(
+                'relative h-[160px] overflow-hidden xl:h-[220px]',
+                selectedCourse && !selectedCourseHasAccess && 'xl:h-[290px]',
+              )}
+            >
               <img alt="" aria-hidden="true" className="absolute inset-0 h-full w-full object-cover" src={selectedCourseVisual} />
               <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(255,255,255,0.18)_0%,rgba(255,255,255,0.06)_55%,rgba(255,255,255,0)_100%)]" />
               <div className="relative h-full px-[18px] pt-[18px] text-[#16264a] xl:px-[30px] xl:pt-[32px]">
@@ -3111,6 +3707,40 @@ export const CourseFigmaTab = ({
                     <div className={cn('h-full rounded-full', selectedToneStyles.progress)} style={{ width: `${selectedCourseSnapshot.progressPercent}%` }} />
                   </div>
                 </div>
+                {selectedCourse && !selectedCourseHasAccess ? (() => {
+                  const pricing = getCoursePricingMeta(selectedCourse);
+                  return (
+                    <div className="mt-[16px] max-w-[360px] rounded-[16px] border border-[#ffd9b6] bg-[linear-gradient(135deg,rgba(255,247,237,0.94)_0%,rgba(255,255,255,0.96)_100%)] px-[14px] py-[12px] shadow-[0_12px_26px_rgba(201,106,43,0.10)] xl:mt-[18px]">
+                      <div className="flex items-start justify-between gap-[10px]">
+                        <div>
+                          <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#c96a2b]">Offer price</p>
+                          <p className="mt-[4px] text-[28px] font-bold leading-none text-[#17233d]">{currency.format(pricing.finalPrice)}</p>
+                        </div>
+                        {pricing.offerPercentage > 0 && (
+                          <span className="rounded-full bg-[#ffedd5] px-[10px] py-[6px] text-[11px] font-bold text-[#c96a2b]">
+                            {pricing.offerPercentage}% OFF
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-[8px] flex flex-wrap items-center gap-[8px] text-[11px]">
+                        <span className="font-semibold text-[#7a8aa7] line-through decoration-[#c96a2b]/55">
+                          {currency.format(pricing.basePrice)}
+                        </span>
+                        {pricing.savings > 0 && (
+                          <span className="rounded-full bg-[#fff3e6] px-[8px] py-[3px] font-semibold text-[#c96a2b]">
+                            Save {currency.format(pricing.savings)}
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-[12px] flex flex-wrap items-center gap-[10px]">
+                        {renderCourseAccessActions(selectedCourse, 'desktop')}
+                        <span className="text-[11px] font-medium text-[#6c7f9f]">
+                          Unlock this course to start lessons and linked mock tests.
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })() : null}
                 <div className="mt-[16px] flex flex-wrap items-center gap-[10px] xl:mt-[28px]">
                   {selectedCourseHasAccess ? (
                     <button
@@ -3121,8 +3751,6 @@ export const CourseFigmaTab = ({
                       {selectedCourseSnapshot.progressPercent > 0 ? 'Continue Course' : 'Start Course'}
                       <ChevronRight className="h-[16px] w-[16px]" />
                     </button>
-                  ) : selectedCourse ? (
-                    renderCourseAccessActions(selectedCourse, 'desktop')
                   ) : null}
                 </div>
                 {courseAccessMessage && (
@@ -3273,7 +3901,7 @@ export const CourseFigmaTab = ({
             <p className="mt-[6px] text-[13px] leading-[1.45] text-[#5d7092]">
               {hasReachedLessonVideoWatchLimit
                 ? 'Maximum lesson video rewatch limit reached.'
-                : `${selectedLessonVideoWatchCount}/${MAX_VIDEO_WATCHES} watches used. One more replay is still available.`}
+                : `${selectedLessonVideoWatchCount}/${selectedLessonVideoWatchLimit} watches used. Replay remains available until the limit is reached.`}
             </p>
             {canRewatchLessonVideo ? (
               <button
@@ -3382,7 +4010,7 @@ export const CourseFigmaTab = ({
                 <p className="mt-[4px] text-[13px] leading-[1.45] text-[#5d7092]">
                   {hasReachedLessonVideoWatchLimit
                     ? 'Maximum lesson video rewatch limit reached.'
-                    : `${selectedLessonVideoWatchCount}/${MAX_VIDEO_WATCHES} watches used. Rewatch is still available before the limit is reached.`}
+                    : `${selectedLessonVideoWatchCount}/${selectedLessonVideoWatchLimit} watches used. Rewatch is still available before the limit is reached.`}
                 </p>
               </div>
               {canRewatchLessonVideo ? (
@@ -3429,7 +4057,7 @@ export const CourseFigmaTab = ({
       return renderDesktopFlowCompletePanel();
     }
 
-    if (!isVideoReplayMode && hasLessonVideoMilestone(selectedLessonStoredProgress)) {
+    if (!isVideoReplayMode && hasCompletedLessonVideo) {
       return renderDesktopCompletionPanel();
     }
 
@@ -3440,16 +4068,24 @@ export const CourseFigmaTab = ({
         data-testid="course-figma-player"
         className={cn(
           'relative overflow-hidden rounded-[18px] border border-[#dde7f5] bg-[#d8e8ff] shadow-[0_12px_28px_rgba(46,67,111,0.08)]',
-          isFullscreen && 'rounded-none border-0',
+          isFullscreen && 'h-screen w-screen rounded-none border-0 bg-black shadow-none',
         )}
       >
         {actualLessonMedia ? (
-          <div className="bg-black">
+          <div className={cn('bg-black', isFullscreen && 'flex h-full w-full items-center justify-center')}>
             {actualLessonMedia}
           </div>
         ) : (
           renderLessonMediaUnavailable('desktop')
         )}
+        <button
+          type="button"
+          onClick={() => void toggleFullscreen()}
+          className="absolute right-[16px] top-[16px] inline-flex items-center gap-[8px] rounded-full border border-white/16 bg-black/52 px-[14px] py-[10px] text-[12px] font-semibold text-white shadow-[0_12px_30px_rgba(0,0,0,0.28)] backdrop-blur-sm transition hover:bg-black/68"
+        >
+          {isFullscreen ? <Minimize2 className="h-[14px] w-[14px]" /> : <Maximize2 className="h-[14px] w-[14px]" />}
+          {isFullscreen ? 'Exit full screen' : 'Expand'}
+        </button>
       </section>
 
       {renderLessonSupportSections('desktop')}
@@ -3697,37 +4333,42 @@ export const CourseFigmaTab = ({
     section?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
 
-  const submitLessonDoubt = () => {
-    if (!selectedLessonEntry) {
+  const submitLessonDoubt = async () => {
+    if (!selectedCourse?._id || !selectedLessonEntry) {
       return;
     }
 
-    const lessonId = selectedLessonEntry.lesson.id;
-    const message = (lessonDoubtDrafts[lessonId] || '').trim();
-    if (!message) {
+    const message = activeLessonDoubtDraft.trim();
+    if (!message || sendingLessonDoubt) {
       return;
     }
 
-    const now = new Date();
-    const time = now.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+    setSendingLessonDoubt(true);
+    setLessonDoubtError(null);
 
-    setLessonDoubtThreads((current) => ({
-      ...current,
-      [lessonId]: [
-        ...(current[lessonId] || []),
-        {
-          id: `${lessonId}-${now.getTime()}`,
-          name: overview.user?.name || 'You',
-          time,
-          message,
-          self: true,
-        },
-      ],
-    }));
-    setLessonDoubtDrafts((current) => ({
-      ...current,
-      [lessonId]: '',
-    }));
+    try {
+      const response = await EduService.postLessonDoubtMessage(selectedCourse._id, selectedLessonEntry.lesson.id, {
+        message,
+        threadId: lessonDoubtViewerRole === 'admin' ? activeLessonDoubtThread?._id || null : null,
+      });
+
+      setLessonDoubtThreads((current) => {
+        const remaining = current.filter((thread) => thread._id !== response.thread._id);
+        return [response.thread, ...remaining].sort(
+          (left, right) => new Date(right.lastMessageAt).getTime() - new Date(left.lastMessageAt).getTime(),
+        );
+      });
+      setSelectedLessonDoubtThreadId(response.thread._id);
+      setLessonDoubtDrafts((current) => ({
+        ...current,
+        [activeLessonDoubtDraftKey]: '',
+      }));
+      void onRefresh();
+    } catch (error) {
+      setLessonDoubtError(error instanceof Error ? error.message : 'Unable to send this message right now.');
+    } finally {
+      setSendingLessonDoubt(false);
+    }
   };
 
   const toggleSupportPanel = (panel: Exclude<LessonSupportPanel, null>) => {
@@ -3811,10 +4452,13 @@ export const CourseFigmaTab = ({
     }
 
     const isDesktop = layout === 'desktop';
-    const lessonId = selectedLessonEntry.lesson.id;
-    const thread = lessonDoubtThreads[lessonId] || [];
-    const draft = lessonDoubtDrafts[lessonId] || '';
     const isExpanded = expandedSupportPanel === 'doubts';
+    const isAdminViewer = lessonDoubtViewerRole === 'admin';
+    const threadList = lessonDoubtThreads;
+    const activeThread = activeLessonDoubtThread;
+    const draft = activeLessonDoubtDraft;
+    const canSend = Boolean(draft.trim()) && !sendingLessonDoubt && (!isAdminViewer || Boolean(activeThread));
+    const threadTitle = isAdminViewer ? 'Student Questions' : 'Lesson Clarification';
 
     return (
       <section
@@ -3837,9 +4481,13 @@ export const CourseFigmaTab = ({
             <MessageSquare className="h-[14px] w-[14px]" />
           </div>
           <div className="min-w-0 flex-1">
-            <p className={cn(isDesktop ? 'text-[16px]' : 'text-[14px]', 'font-semibold text-[#17305c]')}>Ask Doubts</p>
+            <p className={cn(isDesktop ? 'text-[16px]' : 'text-[14px]', 'font-semibold text-[#17305c]')}>{threadTitle}</p>
             <p className={cn(isDesktop ? 'text-[13px]' : 'text-[12px]', 'mt-[4px] leading-[1.45] text-[#5d7092]')}>
-              {isExpanded ? selectedLessonCopy.discussionPrompt : 'Open the chat helper only when you need it.'}
+              {isExpanded
+                ? isAdminViewer
+                  ? 'Select a learner thread and reply right from this lesson.'
+                  : selectedLessonCopy.discussionPrompt
+                : 'Open the lesson question thread only when you need it.'}
             </p>
           </div>
         </div>
@@ -3850,29 +4498,83 @@ export const CourseFigmaTab = ({
 
         {isExpanded && (
           <>
+            {isAdminViewer && threadList.length > 0 && (
+              <div className={cn('mt-[14px] grid gap-[10px]', isDesktop ? 'grid-cols-2' : 'grid-cols-1')}>
+                {threadList.map((thread) => {
+                  const active = thread._id === activeThread?._id;
+                  return (
+                    <button
+                      key={thread._id}
+                      type="button"
+                      onClick={() => setSelectedLessonDoubtThreadId(thread._id)}
+                      className={cn(
+                        'rounded-[14px] border px-[14px] py-[12px] text-left transition',
+                        active
+                          ? 'border-[#b9cdf7] bg-[#eef5ff] shadow-[0_12px_24px_rgba(45,110,229,0.08)]'
+                          : 'border-[#dbe4f3] bg-white hover:border-[#c9daf8] hover:bg-[#f8fbff]',
+                      )}
+                    >
+                      <div className="flex items-center justify-between gap-[10px]">
+                        <p className="text-[13px] font-semibold text-[#17305c]">{thread.studentName}</p>
+                        <span className="rounded-full bg-white/80 px-[10px] py-[4px] text-[10px] font-semibold uppercase tracking-[0.08em] text-[#2d6ee5]">
+                          {thread.status}
+                        </span>
+                      </div>
+                      <p className="mt-[6px] text-[12px] leading-[1.5] text-[#607394] line-clamp-2">{thread.lastMessagePreview || 'Open this thread to reply.'}</p>
+                      <p className="mt-[6px] text-[10px] font-medium uppercase tracking-[0.08em] text-[#8aa0b8]">{thread.pathLabel}</p>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
             <div className={cn('mt-[14px]', isDesktop ? 'space-y-[10px]' : 'space-y-[8px]')}>
-              {thread.map((message) => (
-                <div
-                  key={message.id}
-                  className={cn(
-                    'rounded-[14px] px-[14px] py-[12px]',
-                    message.self ? 'ml-auto bg-[#edf7ff]' : 'bg-[#f6f9ff]',
-                  )}
-                >
-                  <div className="flex items-center justify-between gap-[10px]">
-                    <p className={cn(isDesktop ? 'text-[13px]' : 'text-[12px]', 'font-semibold text-[#1f2d4e]')}>
-                      {message.name}
-                    </p>
-                    <span className={cn(isDesktop ? 'text-[11px]' : 'text-[10px]', 'text-[#8aa0b8]')}>
-                      {message.time}
-                    </span>
-                  </div>
-                  <p className={cn(isDesktop ? 'text-[13px]' : 'text-[12px]', 'mt-[6px] leading-[1.55] text-[#5c708d]')}>
-                    {message.message}
-                  </p>
+              {loadingLessonDoubts && threadList.length === 0 && (
+                <div className="flex items-center gap-[8px] rounded-[14px] border border-[#dbe4f3] bg-[#f9fbff] px-[14px] py-[12px] text-[13px] text-[#5d7092]">
+                  <LoaderCircle className="h-[16px] w-[16px] animate-spin text-[#2d6ee5]" />
+                  Loading lesson conversation...
                 </div>
-              ))}
+              )}
+
+              {!loadingLessonDoubts && !activeThread && (
+                <div className="rounded-[14px] border border-dashed border-[#dbe4f3] bg-[#fbfdff] px-[14px] py-[12px] text-[13px] leading-[1.55] text-[#607394]">
+                  {isAdminViewer
+                    ? 'No student questions have been posted for this video yet.'
+                    : 'Ask your first question and the admin will get notified with this lesson path.'}
+                </div>
+              )}
+
+              {activeThread?.messages.map((message) => {
+                const isSelf = String(message.userId || '') === String(user?._id || '');
+                return (
+                  <div
+                    key={message._id}
+                    className={cn(
+                      'rounded-[14px] px-[14px] py-[12px]',
+                      isSelf ? 'ml-auto bg-[#edf7ff]' : 'bg-[#f6f9ff]',
+                    )}
+                  >
+                    <div className="flex items-center justify-between gap-[10px]">
+                      <p className={cn(isDesktop ? 'text-[13px]' : 'text-[12px]', 'font-semibold text-[#1f2d4e]')}>
+                        {message.userName}{message.role === 'admin' ? ' • Admin' : ''}
+                      </p>
+                      <span className={cn(isDesktop ? 'text-[11px]' : 'text-[10px]', 'text-[#8aa0b8]')}>
+                        {formatLessonDoubtTime(message.createdAt)}
+                      </span>
+                    </div>
+                    <p className={cn(isDesktop ? 'text-[13px]' : 'text-[12px]', 'mt-[6px] leading-[1.55] text-[#5c708d]')}>
+                      {message.message}
+                    </p>
+                  </div>
+                );
+              })}
             </div>
+
+            {lessonDoubtError && (
+              <div className="mt-[12px] rounded-[14px] border border-[#ffd2d2] bg-[#fff6f6] px-[14px] py-[12px] text-[12px] leading-[1.5] text-[#b24141]">
+                {lessonDoubtError}
+              </div>
+            )}
 
             <div className="mt-[14px] flex items-center gap-[8px] rounded-[14px] border border-[#dbe4f3] bg-[#f9fbff] px-[12px] py-[10px]">
               <input
@@ -3880,24 +4582,26 @@ export const CourseFigmaTab = ({
                 value={draft}
                 onChange={(event) => setLessonDoubtDrafts((current) => ({
                   ...current,
-                  [lessonId]: event.target.value,
+                  [activeLessonDoubtDraftKey]: event.target.value,
                 }))}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter') {
                     event.preventDefault();
-                    submitLessonDoubt();
+                    void submitLessonDoubt();
                   }
                 }}
-                placeholder="Type your doubt..."
+                placeholder={isAdminViewer ? 'Reply to this learner...' : 'Type your doubt...'}
+                disabled={sendingLessonDoubt || (isAdminViewer && !activeThread)}
                 className="min-w-0 flex-1 bg-transparent text-[13px] text-[#20314b] outline-none placeholder:text-[#8aa0b8]"
               />
               <button
                 type="button"
                 data-testid="course-lesson-doubt-send"
-                onClick={submitLessonDoubt}
-                className="flex h-[34px] w-[34px] items-center justify-center rounded-full bg-[#2d6ee5] text-white"
+                onClick={() => void submitLessonDoubt()}
+                disabled={!canSend}
+                className="flex h-[34px] w-[34px] items-center justify-center rounded-full bg-[#2d6ee5] text-white disabled:cursor-not-allowed disabled:opacity-50"
               >
-                <Send className="h-[15px] w-[15px]" />
+                {sendingLessonDoubt ? <LoaderCircle className="h-[15px] w-[15px] animate-spin" /> : <Send className="h-[15px] w-[15px]" />}
               </button>
             </div>
           </>
@@ -3923,9 +4627,9 @@ export const CourseFigmaTab = ({
       return null;
     }
 
-    const lessonId = selectedLessonEntry.lesson.id;
-    const thread = lessonDoubtThreads[lessonId] || [];
-    const draft = lessonDoubtDrafts[lessonId] || '';
+    const isAdminViewer = lessonDoubtViewerRole === 'admin';
+    const thread = activeLessonDoubtThread?.messages || [];
+    const draft = activeLessonDoubtDraft;
     return (
       <section className="overflow-hidden rounded-[20px] border border-[#dfe7f4] bg-white shadow-[0_14px_28px_rgba(54,78,123,0.06)]">
         <div className="grid grid-cols-2 border-b border-[#e7edf7]">
@@ -3989,57 +4693,97 @@ export const CourseFigmaTab = ({
           data-state={mobileSupportTab === 'doubts' ? 'expanded' : 'collapsed'}
           className={cn('px-[14px] py-[14px]', mobileSupportTab !== 'doubts' && 'hidden')}
         >
+          {isAdminViewer && lessonDoubtThreads.length > 0 && (
+            <div className="mb-[12px] space-y-[8px]">
+              {lessonDoubtThreads.map((threadItem) => {
+                const active = threadItem._id === activeLessonDoubtThread?._id;
+                return (
+                  <button
+                    key={threadItem._id}
+                    type="button"
+                    onClick={() => setSelectedLessonDoubtThreadId(threadItem._id)}
+                    className={cn(
+                      'w-full rounded-[14px] border px-[12px] py-[10px] text-left',
+                      active ? 'border-[#cfe0ff] bg-[#eef5ff]' : 'border-[#e2ebf6] bg-[#fbfdff]',
+                    )}
+                  >
+                    <div className="flex items-center justify-between gap-[10px]">
+                      <p className="text-[13px] font-semibold text-[#17305c]">{threadItem.studentName}</p>
+                      <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[#2f6fe4]">{threadItem.status}</span>
+                    </div>
+                    <p className="mt-[4px] text-[11px] leading-[1.45] text-[#607394] line-clamp-2">{threadItem.lastMessagePreview}</p>
+                  </button>
+                );
+              })}
+            </div>
+          )}
           <div className="max-h-[240px] space-y-[10px] overflow-y-auto pr-[4px]">
-            {thread.length === 0 && (
+            {loadingLessonDoubts && !activeLessonDoubtThread && (
+              <div className="flex items-center gap-[8px] rounded-[16px] border border-[#dce7f6] bg-[#f8fbff] px-[12px] py-[12px] text-[13px] leading-6 text-[#607394]">
+                <LoaderCircle className="h-[15px] w-[15px] animate-spin text-[#2f6fe4]" />
+                Loading discussion...
+              </div>
+            )}
+            {!loadingLessonDoubts && thread.length === 0 && (
               <div className="rounded-[16px] border border-dashed border-[#dce7f6] bg-[#f8fbff] px-[12px] py-[12px] text-[13px] leading-6 text-[#607394]">
-                No doubts have been posted for this lesson yet.
+                {isAdminViewer
+                  ? 'No student questions have been posted for this lesson yet.'
+                  : 'No doubts have been posted for this lesson yet.'}
               </div>
             )}
             {thread.map((message) => (
               <div
-                key={message.id}
+                key={message._id}
                 className={cn(
                   'rounded-[16px] border px-[12px] py-[12px]',
-                  message.self
+                  String(message.userId || '') === String(user?._id || '')
                     ? 'ml-[22px] border-[#d8e7ff] bg-[#eef5ff]'
                     : 'border-[#edf2fa] bg-[#fcfdff]',
                 )}
               >
                 <div className="flex items-center justify-between gap-[12px]">
-                  <p className="text-[13px] font-semibold text-[#1f2d4e]">{message.name}</p>
-                  <span className="text-[10px] font-medium uppercase tracking-[0.08em] text-[#8ca0bc]">{message.time}</span>
+                  <p className="text-[13px] font-semibold text-[#1f2d4e]">{message.userName}{message.role === 'admin' ? ' • Admin' : ''}</p>
+                  <span className="text-[10px] font-medium uppercase tracking-[0.08em] text-[#8ca0bc]">{formatLessonDoubtTime(message.createdAt)}</span>
                 </div>
                 <p className="mt-[6px] text-[12px] leading-[1.55] text-[#607394]">{message.message}</p>
               </div>
             ))}
           </div>
 
+          {lessonDoubtError && (
+            <div className="mt-[12px] rounded-[16px] border border-[#ffd2d2] bg-[#fff6f6] px-[12px] py-[12px] text-[12px] leading-5 text-[#b24141]">
+              {lessonDoubtError}
+            </div>
+          )}
+
           <div className="mt-[12px] rounded-[16px] border border-[#dbe4f3] bg-[#f9fbff] px-[12px] py-[12px]">
-            <p className="text-[12px] font-semibold text-[#17305c]">Ask a quick doubt</p>
+            <p className="text-[12px] font-semibold text-[#17305c]">{isAdminViewer ? 'Reply in this thread' : 'Ask a quick doubt'}</p>
             <div className="mt-[10px] flex items-center gap-[8px]">
               <input
                 type="text"
                 value={draft}
                 onChange={(event) => setLessonDoubtDrafts((current) => ({
                   ...current,
-                  [lessonId]: event.target.value,
+                  [activeLessonDoubtDraftKey]: event.target.value,
                 }))}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter') {
                     event.preventDefault();
-                    submitLessonDoubt();
+                    void submitLessonDoubt();
                   }
                 }}
-                placeholder="Type your doubt..."
+                placeholder={isAdminViewer ? 'Reply to this learner...' : 'Type your doubt...'}
+                disabled={sendingLessonDoubt || (isAdminViewer && !activeLessonDoubtThread)}
                 className="min-w-0 flex-1 bg-transparent text-[13px] text-[#20314b] outline-none placeholder:text-[#8aa0b8]"
               />
               <button
                 type="button"
                 data-testid="course-lesson-doubt-send"
-                onClick={submitLessonDoubt}
-                className="flex h-[38px] w-[38px] items-center justify-center rounded-full bg-[#2d6ee5] text-white shadow-[0_8px_18px_rgba(45,110,229,0.24)]"
+                onClick={() => void submitLessonDoubt()}
+                disabled={!draft.trim() || sendingLessonDoubt || (isAdminViewer && !activeLessonDoubtThread)}
+                className="flex h-[38px] w-[38px] items-center justify-center rounded-full bg-[#2d6ee5] text-white shadow-[0_8px_18px_rgba(45,110,229,0.24)] disabled:cursor-not-allowed disabled:opacity-50"
               >
-                <Send className="h-[16px] w-[16px]" />
+                {sendingLessonDoubt ? <LoaderCircle className="h-[16px] w-[16px] animate-spin" /> : <Send className="h-[16px] w-[16px]" />}
               </button>
             </div>
           </div>
@@ -4079,9 +4823,16 @@ export const CourseFigmaTab = ({
     );
 
     const renderWatchCard = () => (
-      <section data-testid="course-figma-player" className="relative h-[238px] overflow-hidden rounded-[22px] border border-[#c9d9ee] bg-white shadow-[0_18px_38px_rgba(47,111,228,0.12)]">
+      <section
+        ref={playerViewportRef}
+        data-testid="course-figma-player"
+        className={cn(
+          'relative h-[238px] overflow-hidden rounded-[22px] border border-[#c9d9ee] bg-white shadow-[0_18px_38px_rgba(47,111,228,0.12)]',
+          isFullscreen && 'h-screen w-screen rounded-none border-0 bg-black shadow-none',
+        )}
+      >
         {actualLessonMedia ? (
-          <div className="h-full bg-black">
+          <div className="h-full w-full bg-black">
             {actualLessonMedia}
           </div>
         ) : (
@@ -4097,29 +4848,7 @@ export const CourseFigmaTab = ({
               By <span className="font-bold text-[#7db3ff]">{selectedCourse?.instructor || userName}</span>
             </p>
           </div>
-          <span className="inline-flex h-[38px] min-w-[46px] items-center justify-center rounded-full border border-white/24 bg-[#1d3557]/88 px-[10px] text-[15px] font-extrabold text-white shadow-[0_10px_24px_rgba(0,0,0,0.20)]">
-            {playbackSpeed}x
-          </span>
         </div>
-        <button
-          type="button"
-          data-testid="course-player-overlay-play"
-          onClick={() => {
-            const video = lessonVideoRef.current;
-            if (!video) {
-              setIsVideoPlaying((current) => !current);
-              return;
-            }
-            if (video.paused) {
-              void video.play();
-            } else {
-              video.pause();
-            }
-          }}
-          className="absolute left-1/2 top-1/2 flex h-[62px] w-[62px] -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-[#5f9cff] bg-[#203b60]/88 text-white shadow-[0_0_0_3px_rgba(47,111,228,0.24),0_18px_42px_rgba(0,0,0,0.32)] backdrop-blur-sm"
-        >
-          {isVideoPlaying ? <Pause className="h-[25px] w-[25px] fill-current" /> : <Play className="ml-[4px] h-[27px] w-[27px] fill-current" />}
-        </button>
       </section>
     );
 
@@ -4182,8 +4911,9 @@ export const CourseFigmaTab = ({
       }
 
       const lessonId = selectedLessonEntry.lesson.id;
-      const thread = lessonDoubtThreads[lessonId] || [];
-      const draft = lessonDoubtDrafts[lessonId] || '';
+      const thread = activeLessonDoubtThread?.messages || [];
+      const draft = lessonDoubtDrafts[activeLessonDoubtDraftKey] || '';
+      const isAdminViewer = lessonDoubtViewerRole === 'admin';
       const rating = lessonRatings[lessonId] || 0;
       const reportDraft = lessonReportDrafts[lessonId] || '';
       const reportSent = Boolean(lessonReportSent[lessonId]);
@@ -4231,20 +4961,22 @@ export const CourseFigmaTab = ({
             <div className="mt-[12px] max-h-[210px] space-y-[10px] overflow-y-auto pr-[4px]">
               {thread.length === 0 && (
                 <div className="rounded-[14px] border border-dashed border-[#d7e3f2] bg-[#f8fbff] px-[12px] py-[12px] text-[12px] leading-5 text-[#53647d]">
-                  No chat replay yet. Send a message to start this lesson thread.
+                  No chat replay yet. Ask a lesson question to start this thread.
                 </div>
               )}
               {thread.map((message) => (
                 <div
-                  key={message.id}
+                  key={message._id}
                   className={cn(
                     'rounded-[14px] border px-[12px] py-[10px]',
-                    message.self ? 'ml-[22px] border-[#cfe0ff] bg-[#eef5ff]' : 'border-[#e7edf7] bg-[#fbfdff]',
+                    String(message.userId || '') === String(user?._id || '')
+                      ? 'ml-[22px] border-[#cfe0ff] bg-[#eef5ff]'
+                      : 'border-[#e7edf7] bg-[#fbfdff]',
                   )}
                 >
                   <div className="flex items-center justify-between gap-[10px]">
-                    <p className="text-[12px] font-bold text-[#17233d]">{message.name}</p>
-                    <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[#7b8da6]">{message.time}</span>
+                    <p className="text-[12px] font-bold text-[#17233d]">{message.userName}{message.role === 'admin' ? ' • Admin' : ''}</p>
+                    <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[#7b8da6]">{formatLessonDoubtTime(message.createdAt)}</span>
                   </div>
                   <p className="mt-[5px] text-[12px] leading-[1.5] text-[#53647d]">{message.message}</p>
                 </div>
@@ -4254,23 +4986,25 @@ export const CourseFigmaTab = ({
               <input
                 type="text"
                 value={draft}
-                onChange={(event) => setLessonDoubtDrafts((current) => ({ ...current, [lessonId]: event.target.value }))}
+                onChange={(event) => setLessonDoubtDrafts((current) => ({ ...current, [activeLessonDoubtDraftKey]: event.target.value }))}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter') {
                     event.preventDefault();
-                    submitLessonDoubt();
+                    void submitLessonDoubt();
                   }
                 }}
                 placeholder="Add message..."
+                disabled={sendingLessonDoubt || (isAdminViewer && !activeLessonDoubtThread)}
                 className="min-w-0 flex-1 bg-transparent text-[13px] text-[#17233d] outline-none placeholder:text-[#8ba0bb]"
               />
               <button
                 type="button"
                 aria-label="Send chat replay message"
-                onClick={submitLessonDoubt}
-                className="flex h-[34px] w-[34px] items-center justify-center rounded-full bg-[#2f6fe4] text-white shadow-[0_8px_18px_rgba(47,111,228,0.22)]"
+                onClick={() => void submitLessonDoubt()}
+                disabled={!draft.trim() || sendingLessonDoubt || (isAdminViewer && !activeLessonDoubtThread)}
+                className="flex h-[34px] w-[34px] items-center justify-center rounded-full bg-[#2f6fe4] text-white shadow-[0_8px_18px_rgba(47,111,228,0.22)] disabled:cursor-not-allowed disabled:opacity-50"
               >
-                <Send className="h-[15px] w-[15px]" />
+                {sendingLessonDoubt ? <LoaderCircle className="h-[15px] w-[15px] animate-spin" /> : <Send className="h-[15px] w-[15px]" />}
               </button>
             </div>
           </section>
@@ -4417,7 +5151,7 @@ export const CourseFigmaTab = ({
                 <p className="mt-[4px] text-[11px] leading-[1.42] text-[#5d7092]">
                   {hasReachedLessonVideoWatchLimit
                     ? 'Maximum lesson video rewatch limit reached.'
-                    : `${selectedLessonVideoWatchCount}/${MAX_VIDEO_WATCHES} watches used. One more replay is available.`}
+                    : `${selectedLessonVideoWatchCount}/${selectedLessonVideoWatchLimit} watches used. Replay remains available until the limit is reached.`}
                 </p>
                 {canRewatchLessonVideo ? (
                   <button
@@ -4511,7 +5245,7 @@ export const CourseFigmaTab = ({
                   <p className="mt-[4px] text-[11px] leading-[1.42] text-[#5d7092]">
                     {hasReachedLessonVideoWatchLimit
                       ? 'Maximum lesson video rewatch limit reached.'
-                      : `${selectedLessonVideoWatchCount}/${MAX_VIDEO_WATCHES} watches used. You can replay this lesson one more time.`}
+                      : `${selectedLessonVideoWatchCount}/${selectedLessonVideoWatchLimit} watches used. Replay remains available until the limit is reached.`}
                   </p>
                 </div>
                 {canRewatchLessonVideo ? (
@@ -4886,8 +5620,6 @@ export const CourseFigmaTab = ({
           searchValue={searchQuery}
           onSearchChange={setSearchQuery}
           placeholder="Search playlist..."
-          userName={userName}
-          notificationCount={notificationCount}
         />
       </header>
 
@@ -5072,10 +5804,6 @@ export const CourseFigmaTab = ({
             <header>
               <div className="flex items-center justify-between gap-[12px]">
                 <h1 className="text-[18px] font-semibold leading-none text-[#1c2844]">All Courses</h1>
-                <div className="flex items-center gap-[12px] text-[#1d3158]">
-                  <Search className="h-[19px] w-[19px]" />
-                  <Bell className="h-[19px] w-[19px]" />
-                </div>
               </div>
 
               <label

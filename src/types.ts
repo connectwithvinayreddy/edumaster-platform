@@ -16,18 +16,6 @@ export interface AuthResponse {
   user: AuthUser;
 }
 
-export interface AuthOtpChallenge {
-  challengeId: string;
-  channel: 'email' | 'sms';
-  expiresInSeconds: number;
-  destination: string;
-}
-
-export interface RegisterOtpResponse {
-  verificationRequired: true;
-  challenge: AuthOtpChallenge;
-}
-
 export interface CourseLesson {
   id: string;
   title: string;
@@ -50,8 +38,18 @@ export interface CourseLesson {
   deliveryStrategy?: 'source' | 'hls' | string | null;
   hlsProcessingStatus?: 'queued' | 'processing' | 'ready' | 'failed' | string | null;
   hlsProcessingError?: string | null;
+  playbackReady?: boolean;
+  streamProvider?: 'cloudflare-stream' | string | null;
+  cloudflareStreamUid?: string | null;
+  cloudflareStreamStatus?: string | null;
+  cloudflareStreamPctComplete?: number | null;
+  cloudflareStreamReadyToStream?: boolean | null;
   sourceFallbackAllowed?: boolean;
   targetQualities?: string[];
+  watchLimit?: number;
+  watchCompletionPercent?: number;
+  releaseAt?: string | null;
+  securePlaybackRequired?: boolean;
 }
 
 export interface CourseChapter {
@@ -80,6 +78,7 @@ export interface CourseCard {
   subject: string;
   level: string;
   price: number;
+  offerPercentage?: number;
   validityDays: number;
   thumbnailUrl: string;
   instructor: string;
@@ -95,6 +94,12 @@ export interface CourseCard {
     progressPercent: number;
     progressSeconds: number;
     completed: boolean;
+    lessonStage?: 'video' | 'exam' | 'explanation';
+    examSubmitted?: boolean;
+    examSelectedOption?: number | null;
+    explanationSeconds?: number;
+    videoWatchCount?: number;
+    explanationWatchCount?: number;
     updatedAt: string;
   }[];
 }
@@ -103,6 +108,10 @@ export interface ProtectedLessonPlayback {
   playerType: 'youtube' | 'private-video';
   embedUrl: string | null;
   streamUrl: string | null;
+  drmConfig?: ProtectedPlaybackDrmConfig | null;
+  fallbackStreamUrl?: string | null;
+  fallbackStreamFormat?: 'source' | 'hls' | string | null;
+  fallbackReason?: string | null;
   streamFormat?: 'source' | 'hls' | string | null;
   playbackStatus?: 'queued' | 'processing' | 'ready' | 'failed' | string | null;
   deliveryProfile?: string | null;
@@ -113,6 +122,21 @@ export interface ProtectedLessonPlayback {
   completed: boolean;
   tokenExpiresAt: string | null;
   drmEnabled: boolean;
+  watchLimit?: number | null;
+  watchCompletionPercent?: number | null;
+  playbackGrantExpiresAt?: string | null;
+  playbackGrantRemainingViews?: number | null;
+}
+
+export interface ProtectedPlaybackDrmConfig {
+  enabled: boolean;
+  provider: string;
+  manifestUrl: string;
+  manifestFormat?: 'dash' | 'hls' | string | null;
+  licenseServers: Record<string, string>;
+  fairplayCertificateUrl?: string | null;
+  preferredKeySystem?: string | null;
+  captureProtection?: 'drm' | string | null;
 }
 
 export interface MockQuestion {
@@ -124,6 +148,21 @@ export interface MockQuestion {
   explanation?: string;
   marks: number;
   topic: string;
+}
+
+export interface TestSeriesCompanionVideo {
+  id?: string | null;
+  title: string;
+  type?: 'private-video' | string;
+  durationMinutes?: number;
+  uploadedAt?: string | null;
+  deliveryProfile?: string | null;
+  deliveryStrategy?: 'source' | 'hls' | string | null;
+  hlsProcessingStatus?: 'queued' | 'processing' | 'ready' | 'failed' | string | null;
+  hlsProcessingError?: string | null;
+  sourceFallbackAllowed?: boolean;
+  targetQualities?: string[];
+  available?: boolean;
 }
 
 export interface MockTest {
@@ -138,6 +177,7 @@ export interface MockTest {
   negativeMarking: number;
   sectionBreakup: { name: string; questions: number }[];
   questions: MockQuestion[];
+  companionVideo?: TestSeriesCompanionVideo | null;
 }
 
 export interface TestAttemptResult {
@@ -538,6 +578,36 @@ export interface NotificationItem {
   createdAt: string;
 }
 
+export interface LessonDoubtMessage {
+  _id: string;
+  threadId: string;
+  userId: string;
+  role: 'student' | 'admin' | string;
+  userName: string;
+  message: string;
+  createdAt: string;
+}
+
+export interface LessonDoubtThread {
+  _id: string;
+  courseId: string;
+  lessonId: string;
+  studentUserId: string;
+  studentName: string;
+  studentEmail?: string | null;
+  courseTitle: string;
+  moduleTitle?: string | null;
+  chapterTitle?: string | null;
+  lessonTitle: string;
+  status: 'open' | 'answered' | string;
+  lastMessagePreview: string;
+  lastMessageAt: string;
+  createdAt: string;
+  updatedAt: string;
+  pathLabel: string;
+  messages: LessonDoubtMessage[];
+}
+
 export interface AnalyticsSnapshot {
   accuracy: number;
   speed: number;
@@ -545,6 +615,7 @@ export interface AnalyticsSnapshot {
   weakTopics: string[];
   strongTopics: string[];
   suggestions: string[];
+  seriesPerformance: AnalyticsSeriesPerformance[];
   trend: {
     label: string;
     score: number;
@@ -555,6 +626,57 @@ export interface AnalyticsSnapshot {
     difficulty: string;
     reason: string;
   };
+}
+
+export interface AnalyticsConceptPerformance {
+  topic: string;
+  sectionName: string;
+  accuracy: number;
+  correct: number;
+  incorrect: number;
+  unattempted: number;
+  totalQuestions: number;
+  attempts: number;
+  status: 'weak' | 'watch' | 'strong';
+  subjectTitle?: string | null;
+  moduleTitle?: string | null;
+  chapterTitle?: string | null;
+  lessonTitle?: string | null;
+  pathLabel?: string | null;
+}
+
+export interface AnalyticsSectionPerformance {
+  name: string;
+  accuracy: number;
+  correct: number;
+  incorrect: number;
+  unattempted: number;
+  totalQuestions: number;
+  attempts: number;
+  status: 'weak' | 'watch' | 'strong';
+  weakConcepts: AnalyticsConceptPerformance[];
+  strongConcepts: AnalyticsConceptPerformance[];
+}
+
+export interface AnalyticsSeriesPerformance {
+  id: string;
+  title: string;
+  courseId?: string | null;
+  courseTitle?: string | null;
+  exam?: string | null;
+  attempts: number;
+  linkedTests: number;
+  lastAttemptedAt: string | null;
+  overallAccuracy: number;
+  averageScore: number;
+  totalMarks: number;
+  correct: number;
+  incorrect: number;
+  unattempted: number;
+  status: 'weak' | 'watch' | 'strong';
+  sections: AnalyticsSectionPerformance[];
+  focusConcepts: AnalyticsConceptPerformance[];
+  healthyConcepts: AnalyticsConceptPerformance[];
 }
 
 export interface DeviceActivity {

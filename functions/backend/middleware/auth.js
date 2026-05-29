@@ -1,6 +1,6 @@
 const jwt = require('jsonwebtoken');
 const { appConfig } = require('../lib/config.js');
-const { usersRepository, sessionRepository } = require('../lib/repositories.js');
+const { sessionRepository } = require('../lib/repositories.js');
 
 const getTokenFromHeader = (header) => {
   if (!header || !header.startsWith('Bearer ')) {
@@ -17,21 +17,29 @@ const attachUserFromToken = async (req, token) => {
     }
 
     const decoded = jwt.verify(token, appConfig.jwtSecret);
-    const user = await usersRepository.findById(decoded.id);
+    const persistedSessionId = decoded.session || null;
+    const activeSessionId = appConfig.nodeEnv === 'production'
+      ? await sessionRepository.getActiveSessionId(String(decoded.id), persistedSessionId)
+      : persistedSessionId;
 
-    if (!user) {
-      return false;
-    }
-
-    const activeSessionId = await sessionRepository.getActiveSessionId(user._id?.toString?.() || String(user._id), user.session || null);
-    if (decoded.session && decoded.session !== (activeSessionId || null)) {
-      return false;
+    if (appConfig.nodeEnv === 'production' && decoded.session) {
+      const validSessionIds = [activeSessionId, persistedSessionId].filter(Boolean);
+      if (validSessionIds.length > 0 && !validSessionIds.includes(decoded.session)) {
+        return false;
+      }
     }
 
     req.user = {
-      id: user._id?.toString?.() || String(user._id),
-      role: user.role,
-      session: user.session || null,
+      id: String(decoded.id),
+      role: decoded.role || 'student',
+      session: persistedSessionId,
+      profile: {
+        _id: String(decoded.id),
+        email: decoded.email || null,
+        name: decoded.name || null,
+        role: decoded.role || 'student',
+        session: persistedSessionId,
+      },
     };
 
     return true;
@@ -63,4 +71,5 @@ const attachAuthIfPresent = async (req, _res, next) => {
 module.exports = {
   requireAuth,
   attachAuthIfPresent,
+  attachUserFromToken,
 };

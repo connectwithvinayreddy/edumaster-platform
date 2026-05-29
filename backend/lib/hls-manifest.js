@@ -7,6 +7,7 @@ const assetMimeTypeByExtension = {
   '.mp4': 'video/mp4',
   '.m4a': 'audio/mp4',
   '.aac': 'audio/aac',
+  '.key': 'application/octet-stream',
 };
 
 const normalizeManifestText = (manifestText) => String(manifestText || '').replace(/\r\n/g, '\n');

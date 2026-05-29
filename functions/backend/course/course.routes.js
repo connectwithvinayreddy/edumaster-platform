@@ -1,11 +1,30 @@
 const express = require('express');
-const { getCourses, getCourse, getCourseLessons, getProtectedLessonPlayer, streamProtectedLesson, createCourse } = require('./course.controller.js');
+const {
+  getCourses,
+  getCourse,
+  getCourseLessons,
+  getProtectedLessonBootstrap,
+  getProtectedLessonPlayer,
+  proxyProtectedDrmLicense,
+  proxyProtectedFairplayCertificate,
+  streamProtectedLesson,
+  streamCompactProtectedLessonAsset,
+  createCourse,
+} = require('./course.controller.js');
 const {
   uploadVideoToModule,
+  uploadVideoChunkToModule,
+  initiateCloudflareStreamUpload,
+  completeCloudflareStreamUpload,
+  handleCloudflareStreamWebhook,
   deleteVideoFromModule,
   listVideosInModule,
   getVideoMetadata,
 } = require('./video-upload.controller.js');
+const {
+  getLessonDoubts,
+  postLessonDoubtMessage,
+} = require('./lesson-doubts.controller.js');
 const {
   updateCourse,
   deleteCourse,
@@ -43,15 +62,27 @@ router.put('/:courseId/modules/:moduleId/lessons/:lessonId/cbt', requireAuth, re
 router.delete('/:courseId/modules/:moduleId/lessons/:lessonId/cbt', requireAuth, requireAdmin, deleteLessonCbt);
 
 // Admin routes - video upload and management
+router.post('/:courseId/modules/:moduleId/videos/cloudflare/direct-upload', requireAuth, requireAdmin, initiateCloudflareStreamUpload);
+router.post('/:courseId/modules/:moduleId/videos/cloudflare/complete', requireAuth, requireAdmin, completeCloudflareStreamUpload);
 router.post('/:courseId/modules/:moduleId/videos', requireAuth, requireAdmin, upload.single('video'), uploadVideoToModule);
+router.post('/:courseId/modules/:moduleId/videos/chunked', requireAuth, requireAdmin, upload.chunkUpload.single('chunk'), uploadVideoChunkToModule);
 router.delete('/:courseId/modules/:moduleId/videos/:videoId', requireAuth, requireAdmin, deleteVideoFromModule);
 router.get('/:courseId/modules/:moduleId/videos', requireAuth, requireAdmin, listVideosInModule);
 router.get('/:courseId/modules/:moduleId/videos/:videoId', requireAuth, requireAdmin, getVideoMetadata);
 
+router.post('/webhooks/cloudflare-stream', handleCloudflareStreamWebhook);
+
 // Public routes
 router.get('/', attachAuthIfPresent, getCourses);
+router.get('/h/*', streamCompactProtectedLessonAsset);
+router.get('/hls/*', streamCompactProtectedLessonAsset);
 router.get('/stream/:token', streamProtectedLesson);
+router.get('/:id/lessons/:lessonId/bootstrap', requireAuth, getProtectedLessonBootstrap);
 router.get('/:id/lessons/:lessonId/player', requireAuth, getProtectedLessonPlayer);
+router.post('/:id/lessons/:lessonId/drm/license/:provider', proxyProtectedDrmLicense);
+router.get('/:id/lessons/:lessonId/drm/fairplay-certificate', proxyProtectedFairplayCertificate);
+router.get('/:id/lessons/:lessonId/doubts', requireAuth, getLessonDoubts);
+router.post('/:id/lessons/:lessonId/doubts', requireAuth, postLessonDoubtMessage);
 router.get('/:id/lessons', attachAuthIfPresent, getCourseLessons);
 router.get('/:id', attachAuthIfPresent, getCourse);
 

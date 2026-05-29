@@ -188,6 +188,10 @@ const numberEnv = (name: string, defaultValue: number, min = 0) => {
   return Math.max(min, parsed);
 };
 const textOrEmpty = (value: unknown) => String(value ?? '').trim();
+const csvEnv = (name: string) => String(process.env[name] || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
 
 const reportId = new Date().toISOString().replace(/[:.]/g, '-');
 const cwdRoot = path.resolve(process.cwd());
@@ -334,6 +338,21 @@ const TEST_MATRIX: TestCaseDefinition[] = [
   { id: 'security-direct-segment', category: 'Security', title: 'direct segment access without auth', automation: 'api', description: 'Raw segment access without a valid signed path is denied.' },
   { id: 'security-replay-attack', category: 'Security', title: 'replay attack prevention', automation: 'api', description: 'Previously captured invalid or mutated playback URLs are not reusable.' },
 ];
+
+const caseIdFilters = csvEnv('PLAYBACK_QA_CASE_FILTER');
+const categoryFilters = csvEnv('PLAYBACK_QA_CATEGORY_FILTER').map((value) => value.toLowerCase());
+
+const FILTERED_TEST_MATRIX = TEST_MATRIX.filter((testCase) => {
+  if (caseIdFilters.length && !caseIdFilters.includes(testCase.id)) {
+    return false;
+  }
+
+  if (categoryFilters.length && !categoryFilters.includes(testCase.category.toLowerCase())) {
+    return false;
+  }
+
+  return true;
+});
 
 const listFilesSorted = async (dir: string, prefix: string) => {
   const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
@@ -1808,7 +1827,7 @@ const renderHtml = (caseResults: CaseResult[], loadResults: LoadRungResult[]) =>
 const main = async () => {
   await cleanupOldRuns();
   await ensureDir(runtime.reportRoot);
-  await writeJson(path.join(runtime.reportRoot, 'test-case-matrix.json'), TEST_MATRIX);
+  await writeJson(path.join(runtime.reportRoot, 'test-case-matrix.json'), FILTERED_TEST_MATRIX);
 
   const browser = await chromium.launch({
     headless: runtime.headless,
@@ -1816,12 +1835,12 @@ const main = async () => {
   });
 
   const executableSummary: Record<string, number> = {};
-  for (const item of TEST_MATRIX) {
+  for (const item of FILTERED_TEST_MATRIX) {
     executableSummary[item.category] = (executableSummary[item.category] || 0) + 1;
   }
   await writeJson(path.join(runtime.reportRoot, 'matrix-category-summary.json'), executableSummary);
 
-  const nonLoadCases = TEST_MATRIX.filter((testCase) => testCase.automation !== 'load');
+  const nonLoadCases = FILTERED_TEST_MATRIX.filter((testCase) => testCase.automation !== 'load');
   const caseResults = await runWithPool(nonLoadCases, runtime.browserWorkers, async (testCase) => runSingleCase(browser, testCase));
   await browser.close();
   await artifactWriter.flush();

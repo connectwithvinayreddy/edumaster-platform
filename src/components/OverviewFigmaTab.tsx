@@ -9,7 +9,7 @@ import {
   Radio,
   Target,
 } from 'lucide-react';
-import { CourseCard, LiveClass, MockTest, NotificationItem, PlatformOverview } from '../types';
+import { CourseCard, LiveClass, MockTest, PlatformOverview } from '../types';
 
 type OverviewFigmaTabProps = {
   overview: PlatformOverview;
@@ -18,7 +18,6 @@ type OverviewFigmaTabProps = {
   onOpenTestsTab?: () => void;
   onOpenRevisionTab?: () => void;
   onOpenCoursesTab?: () => void;
-  onOpenNotification?: (notification: NotificationItem) => void;
 };
 
 const overviewFontStack = 'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
@@ -41,8 +40,31 @@ const isSameLocalDay = (value: string | null | undefined, date: Date) => {
 const formatClassTime = (value: string) =>
   new Intl.DateTimeFormat('en-IN', { hour: 'numeric', minute: '2-digit', hour12: true }).format(new Date(value));
 
+const currency = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 });
+
 const getCourseSubtitle = (course: CourseCard) =>
   [course.exam, course.subject].filter(Boolean).join(' | ') || course.category || course.level || 'Course';
+
+const getDiscountedCoursePrice = (course: CourseCard) => {
+  const basePrice = Math.max(Number(course.price || 0), 1);
+  const offerPercentage = Math.min(Math.max(Number(course.offerPercentage || 0), 0), 100);
+  const discountedPrice = basePrice * (1 - (offerPercentage / 100));
+  return Math.max(Number(discountedPrice.toFixed(2)), 1);
+};
+
+const getOverviewCoursePricing = (course: CourseCard) => {
+  const basePrice = Math.max(Number(course.price || 0), 1);
+  const finalPrice = getDiscountedCoursePrice(course);
+  const offerPercentage = Number(course.offerPercentage || 0);
+  const savings = Math.max(basePrice - finalPrice, 0);
+
+  return {
+    basePrice,
+    finalPrice,
+    offerPercentage,
+    savings,
+  };
+};
 
 const getCourseInitials = (course: CourseCard) =>
   (course.title || course.exam || 'Course')
@@ -64,21 +86,6 @@ const getCourseQuestionCount = (tests: MockTest[], course: CourseCard) =>
         || (course.category && haystack.includes(course.category.toLowerCase()));
     })
     .reduce((sum, test) => sum + (test.questions?.length || 0), 0);
-
-const Avatar = ({ name }: { name: string }) => {
-  const initials = name
-    .split(/\s+/)
-    .filter(Boolean)
-    .slice(0, 2)
-    .map((part) => part[0]?.toUpperCase())
-    .join('') || 'U';
-
-  return (
-    <div className="flex h-full w-full items-center justify-center rounded-full bg-[#e9f1ff] text-[13px] font-semibold text-[#2454b8]">
-      {initials}
-    </div>
-  );
-};
 
 const SectionTitle = ({ children }: { children: React.ReactNode }) => (
   <p className="text-[15px] font-bold text-[#17233d]">{children}</p>
@@ -271,7 +278,6 @@ export const OverviewFigmaTab = ({
   onOpenTestsTab,
   onOpenRevisionTab,
   onOpenCoursesTab,
-  onOpenNotification,
 }: OverviewFigmaTabProps) => {
   const [isMobileLayout, setIsMobileLayout] = useState(false);
   const [mobileCoursePage, setMobileCoursePage] = useState(0);
@@ -354,7 +360,7 @@ export const OverviewFigmaTab = ({
       return;
     }
 
-    onContinueLearning(course._id, course.continueLesson?.id || null);
+    onContinueLearning(course._id, null);
   };
 
   useEffect(() => {
@@ -455,7 +461,7 @@ export const OverviewFigmaTab = ({
       </div>
 
       {mobileCarouselCourses.length === 0 ? (
-        <EmptyState title="No active courses" body="Paid and free course enrollments will appear here after the learner is enrolled." />
+        <EmptyState title="No active courses" body="Purchased course enrollments will appear here after the learner buys access." />
       ) : (
         <>
           <div
@@ -475,7 +481,7 @@ export const OverviewFigmaTab = ({
                   type="button"
                   data-testid={`overview-active-course-card-${index}`}
                   onClick={() => openCourse(course)}
-                  className={`relative h-[148px] shrink-0 snap-start overflow-hidden rounded-[10px] px-[11px] py-[14px] text-left text-white shadow-[0_16px_30px_rgba(22,62,128,0.14)] ${tone === 'blue'
+                  className={`relative h-[182px] shrink-0 snap-start overflow-hidden rounded-[12px] px-[11px] py-[14px] text-left text-white shadow-[0_16px_30px_rgba(22,62,128,0.14)] ${tone === 'blue'
                     ? 'bg-[linear-gradient(135deg,#1776d8_0%,#35a2ff_100%)]'
                     : tone === 'green'
                       ? 'bg-[linear-gradient(135deg,#11966f_0%,#36caa1_100%)]'
@@ -496,6 +502,22 @@ export const OverviewFigmaTab = ({
                   <p className="relative z-10 mt-[7px] max-w-[112px] truncate text-[12px] font-semibold text-white/92">
                     {getCourseSubtitle(course)}
                   </p>
+                  {!course.enrolled && (
+                    <div className="relative z-10 mt-[10px] inline-flex max-w-[138px] flex-col rounded-[10px] bg-white/18 px-[8px] py-[7px] backdrop-blur-[6px]">
+                      <p className="text-[9px] font-semibold uppercase tracking-[0.08em] text-white/74">Offer price</p>
+                      <p className="mt-[2px] text-[13px] font-extrabold text-white">
+                        {currency.format(getOverviewCoursePricing(course).finalPrice)}
+                      </p>
+                      <div className="mt-[3px] flex items-center gap-[5px] text-[9px] font-semibold text-white/84">
+                        <span className="line-through decoration-white/65">{currency.format(getOverviewCoursePricing(course).basePrice)}</span>
+                        {getOverviewCoursePricing(course).offerPercentage > 0 && (
+                          <span className="rounded-full bg-[#ffd36f] px-[5px] py-[1px] text-[#6a3b00]">
+                            {getOverviewCoursePricing(course).offerPercentage}% OFF
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  )}
                   {renderMobileCourseArt(tone, index)}
                 </button>
               );
@@ -532,9 +554,6 @@ export const OverviewFigmaTab = ({
         <p className="mt-[6px] text-[13px] leading-[1.45] text-[#5f6f86]">Your dashboard is based on live course, test, and class activity.</p>
       </div>
 
-      <div className="hidden h-[38px] w-[38px] shrink-0 items-center justify-center overflow-hidden rounded-full border border-[#e2e8f2] bg-white shadow-[0_6px_16px_rgba(28,41,61,0.05)] lg:flex">
-        <Avatar name={learnerName} />
-      </div>
     </div>
   );
 
@@ -593,7 +612,7 @@ export const OverviewFigmaTab = ({
     <section data-testid="overview-active-courses" className="space-y-[10px]">
       <SectionTitle>Active Courses</SectionTitle>
       {activeCourseCards.length === 0 ? (
-        <EmptyState title="No active courses" body="Paid and free course enrollments will appear here after the learner is enrolled." />
+        <EmptyState title="No active courses" body="Purchased course enrollments will appear here after the learner buys access." />
       ) : (
         <div className="grid grid-cols-1 rounded-[18px] border border-[#dbe5f2] bg-white shadow-[0_10px_28px_rgba(28,41,61,0.06)] lg:grid-cols-2">
           {activeCourseCards.map((course, index) => (

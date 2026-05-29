@@ -23,9 +23,12 @@ const quizRoutes = require('./quiz/quiz.routes.js');
 const authRoutes = require('./auth/auth.routes.js');
 const platformRoutes = require('./platform/platform.routes.js');
 const liveRoutes = require('./live/live.routes.js');
+const { startLiveEventBus } = require('./live/live-event-bus.js');
+const { ensureReplayImporterWorker } = require('./live/live-replay.worker.js');
 const { connectDatabase, getDatabaseMode } = require('./lib/database.js');
 const { isFirestoreStateEnabled, getStateDocumentRef } = require('./lib/firebase-state.js');
 const { resetState, serializeState } = require('./lib/store.js');
+const { recoverPendingCourseVideoProcessingJobs } = require('./lib/video-processing.js');
 
 const parseCorsOrigin = (value) => {
   const normalized = String(value || '').trim();
@@ -45,7 +48,12 @@ const app = express();
 app.set('trust proxy', appConfig.trustProxy);
 app.disable('x-powered-by');
 app.use(cors({ origin: parseCorsOrigin(appConfig.corsOrigin) }));
-app.use(express.json({ limit: appConfig.jsonBodyLimit }));
+app.use(express.json({
+  limit: appConfig.jsonBodyLimit,
+  verify: (req, _res, buffer) => {
+    req.rawBody = Buffer.from(buffer);
+  },
+}));
 app.use(express.urlencoded({ extended: false, limit: '64kb' }));
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 app.use('/private_uploads', express.static(path.join(process.cwd(), 'private_uploads')));
@@ -77,12 +85,12 @@ if (isFirestoreStateEnabled()) {
   });
 }
 
-app.get('/api/health', async (_req, res) => {
+app.get(['/api/health', '/backend/api/health'], async (_req, res) => {
   const snapshot = await getHealthSnapshot();
   res.status(snapshot.status === 'degraded' ? 503 : 200).json(snapshot);
 });
 
-app.get('/api/ready', async (_req, res) => {
+app.get(['/api/ready', '/backend/api/ready'], async (_req, res) => {
   const snapshot = await getHealthSnapshot();
   const ready = ['ok', 'bootstrapped'].includes(snapshot.status);
   res.status(ready ? 200 : 503).json({
@@ -93,7 +101,7 @@ app.get('/api/ready', async (_req, res) => {
   });
 });
 
-app.get('/api/live', (_req, res) => {
+app.get(['/api/live', '/backend/api/live'], (_req, res) => {
   res.json({
     alive: true,
     mode: getDatabaseMode(),
@@ -101,22 +109,25 @@ app.get('/api/live', (_req, res) => {
   });
 });
 
-app.use('/api/users', userRoutes);
-app.use('/api/courses', courseRoutes);
-app.use('/api/tests', testRoutes);
-app.use('/api/quiz', quizRoutes);
-app.use('/api/auth', authRoutes);
-app.use('/api/analytics', analyticsRoutes);
-app.use('/api/admin', adminRoutes);
-app.use('/api/notifications', notificationsRoutes);
-app.use('/api/engagement', engagementRoutes);
-app.use('/api/track', trackRoutes);
-app.use('/api/payment', paymentRoutes);
-app.use('/api/platform', platformRoutes);
-app.use('/api/live-classes', liveRoutes);
+['/api', '/backend/api'].forEach((prefix) => {
+  app.use(`${prefix}/users`, userRoutes);
+  app.use(`${prefix}/courses`, courseRoutes);
+  app.use(`${prefix}/tests`, testRoutes);
+  app.use(`${prefix}/quiz`, quizRoutes);
+  app.use(`${prefix}/auth`, authRoutes);
+  app.use(`${prefix}/analytics`, analyticsRoutes);
+  app.use(`${prefix}/admin`, adminRoutes);
+  app.use(`${prefix}/notifications`, notificationsRoutes);
+  app.use(`${prefix}/engagement`, engagementRoutes);
+  app.use(`${prefix}/track`, trackRoutes);
+  app.use(`${prefix}/payment`, paymentRoutes);
+  app.use(`${prefix}/platform`, platformRoutes);
+  app.use(`${prefix}/live-classes`, liveRoutes);
+});
 
 const PORT = appConfig.port;
 const HOST = process.env.HOST || '127.0.0.1';
+const enableBackgroundWorkers = String(process.env.ENABLE_BACKGROUND_WORKERS || 'true').toLowerCase() !== 'false';
 
 app.use(notFoundHandler);
 app.use(errorHandler);
@@ -142,6 +153,19 @@ const startServer = async (options = {}) => {
 
   const port = options.port ?? PORT;
   const host = options.host ?? HOST;
+  if (enableBackgroundWorkers) {
+    startLiveEventBus();
+    ensureReplayImporterWorker();
+    recoverPendingCourseVideoProcessingJobs()
+      .then((result) => {
+        if (result.scheduled > 0) {
+          console.log(`[video-processing] recovered ${result.scheduled} pending course video job(s) after scanning ${result.scanned} lesson(s)`);
+        }
+      })
+      .catch((error) => {
+        console.error('[video-processing] failed to recover pending course video jobs', error);
+      });
+  }
 
   return new Promise((resolve, reject) => {
     const server = app.listen(port, host, () => {

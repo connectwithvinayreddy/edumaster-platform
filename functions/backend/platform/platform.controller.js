@@ -8,6 +8,7 @@ const {
   requireString,
   optionalString,
   requireNumber,
+  optionalNumber,
   requireBoolean,
 } = require('../lib/http.js');
 
@@ -25,6 +26,9 @@ const enroll = asyncHandler(async (req, res) => {
   const courseId = requireString(req.body?.courseId, 'courseId');
   if (!userId) {
     throw new ApiError(401, 'Authorization token required', { code: 'AUTH_REQUIRED' });
+  }
+  if (req.user?.role !== 'admin') {
+    throw new ApiError(403, 'Course access requires a verified payment', { code: 'PAYMENT_REQUIRED' });
   }
 
   const enrollment = await platformRepository.enroll({
@@ -72,6 +76,22 @@ const updateWatchProgress = asyncHandler(async (req, res) => {
     progressPercent: requireNumber(req.body?.progressPercent ?? 0, 'progressPercent', { min: 0, max: 100 }),
     progressSeconds: requireNumber(req.body?.progressSeconds ?? 0, 'progressSeconds', { min: 0 }),
     completed: requireBoolean(req.body?.completed ?? false, 'completed'),
+    lessonStage: optionalString(req.body?.lessonStage, '', { maxLength: 20 }) || null,
+    examSubmitted: req.body?.examSubmitted === undefined ? null : requireBoolean(req.body?.examSubmitted, 'examSubmitted'),
+    examSelectedOption: req.body?.examSelectedOption === undefined || req.body?.examSelectedOption === null || req.body?.examSelectedOption === ''
+      ? null
+      : optionalNumber(req.body?.examSelectedOption, null, { integer: true, min: 0 }),
+    explanationSeconds: optionalNumber(req.body?.explanationSeconds, null, { min: 0 }),
+    videoWatchCount: optionalNumber(req.body?.videoWatchCount, null, { integer: true, min: 0 }),
+    explanationWatchCount: optionalNumber(req.body?.explanationWatchCount, null, { integer: true, min: 0 }),
+    sessionId: req.user?.session || null,
+    device: {
+      id: req.headers['x-edumaster-device-id'] || null,
+      platform: req.headers['x-edumaster-client-platform'] || null,
+      browser: req.headers['x-edumaster-client-browser'] || null,
+      app: req.headers['x-edumaster-app'] || 'web',
+      userAgent: req.headers['user-agent'] || null,
+    },
   });
 
   return ok(res, watchRecord);

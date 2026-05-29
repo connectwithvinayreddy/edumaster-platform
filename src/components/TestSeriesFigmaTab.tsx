@@ -2,7 +2,6 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   ArrowRight,
-  Bell,
   Bookmark,
   Check,
   ChevronDown,
@@ -26,9 +25,11 @@ import {
   Video,
   X,
 } from 'lucide-react';
-import { LiveClass, MockQuestion, MockTest, PlatformOverview } from '../types';
+import { EduService } from '../EduService';
+import { LiveClass, MockQuestion, MockTest, PlatformOverview, ProtectedLessonPlayback, TestAttemptResult } from '../types';
 import { cn } from '../lib/utils';
 import { BrandLogo } from './BrandLogo';
+import { ResilientHlsVideo } from './ResilientHlsVideo';
 
 type TestSeriesFigmaTabProps = {
   overview: PlatformOverview;
@@ -62,7 +63,9 @@ type DetailTestCard = {
 };
 
 type ResolvedDetailTestCard = DetailTestCard & {
+  companionMode: 'default' | 'live' | 'video';
   liveClassId: string | null;
+  mockTestId: string | null;
   companionButtonLabel: string;
   companionPrimaryMeta: string;
   companionSecondaryMeta: string;
@@ -122,7 +125,12 @@ type AttemptSession = {
   defaultLanguage: string;
   selectedLanguage: string;
   confirmationAccepted: boolean;
+  startedAt: string | null;
+  updatedAt: string | null;
 };
+
+type ExitPromptTarget = 'home' | 'detail';
+type PauseDialogStep = null | 'confirm' | 'summary';
 
 type SeriesDetailMeta = {
   title: string;
@@ -141,6 +149,7 @@ const uiFontStack = 'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-
 const cbtFontStack = 'Arial, Helvetica, sans-serif';
 const MOCK_TEST_LINK_TAG_PREFIX = 'mock-test:';
 const MOCK_TEST_ID_TAG_PREFIX = 'mock-test-id:';
+const TEST_SERIES_DRAFT_STORAGE_PREFIX = 'test-series-drafts';
 
 const normalizeMockTestTitle = (value: string) =>
   String(value || '')
@@ -376,6 +385,87 @@ const formatMetricValue = (value: number) => {
   }
 
   return value.toFixed(2).replace(/\.?0+$/, '');
+};
+
+const getDraftStorageKey = (userId?: string | null) => `${TEST_SERIES_DRAFT_STORAGE_PREFIX}:${userId || 'anonymous'}`;
+
+const getSafeIsoTimestamp = (value: string | null | undefined) => {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+};
+
+const normalizePersistedTimeLeft = (session: Partial<AttemptSession>) => {
+  const baseTimeLeft = Number.isFinite(Number(session.timeLeft)) ? Math.max(Number(session.timeLeft), 0) : 0;
+  const updatedAt = getSafeIsoTimestamp(session.updatedAt);
+
+  if (session.status !== 'in-progress' || !updatedAt) {
+    return baseTimeLeft;
+  }
+
+  const elapsedSeconds = Math.max(0, Math.floor((Date.now() - new Date(updatedAt).getTime()) / 1000));
+  return Math.max(baseTimeLeft - elapsedSeconds, 0);
+};
+
+const readDraftSessions = (userId?: string | null): Record<string, AttemptSession> => {
+  if (typeof window === 'undefined') {
+    return {};
+  }
+
+  try {
+    const raw = window.localStorage.getItem(getDraftStorageKey(userId));
+    if (!raw) {
+      return {};
+    }
+
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') {
+      return {};
+    }
+
+    return Object.entries(parsed).reduce<Record<string, AttemptSession>>((accumulator, [testId, value]) => {
+      if (!value || typeof value !== 'object') {
+        return accumulator;
+      }
+
+      const session = value as Partial<AttemptSession>;
+      accumulator[testId] = {
+        status: session.status === 'completed' ? 'completed' : session.status === 'in-progress' ? 'in-progress' : 'not-started',
+        visitedQuestions: session.visitedQuestions || {},
+        answers: session.answers || {},
+        review: session.review || {},
+        currentIndex: Number.isInteger(session.currentIndex) ? Number(session.currentIndex) : 0,
+        timeLeft: normalizePersistedTimeLeft(session),
+        defaultLanguage: String(session.defaultLanguage || 'English'),
+        selectedLanguage: String(session.selectedLanguage || session.defaultLanguage || 'English'),
+        confirmationAccepted: Boolean(session.confirmationAccepted),
+        startedAt: getSafeIsoTimestamp(session.startedAt),
+        updatedAt: getSafeIsoTimestamp(session.updatedAt),
+      };
+      return accumulator;
+    }, {});
+  } catch {
+    return {};
+  }
+};
+
+const writeDraftSessions = (userId: string | null | undefined, sessions: Record<string, AttemptSession>) => {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  try {
+    const entries = Object.entries(sessions).filter(([, session]) => session.status !== 'completed');
+    if (entries.length === 0) {
+      window.localStorage.removeItem(getDraftStorageKey(userId));
+      return;
+    }
+
+    window.localStorage.setItem(getDraftStorageKey(userId), JSON.stringify(Object.fromEntries(entries)));
+  } catch {}
 };
 
 const getAttemptedAnswerCount = (answers: Record<number, number[]>) =>
@@ -776,11 +866,6 @@ const DesktopTopBar = () => (
         <button className="flex h-[48px] min-w-[174px] items-center justify-center rounded-[8px] border border-[#d6e0ea] bg-white px-6 text-[16px] text-[#87a5bf]">
           Pass Active
         </button>
-        <Bell className="h-7 w-7 text-[#8aa0b3]" />
-        <div className="flex items-center gap-3">
-          <UserAvatar />
-          <ChevronDown className="h-5 w-5" />
-        </div>
       </div>
     </div>
   </div>
@@ -830,8 +915,6 @@ export const TestSeriesFigmaTab = ({
   onImmersiveModeChange,
   onOpenLiveClass,
 }: TestSeriesFigmaTabProps) => {
-  void onRefresh;
-
   const [screen, setScreen] = useState<Screen>('home');
   const [selectedSeriesId, setSelectedSeriesId] = useState('');
   const [savedSeriesIds, setSavedSeriesIds] = useState<string[]>([]);
@@ -849,7 +932,18 @@ export const TestSeriesFigmaTab = ({
   const [draftAnswer, setDraftAnswer] = useState<number[]>([]);
   const [draftReview, setDraftReview] = useState(false);
   const [attemptSessions, setAttemptSessions] = useState<Record<string, AttemptSession>>({});
+  const [submittedAttempts, setSubmittedAttempts] = useState<Record<string, TestAttemptResult>>({});
+  const [submittingExam, setSubmittingExam] = useState(false);
+  const [attemptError, setAttemptError] = useState('');
+  const [exitPromptTarget, setExitPromptTarget] = useState<ExitPromptTarget | null>(null);
+  const [pauseDialogStep, setPauseDialogStep] = useState<PauseDialogStep>(null);
+  const [activeCompanionVideoTest, setActiveCompanionVideoTest] = useState<MockTest | null>(null);
+  const [activeCompanionVideoPlayback, setActiveCompanionVideoPlayback] = useState<ProtectedLessonPlayback | null>(null);
+  const [loadingCompanionVideo, setLoadingCompanionVideo] = useState(false);
+  const [companionVideoError, setCompanionVideoError] = useState('');
   const hydratedTestIdRef = useRef<string | null>(null);
+  const resumeBootstrapCompleteRef = useRef(false);
+  const learnerId = overview.user?._id || null;
 
   const fullMockTests = useMemo(
     () => (overview.testSeries || []).filter((test) => {
@@ -899,14 +993,21 @@ export const TestSeriesFigmaTab = ({
       return sourceTests.map((card) => {
       const linkedLiveClass = findLinkedLiveClassForTest(overview.liveClasses || [], card.title, card.mockTestId);
       const defaultMeta = splitCompanionMeta(card.companionMeta);
+      const linkedTest = fullMockTests.find((entry) => entry._id === card.mockTestId) || null;
 
       if (!linkedLiveClass) {
         return {
           ...card,
+          companionMode: linkedTest?.companionVideo?.available ? 'video' : 'default',
           liveClassId: null,
+          mockTestId: card.mockTestId || null,
           companionButtonLabel: card.companionTone === 'blue' ? 'Watch Now' : card.companionTone === 'emerald' ? 'Join' : 'Watch Video',
-          companionPrimaryMeta: defaultMeta.primary,
-          companionSecondaryMeta: defaultMeta.secondary,
+          companionPrimaryMeta: linkedTest?.companionVideo?.available
+            ? (linkedTest.companionVideo?.title || 'Explanation video ready')
+            : defaultMeta.primary,
+          companionSecondaryMeta: linkedTest?.companionVideo?.available
+            ? `${linkedTest.companionVideo?.durationMinutes || 0} min secure playback`
+            : defaultMeta.secondary,
         };
       }
 
@@ -914,7 +1015,9 @@ export const TestSeriesFigmaTab = ({
       if (linkedLiveClass.joinEnabled || status === 'live' || status === 'scheduled') {
         return {
           ...card,
+          companionMode: 'live',
           liveClassId: linkedLiveClass._id,
+          mockTestId: card.mockTestId || null,
           companionAction: 'Join Live Class',
           companionTone: 'emerald',
           companionMeta: `${formatLiveSchedule(linkedLiveClass.startTime)} explanation session`,
@@ -924,10 +1027,27 @@ export const TestSeriesFigmaTab = ({
         };
       }
 
+      if (linkedTest?.companionVideo?.available) {
+        return {
+          ...card,
+          companionMode: 'video',
+          liveClassId: null,
+          mockTestId: card.mockTestId || null,
+          companionAction: 'Watch Video',
+          companionTone: 'blue',
+          companionMeta: linkedTest.companionVideo?.title || 'Explanation video ready',
+          companionButtonLabel: 'Watch Now',
+          companionPrimaryMeta: linkedTest.companionVideo?.title || 'Explanation video ready',
+          companionSecondaryMeta: `${linkedTest.companionVideo?.durationMinutes || 0} min secure playback`,
+        };
+      }
+
       if (linkedLiveClass.replayReady) {
         return {
           ...card,
+          companionMode: 'live',
           liveClassId: linkedLiveClass._id,
+          mockTestId: card.mockTestId || null,
           companionAction: 'Watch Explanation',
           companionTone: 'blue',
           companionMeta: 'Live class completed, replay ready',
@@ -939,7 +1059,9 @@ export const TestSeriesFigmaTab = ({
 
       return {
         ...card,
+        companionMode: 'default',
         liveClassId: linkedLiveClass._id,
+        mockTestId: card.mockTestId || null,
         companionButtonLabel: card.companionTone === 'blue' ? 'Watch Now' : card.companionTone === 'emerald' ? 'Join' : 'Watch Video',
         companionPrimaryMeta: defaultMeta.primary,
         companionSecondaryMeta: defaultMeta.secondary,
@@ -974,17 +1096,53 @@ export const TestSeriesFigmaTab = ({
   const questionTextClass = ['text-[14px] leading-[1.58]', 'text-[16px] leading-[1.68]', 'text-[18px] leading-[1.78]'][questionZoom];
   const isCurrentQuestionMarkedForReview = draftReview;
   const currentTestId = selectedTest?._id || '';
+  const currentSubmittedAttempt = currentTestId ? submittedAttempts[currentTestId] || null : null;
   const persistedAttemptStatus = currentTestId ? attemptSessions[currentTestId]?.status : undefined;
   const currentAttemptedAnswerCount = getAttemptedAnswerCount(answers);
-  const currentAttemptStatus: AttemptStatus = screen === 'result' || screen === 'solutions'
+  const currentAttemptStatus: AttemptStatus = currentSubmittedAttempt || persistedAttemptStatus === 'completed'
     ? 'completed'
-    : persistedAttemptStatus === 'completed'
-      ? 'completed'
     : currentAttemptedAnswerCount > 0 || Object.keys(visitedQuestions).length > 0 || screen === 'exam'
       ? 'in-progress'
       : 'not-started';
   const attemptResults = useMemo<AttemptQuestionResult[]>(
-    () => questions.map((question, index) => {
+    () => {
+      if (currentSubmittedAttempt) {
+        return currentSubmittedAttempt.solutions.map((solution, index) => {
+          const question = questions.find((entry) => entry.id === solution.questionId);
+          const selectedIndexes = getAnswerIndexes(
+            Array.isArray(solution.selectedOptions) && solution.selectedOptions.length > 0
+              ? solution.selectedOptions
+              : solution.selectedOption === null || solution.selectedOption === undefined
+                ? []
+                : [solution.selectedOption],
+          );
+          const correctIndexes = getAnswerIndexes(
+            Array.isArray(solution.correctOptions) && solution.correctOptions.length > 0
+              ? solution.correctOptions
+              : [solution.correctOption],
+          );
+
+          let status: AttemptQuestionResult['status'] = 'unattempted';
+          if (selectedIndexes.length > 0) {
+            status = areAnswerIndexesEqual(selectedIndexes, correctIndexes) ? 'correct' : 'incorrect';
+          }
+
+          return {
+            questionId: solution.questionId,
+            questionNumber: index + 1,
+            prompt: solution.questionText || question?.prompt || `Question ${index + 1}`,
+            options: question?.options || [],
+            selectedIndexes,
+            correctIndexes,
+            explanation: solution.explanation || question?.explanation || 'Explanation not available yet.',
+            marks: Number(question?.marks || 1),
+            topic: solution.topic || question?.topic || 'General Practice',
+            status,
+          };
+        });
+      }
+
+      return questions.map((question, index) => {
       const selectedIndexes = getAnswerIndexes(answers[index]);
       let status: AttemptQuestionResult['status'] = 'unattempted';
 
@@ -1004,24 +1162,25 @@ export const TestSeriesFigmaTab = ({
         topic: question.topic,
         status,
       };
-    }),
-    [answers, questions],
+      });
+    },
+    [answers, currentSubmittedAttempt, questions],
   );
   const correctCount = useMemo(
-    () => attemptResults.filter((result) => result.status === 'correct').length,
-    [attemptResults],
+    () => currentSubmittedAttempt?.correctCount ?? attemptResults.filter((result) => result.status === 'correct').length,
+    [attemptResults, currentSubmittedAttempt],
   );
   const incorrectCount = useMemo(
-    () => attemptResults.filter((result) => result.status === 'incorrect').length,
-    [attemptResults],
+    () => currentSubmittedAttempt?.incorrectCount ?? attemptResults.filter((result) => result.status === 'incorrect').length,
+    [attemptResults, currentSubmittedAttempt],
   );
   const unattemptedCount = useMemo(
-    () => attemptResults.filter((result) => result.status === 'unattempted').length,
-    [attemptResults],
+    () => currentSubmittedAttempt?.unattemptedCount ?? attemptResults.filter((result) => result.status === 'unattempted').length,
+    [attemptResults, currentSubmittedAttempt],
   );
   const attemptedCount = correctCount + incorrectCount;
   const resultScore = useMemo(
-    () => attemptResults.reduce((sum, result) => {
+    () => currentSubmittedAttempt?.score ?? attemptResults.reduce((sum, result) => {
       if (result.status === 'correct') {
         return sum + Number(result.marks || 1);
       }
@@ -1030,16 +1189,17 @@ export const TestSeriesFigmaTab = ({
       }
       return sum;
     }, 0),
-    [attemptResults, selectedTest?.negativeMarking],
+    [attemptResults, currentSubmittedAttempt, selectedTest?.negativeMarking],
   );
   const resultAccuracy = useMemo(
     () => (attemptedCount > 0 ? Math.round((correctCount / attemptedCount) * 100) : 0),
     [attemptedCount, correctCount],
   );
-  const resultTotalMarks = Number(selectedTest?.totalMarks || questions.reduce((sum, question) => sum + Number(question.marks || 1), 0));
-  const resultRank = overview.dashboard.latestMockTest && selectedTest?._id && overview.dashboard.latestMockTest.testId === selectedTest._id
-    ? overview.dashboard.latestMockTest.rank
-    : null;
+  const resultTotalMarks = Number(currentSubmittedAttempt?.totalMarks || selectedTest?.totalMarks || questions.reduce((sum, question) => sum + Number(question.marks || 1), 0));
+  const resultRank = currentSubmittedAttempt?.rank
+    ?? (overview.dashboard.latestMockTest && selectedTest?._id && overview.dashboard.latestMockTest.testId === selectedTest._id
+      ? overview.dashboard.latestMockTest.rank
+      : null);
   const solutionFilterSummary = [
     { id: 'all', label: `All (${attemptResults.length})`, tone: 'active' as const },
     { id: 'correct', label: `Correct (${correctCount})`, tone: 'success' as const },
@@ -1047,7 +1207,17 @@ export const TestSeriesFigmaTab = ({
     { id: 'unattempted', label: `Unattempted (${unattemptedCount})`, tone: 'neutral' as const },
   ];
   const getSessionForTest = (testId?: string | null) => (testId ? attemptSessions[testId] || null : null);
-  const getAttemptStatusForTest = (testId?: string | null): AttemptStatus => getSessionForTest(testId)?.status || 'not-started';
+  const getAttemptStatusForTest = (testId?: string | null): AttemptStatus => {
+    if (!testId) {
+      return 'not-started';
+    }
+
+    if (submittedAttempts[testId]) {
+      return 'completed';
+    }
+
+    return getSessionForTest(testId)?.status || 'not-started';
+  };
   const getAttemptProgressForTest = (testId?: string | null, totalQuestions = 0) => {
     const session = getSessionForTest(testId);
     if (!session || totalQuestions <= 0) {
@@ -1058,19 +1228,139 @@ export const TestSeriesFigmaTab = ({
   };
   const getAttemptActionLabel = (status: AttemptStatus) => {
     if (status === 'completed') {
-      return 'Completed';
+      return 'View Result';
     }
     if (status === 'in-progress') {
       return 'Resume';
     }
     return 'Start Now';
   };
+  const pauseSummaryRows = useMemo(() => {
+    const configuredSections = Array.isArray(selectedTest?.sectionBreakup) && selectedTest.sectionBreakup.length > 0
+      ? selectedTest.sectionBreakup
+      : [{ name: 'PART-A', questions: questions.length }];
+    let offset = 0;
+
+    return configuredSections.map((section, sectionIndex) => {
+      const totalQuestions = Math.max(Number(section.questions || 0), 0);
+      const start = offset;
+      const end = Math.min(offset + totalQuestions, committedStates.length);
+      const sectionStates = committedStates.slice(start, end);
+      offset += totalQuestions;
+
+      const answered = sectionStates.filter((state) => state === 'answered' || state === 'answered-review').length;
+      const notAnswered = sectionStates.filter((state) => state === 'unanswered').length;
+      const markedForReview = sectionStates.filter((state) => state === 'review' || state === 'answered-review').length;
+      const notVisited = sectionStates.filter((state) => state === 'unvisited').length;
+
+      return {
+        id: `${section.name || 'section'}-${sectionIndex}`,
+        title: section.name || `Section ${sectionIndex + 1}`,
+        totalQuestions,
+        answered,
+        notAnswered,
+        markedForReview,
+        notVisited,
+      };
+    });
+  }, [committedStates, questions.length, selectedTest?.sectionBreakup]);
+  const pauseSummaryTotals = useMemo(
+    () => ({
+      totalQuestions: pauseSummaryRows.reduce((sum, row) => sum + row.totalQuestions, 0),
+      answered: pauseSummaryRows.reduce((sum, row) => sum + row.answered, 0),
+      notAnswered: pauseSummaryRows.reduce((sum, row) => sum + row.notAnswered, 0),
+      markedForReview: pauseSummaryRows.reduce((sum, row) => sum + row.markedForReview, 0),
+      notVisited: pauseSummaryRows.reduce((sum, row) => sum + row.notVisited, 0),
+    }),
+    [pauseSummaryRows],
+  );
 
   useEffect(() => {
     if (!selectedSeriesId && fullMockTests[0]?._id) {
       setSelectedSeriesId(fullMockTests[0]._id);
     }
   }, [fullMockTests, selectedSeriesId]);
+
+  useEffect(() => {
+    setAttemptSessions(readDraftSessions(learnerId));
+    resumeBootstrapCompleteRef.current = false;
+  }, [learnerId]);
+
+  useEffect(() => {
+    writeDraftSessions(learnerId, attemptSessions);
+  }, [attemptSessions, learnerId]);
+
+  useEffect(() => {
+    if (resumeBootstrapCompleteRef.current) {
+      return;
+    }
+
+    const resumableEntries = Object.entries(attemptSessions)
+      .filter(([, session]) => session.status === 'in-progress')
+      .sort(([, left], [, right]) => {
+        const leftUpdatedAt = new Date(left.updatedAt || left.startedAt || 0).getTime();
+        const rightUpdatedAt = new Date(right.updatedAt || right.startedAt || 0).getTime();
+        return rightUpdatedAt - leftUpdatedAt;
+      });
+
+    resumeBootstrapCompleteRef.current = true;
+
+    const nextResumable = resumableEntries[0];
+    if (!nextResumable) {
+      return;
+    }
+
+    const [testId] = nextResumable;
+    hydratedTestIdRef.current = null;
+    setSelectedSeriesId(testId);
+    setScreen('exam');
+  }, [attemptSessions]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadAttempts = async () => {
+      if (!learnerId) {
+        setSubmittedAttempts({});
+        return;
+      }
+
+      try {
+        setAttemptError('');
+        const attempts = await EduService.listMockTestAttempts();
+        if (cancelled) {
+          return;
+        }
+
+        const nextAttempts = attempts.reduce<Record<string, TestAttemptResult>>((accumulator, attempt) => {
+          if (!attempt?.testId || accumulator[attempt.testId]) {
+            return accumulator;
+          }
+          accumulator[attempt.testId] = attempt;
+          return accumulator;
+        }, {});
+
+        setSubmittedAttempts(nextAttempts);
+        setAttemptSessions((current) => {
+          const next = { ...current };
+          Object.keys(nextAttempts).forEach((testId) => {
+            delete next[testId];
+          });
+          return next;
+        });
+      } catch (error) {
+        if (!cancelled) {
+          setAttemptError(error instanceof Error ? error.message : 'Unable to load your test attempts right now.');
+        }
+      }
+    };
+
+    void loadAttempts();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [learnerId]);
 
   useEffect(() => {
     const nextTestId = selectedTest?._id;
@@ -1148,6 +1438,20 @@ export const TestSeriesFigmaTab = ({
   }, [screen]);
 
   useEffect(() => {
+    if (screen !== 'exam' || currentAttemptStatus !== 'in-progress') {
+      return undefined;
+    }
+
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [currentAttemptStatus, screen]);
+
+  useEffect(() => {
     if (!currentTestId) {
       return;
     }
@@ -1164,6 +1468,8 @@ export const TestSeriesFigmaTab = ({
         defaultLanguage,
         selectedLanguage,
         confirmationAccepted,
+        startedAt: current[currentTestId]?.startedAt || (currentAttemptStatus === 'in-progress' ? new Date().toISOString() : null),
+        updatedAt: new Date().toISOString(),
       },
     }));
   }, [
@@ -1243,10 +1549,57 @@ export const TestSeriesFigmaTab = ({
     setScreen('instructions');
   };
 
-  const restartCurrentAttempt = () => {
-    clearAttemptSession(currentTestId);
-    resetAttemptState();
-    setScreen('instructions');
+  const goToScreenWithPauseHandling = (target: ExitPromptTarget) => {
+    if (screen === 'exam' && currentAttemptStatus === 'in-progress') {
+      commitCurrentDraft();
+      setExitPromptTarget(target);
+      return;
+    }
+
+    setScreen(target);
+  };
+
+  const confirmPauseAndExit = () => {
+    const target = exitPromptTarget;
+    setExitPromptTarget(null);
+    if (!target) {
+      return;
+    }
+    setDesktopExamPanel(null);
+    setMobilePaletteOpen(false);
+    setScreen(target);
+  };
+
+  const continuePausedExam = () => {
+    setExitPromptTarget(null);
+  };
+
+  const openPauseDialog = () => {
+    if (screen !== 'exam' || currentAttemptStatus !== 'in-progress') {
+      return;
+    }
+
+    commitCurrentDraft();
+    setPauseDialogStep('confirm');
+  };
+
+  const closePauseDialog = () => {
+    setPauseDialogStep(null);
+  };
+
+  const continueToPauseSummary = () => {
+    setPauseDialogStep('summary');
+  };
+
+  const resumeFromPauseDialog = () => {
+    setPauseDialogStep(null);
+  };
+
+  const openTestsFromPauseDialog = () => {
+    setPauseDialogStep(null);
+    setDesktopExamPanel(null);
+    setMobilePaletteOpen(false);
+    setScreen('detail');
   };
 
   const toggleSavedSeries = (seriesId: string) => {
@@ -1263,6 +1616,47 @@ export const TestSeriesFigmaTab = ({
     }
 
     onOpenLiveClass?.(liveClassId);
+  };
+
+  const closeCompanionVideo = () => {
+    setActiveCompanionVideoPlayback(null);
+    setActiveCompanionVideoTest(null);
+    setCompanionVideoError('');
+    setLoadingCompanionVideo(false);
+  };
+
+  const openCompanionVideo = async (testId: string | null) => {
+    if (!testId) {
+      return;
+    }
+
+    const targetTest = fullMockTests.find((entry) => entry._id === testId) || null;
+    if (!targetTest?.companionVideo?.available) {
+      return;
+    }
+
+    setActiveCompanionVideoTest(targetTest);
+    setCompanionVideoError('');
+    setActiveCompanionVideoPlayback(null);
+    setLoadingCompanionVideo(true);
+
+    try {
+      const playback = await EduService.getProtectedMockTestVideoPlayback(testId);
+      setActiveCompanionVideoPlayback(playback);
+    } catch (error) {
+      setCompanionVideoError(error instanceof Error ? error.message : 'Unable to load the test video right now.');
+    } finally {
+      setLoadingCompanionVideo(false);
+    }
+  };
+
+  const openCompanionAction = (card: ResolvedDetailTestCard) => {
+    if (card.companionMode === 'video') {
+      void openCompanionVideo(card.mockTestId);
+      return;
+    }
+
+    openLinkedLiveClass(card.liveClassId);
   };
 
   const goToQuestion = (index: number) => {
@@ -1325,20 +1719,69 @@ export const TestSeriesFigmaTab = ({
   };
 
   const beginExam = () => {
+    if (currentSubmittedAttempt) {
+      setScreen('result');
+      return;
+    }
+
+    const existingSession = currentTestId ? attemptSessions[currentTestId] : null;
     setSelectedLanguage(defaultLanguage || 'English');
     setDesktopExamPanel(null);
     setMobilePaletteOpen(false);
-    setVisitedQuestions({ 0: true });
-    setCurrentIndex(0);
+    setVisitedQuestions((existingSession?.visitedQuestions && Object.keys(existingSession.visitedQuestions).length > 0)
+      ? existingSession.visitedQuestions
+      : { 0: true });
+    setCurrentIndex(existingSession?.currentIndex ?? 0);
+    setTimeLeft(existingSession?.timeLeft ?? Math.max(Number(selectedTest?.durationMinutes || 0), 0) * 60);
     setScreen('exam');
   };
 
-  const submitExam = () => {
+  const submitExam = async () => {
+    if (!selectedTest?._id || submittingExam || currentSubmittedAttempt) {
+      if (currentSubmittedAttempt) {
+        setScreen('result');
+      }
+      return;
+    }
+
     commitCurrentDraft();
     setDesktopExamPanel(null);
     setMobilePaletteOpen(false);
-    setScreen('result');
-    void onRefresh();
+    setSubmittingExam(true);
+    setAttemptError('');
+
+    try {
+      const effectiveAnswers = (() => {
+        const next = { ...answers };
+        if (draftAnswer.length === 0) {
+          delete next[currentIndex];
+        } else {
+          next[currentIndex] = draftAnswer;
+        }
+        return questions.reduce<Record<string, number | number[]>>((accumulator, question, index) => {
+          const selectedIndexes = getAnswerIndexes(next[index]);
+          if (selectedIndexes.length > 0) {
+            accumulator[question.id] = question.correctIndexes.length > 1 ? selectedIndexes : selectedIndexes[0];
+          }
+          return accumulator;
+        }, {});
+      })();
+
+      const startedAt = attemptSessions[currentTestId]?.startedAt || new Date().toISOString();
+      const attempt = await EduService.submitMockTest(selectedTest._id, effectiveAnswers, startedAt);
+
+      setSubmittedAttempts((current) => ({
+        ...current,
+        [attempt.testId]: attempt,
+      }));
+      clearAttemptSession(attempt.testId);
+      setScreen('result');
+      await onRefresh();
+    } catch (error) {
+      setAttemptError(error instanceof Error ? error.message : 'Unable to submit the test right now.');
+    } finally {
+      setSubmittingExam(false);
+    }
   };
 
   const desktopHome = (
@@ -1395,33 +1838,42 @@ export const TestSeriesFigmaTab = ({
 
           <section className="mt-[18px]">
             <p className="text-[16px] font-semibold text-[#1f2737]">Your Enrolled Test Series</p>
-            <div className="mt-[12px] grid grid-cols-5 gap-[10px]">
-              {enrolledSeries.map((item) => (
-                <button key={item.title} type="button" className="flex items-center gap-[10px] rounded-[12px] border border-[#e8eef6] bg-white px-[12px] py-[12px] text-left shadow-[0_8px_18px_rgba(18,39,74,0.04)]">
-                  <div
-                    className={cn(
-                      'flex h-[34px] w-[34px] items-center justify-center rounded-[10px]',
-                      item.iconTone === 'blue' && 'bg-[#eef4ff] text-[#3070e6]',
-                      item.iconTone === 'orange' && 'bg-[#fff3ea] text-[#f29f47]',
-                      item.iconTone === 'ink' && 'bg-[#f6f7fb] text-[#1c2640]',
-                    )}
-                  >
-                    {item.iconTone === 'ink' ? <UserCircle2 className="h-4 w-4" /> : <FileText className="h-4 w-4" />}
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-[12px] font-semibold text-[#273248]">{item.title}</p>
-                    <p className="mt-[4px] text-[10px] text-[#98a2b3]">{item.subtitle}</p>
-                  </div>
-                  <ChevronRight className="h-4 w-4 text-[#a0acbc]" />
-                </button>
-              ))}
-            </div>
+            {enrolledSeries.length > 0 ? (
+              <div className="mt-[12px] grid grid-cols-5 gap-[10px]">
+                {enrolledSeries.map((item) => (
+                  <button key={item.title} type="button" className="flex items-center gap-[10px] rounded-[12px] border border-[#e8eef6] bg-white px-[12px] py-[12px] text-left shadow-[0_8px_18px_rgba(18,39,74,0.04)]">
+                    <div
+                      className={cn(
+                        'flex h-[34px] w-[34px] items-center justify-center rounded-[10px]',
+                        item.iconTone === 'blue' && 'bg-[#eef4ff] text-[#3070e6]',
+                        item.iconTone === 'orange' && 'bg-[#fff3ea] text-[#f29f47]',
+                        item.iconTone === 'ink' && 'bg-[#f6f7fb] text-[#1c2640]',
+                      )}
+                    >
+                      {item.iconTone === 'ink' ? <UserCircle2 className="h-4 w-4" /> : <FileText className="h-4 w-4" />}
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-[12px] font-semibold text-[#273248]">{item.title}</p>
+                      <p className="mt-[4px] text-[10px] text-[#98a2b3]">{item.subtitle}</p>
+                    </div>
+                    <ChevronRight className="h-4 w-4 text-[#a0acbc]" />
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="mt-[12px] rounded-[14px] border border-dashed border-[#d8e2f0] bg-white px-[14px] py-[16px] shadow-[0_8px_18px_rgba(18,39,74,0.03)]">
+                <p className="text-[12px] font-semibold text-[#273248]">No enrolled mock tests yet</p>
+                <p className="mt-[6px] text-[11px] leading-5 text-[#7d8ca3]">
+                  Buy a course to unlock its linked mock tests here. Students only get access to the mock series attached to their purchased course.
+                </p>
+              </div>
+            )}
           </section>
 
           <section className="mt-[18px]">
             <div className="flex items-center justify-between">
               <p className="text-[16px] font-semibold text-[#1f2737]">
-                Live Tests &amp; <span className="text-[#35bb6f]">Free</span> Quizzes
+                Live Tests &amp; <span className="text-[#35bb6f]">Practice</span> Quizzes
               </p>
               <button className="text-[11px] font-semibold text-[#4590ef]">View All</button>
             </div>
@@ -1531,7 +1983,7 @@ export const TestSeriesFigmaTab = ({
                     <button
                       type="button"
                       data-testid="tests-live-companion-featured-desktop"
-                      onClick={() => openLinkedLiveClass(featuredDetailCard.liveClassId)}
+                      onClick={() => openCompanionAction(featuredDetailCard)}
                       className={cn(
                         'flex h-[30px] min-w-[124px] items-center justify-center rounded-[6px] border px-[12px] text-[11px] font-semibold',
                         companionActionToneClasses[featuredDetailCard.companionTone],
@@ -1571,7 +2023,7 @@ export const TestSeriesFigmaTab = ({
                             <button
                               type="button"
                               data-testid={`tests-live-companion-desktop-${card.id}`}
-                              onClick={() => openLinkedLiveClass(card.liveClassId)}
+                              onClick={() => openCompanionAction(card)}
                               className={cn(
                                 'flex h-[28px] min-w-[132px] items-center justify-center rounded-[6px] border px-[12px] text-[11px] font-semibold',
                                 companionActionToneClasses[card.companionTone],
@@ -1680,7 +2132,7 @@ export const TestSeriesFigmaTab = ({
             <li>Try not to guess the answer as there is negative marking.</li>
             <li>You will be awarded 3 mark for each correct answer and 1 will be deducted for each wrong answer.</li>
             <li>There is no negative marking for the questions that you have not attempted.</li>
-            <li>You can submit this test and reattempt it later if needed. Make sure you complete or submit the current attempt before leaving.</li>
+            <li>You can submit this test only once. If you leave before submitting, your test stays paused and you can resume it later.</li>
           </ol>
 
           <div className="mt-8 border-y border-slate-200 py-6">
@@ -1717,7 +2169,7 @@ export const TestSeriesFigmaTab = ({
               <span>
                 I have read all the instructions carefully and have understood them. I agree not to cheat or use unfair means in this examination. I understand
                 that using unfair means of any sort for my own or someone else&apos;s advantage will lead to my immediate disqualification. The decision of
-                VARONENGLISH will be final in these matters and cannot be appealed.
+                VaronEnglish will be final in these matters and cannot be appealed.
               </span>
             </label>
           </div>
@@ -1894,7 +2346,12 @@ export const TestSeriesFigmaTab = ({
           <button type="button" onClick={() => void document.documentElement.requestFullscreen?.()} className="flex h-11 w-11 items-center justify-center rounded-[4px] border border-[#37b3eb] bg-white text-[#37b3eb]">
             <Expand className="h-4 w-4" />
           </button>
-          <button type="button" className="flex h-11 w-11 items-center justify-center rounded-[4px] border border-[#37b3eb] bg-white text-[#37b3eb]">
+          <button
+            type="button"
+            onClick={openPauseDialog}
+            data-testid="tests-pause-trigger"
+            className="flex h-11 w-11 items-center justify-center rounded-[4px] border border-[#37b3eb] bg-white text-[#37b3eb]"
+          >
             <Pause className="h-4 w-4" />
           </button>
           <div className="px-1 text-right">
@@ -1980,13 +2437,15 @@ export const TestSeriesFigmaTab = ({
                 <button
                   type="button"
                   data-testid="tests-exam-submit-desktop"
-                  onClick={submitExam}
-                  className="min-w-[114px] rounded-[4px] bg-[#2f69d9] px-4 py-[8px] text-[12px] font-semibold text-white"
+                  onClick={() => void submitExam()}
+                  disabled={submittingExam}
+                  className="min-w-[114px] rounded-[4px] bg-[#2f69d9] px-4 py-[8px] text-[12px] font-semibold text-white disabled:opacity-60"
                 >
-                  Submit Test
+                  {submittingExam ? 'Submitting...' : 'Submit Test'}
                 </button>
               </div>
             </div>
+            {attemptError && <p className="text-[12px] font-medium text-[#d13f3f]">{attemptError}</p>}
 
             <div />
           </div>
@@ -2141,16 +2600,6 @@ export const TestSeriesFigmaTab = ({
           <p className="truncate text-[16px] font-semibold text-[#1e2f5a]">Hi {learnerDisplayName}</p>
           <p className="mt-[4px] text-[12px] leading-5 text-[#7284a7]">Pick up your next mock without the extra clutter.</p>
         </div>
-      </div>
-
-      <div className="mt-[14px] flex items-center gap-[10px]">
-        <div className="flex h-[46px] min-w-0 flex-1 items-center gap-3 rounded-[16px] border border-[#e5ebf5] bg-white px-[14px] text-[13px] text-[#96a1b4] shadow-[0_8px_18px_rgba(16,24,40,0.05)]">
-          <Search className="h-4 w-4" />
-          <span className="truncate">Search for tests, classes...</span>
-        </div>
-        <button className="flex h-[46px] w-[46px] items-center justify-center rounded-[16px] border border-[#e5ebf5] bg-white text-[#223357] shadow-[0_8px_18px_rgba(16,24,40,0.05)]">
-          <ListFilter className="h-[18px] w-[18px]" />
-        </button>
       </div>
 
       <button
@@ -2376,13 +2825,24 @@ export const TestSeriesFigmaTab = ({
         {featuredDetailCard && (
         <div className="mt-[10px] grid grid-cols-[minmax(0,1fr)_140px] items-center gap-0 rounded-[16px] border border-[#e7edf8] bg-white/92 px-[12px] py-[9px]">
           <div className="flex min-w-0 items-center gap-[10px] border-r border-[#e8eef7] pr-[12px]">
-            <div className="flex h-[36px] w-[36px] items-center justify-center rounded-[11px] bg-[#eefbf2] text-[#1f9c5a]">
+            <div className={cn(
+              'flex h-[36px] w-[36px] items-center justify-center rounded-[11px]',
+              featuredDetailCard.companionTone === 'emerald'
+                ? 'bg-[#eefbf2] text-[#1f9c5a]'
+                : featuredDetailCard.companionTone === 'blue'
+                  ? 'bg-[#eef4ff] text-[#2f78eb]'
+                  : 'bg-[#fff6ea] text-[#d88928]',
+            )}>
               <Video className="h-[16px] w-[16px]" />
             </div>
             <div className="min-w-0">
               <div className="flex items-center gap-[8px]">
-                <p className="whitespace-nowrap text-[11px] font-semibold text-[#1e2f5a]">Live Class</p>
-                <span className="rounded-full bg-[#ffefef] px-[7px] py-[2px] text-[10px] font-semibold text-[#ff5b57]">LIVE</span>
+                <p className="whitespace-nowrap text-[11px] font-semibold text-[#1e2f5a]">
+                  {featuredDetailCard.companionMode === 'live' ? 'Live Class' : featuredDetailCard.companionAction}
+                </p>
+                {featuredDetailCard.companionMode === 'live' && (
+                  <span className="rounded-full bg-[#ffefef] px-[7px] py-[2px] text-[10px] font-semibold text-[#ff5b57]">LIVE</span>
+                )}
               </div>
               <p className="mt-[2px] text-[10px] text-[#607394]">{featuredDetailCard.companionPrimaryMeta}</p>
               {featuredDetailCard.companionSecondaryMeta && (
@@ -2390,9 +2850,21 @@ export const TestSeriesFigmaTab = ({
               )}
             </div>
           </div>
-          <button type="button" data-testid="tests-live-companion-featured-mobile" onClick={() => openLinkedLiveClass(featuredDetailCard.liveClassId)} className="ml-[12px] inline-flex h-[40px] items-center justify-center gap-[8px] rounded-[12px] border border-[#cfeedd] bg-[#effcf4] px-[10px] text-[11px] font-semibold text-[#1f9c5a]">
+          <button
+            type="button"
+            data-testid="tests-live-companion-featured-mobile"
+            onClick={() => openCompanionAction(featuredDetailCard)}
+            className={cn(
+              'ml-[12px] inline-flex h-[40px] items-center justify-center gap-[8px] rounded-[12px] border px-[10px] text-[11px] font-semibold',
+              featuredDetailCard.companionTone === 'emerald'
+                ? 'border-[#cfeedd] bg-[#effcf4] text-[#1f9c5a]'
+                : featuredDetailCard.companionTone === 'blue'
+                  ? 'border-[#dce7ff] bg-[#eef4ff] text-[#2f78eb]'
+                  : 'border-[#ffe3bb] bg-[#fff7eb] text-[#d88928]',
+            )}
+          >
             <Video className="h-[14px] w-[14px]" />
-            {featuredDetailCard.companionAction}
+            {featuredDetailCard.companionButtonLabel}
           </button>
         </div>
         )}
@@ -2464,7 +2936,7 @@ export const TestSeriesFigmaTab = ({
                     <button
                       type="button"
                       data-testid={`tests-live-companion-mobile-${card.id}`}
-                      onClick={() => openLinkedLiveClass(card.liveClassId)}
+                      onClick={() => openCompanionAction(card)}
                       className="flex h-[34px] items-center justify-center rounded-[10px] border border-[#cfeedd] bg-[#effcf4] text-[10px] font-semibold text-[#1f9c5a]"
                     >
                       {card.companionButtonLabel}
@@ -2490,7 +2962,7 @@ export const TestSeriesFigmaTab = ({
                   <button
                     type="button"
                     data-testid={`tests-live-companion-mobile-${card.id}`}
-                    onClick={() => openLinkedLiveClass(card.liveClassId)}
+                    onClick={() => openCompanionAction(card)}
                     className={cn(
                       'mt-[10px] flex h-[30px] w-full items-center justify-center rounded-[10px] border text-[10px] font-semibold',
                       companionActionToneClasses[card.companionTone],
@@ -2519,7 +2991,7 @@ export const TestSeriesFigmaTab = ({
         {renderMobileInstructionBody()}
       </div>
       <button type="button" data-testid="tests-instructions-next-mobile" onClick={() => setScreen('confirmation')} className="mt-[16px] flex h-[42px] items-center justify-center rounded-[8px] bg-[#2f8df4] text-[14px] font-semibold text-white">Next</button>
-      <button type="button" onClick={() => setScreen('detail')} className="mt-[12px] text-center text-[14px] font-semibold text-[#2f8df4]">Go to Tests</button>
+      <button type="button" onClick={() => goToScreenWithPauseHandling('detail')} className="mt-[12px] text-center text-[14px] font-semibold text-[#2f8df4]">Go to Tests</button>
     </>
   ));
 
@@ -2544,7 +3016,7 @@ export const TestSeriesFigmaTab = ({
           <li>Try not to guess the answer as there is negative marking.</li>
           <li>You will be awarded 3 mark for each correct answer and 1 will be deducted for each wrong answer.</li>
           <li>There is no negative marking for the questions that you have not attempted.</li>
-          <li>You can reattempt this test later if you want to improve your score.</li>
+          <li>You can submit this test only once. If you leave before submitting, your test stays paused and you can resume it later.</li>
         </ol>
         <div className="mt-[16px]">
           <label className="text-[12px] font-semibold text-[#1f2737]">Choose your default language:</label>
@@ -2645,9 +3117,10 @@ export const TestSeriesFigmaTab = ({
         <button type="button" onClick={saveAndNext} className="flex h-[38px] flex-1 items-center justify-center rounded-[8px] bg-[#2f8df4] text-[12px] font-semibold text-white">Save &amp; Next</button>
       </div>
       <div className="mt-[10px] grid grid-cols-2 gap-[10px]">
-        <button type="button" onClick={() => setScreen('detail')} className="flex h-[40px] items-center justify-center rounded-[8px] border border-[#d9e1eb] text-[12px] font-semibold text-[#47556d]">Go to Tests</button>
-        <button type="button" data-testid="tests-exam-submit-mobile" onClick={submitExam} className="flex h-[40px] items-center justify-center rounded-[8px] bg-[#1f9c5a] text-[12px] font-semibold text-white">Submit Test</button>
+        <button type="button" onClick={() => goToScreenWithPauseHandling('detail')} className="flex h-[40px] items-center justify-center rounded-[8px] border border-[#d9e1eb] text-[12px] font-semibold text-[#47556d]">Go to Tests</button>
+        <button type="button" data-testid="tests-exam-submit-mobile" onClick={() => void submitExam()} disabled={submittingExam} className="flex h-[40px] items-center justify-center rounded-[8px] bg-[#1f9c5a] text-[12px] font-semibold text-white disabled:opacity-60">{submittingExam ? 'Submitting...' : 'Submit Test'}</button>
       </div>
+      {attemptError && <p className="mt-[10px] text-[12px] font-medium text-[#d13f3f]">{attemptError}</p>}
     </>
   ));
 
@@ -2678,9 +3151,10 @@ export const TestSeriesFigmaTab = ({
         <div className="flex items-center justify-between"><span className="flex items-center gap-[8px]"><span className="h-[10px] w-[10px] rounded-[2px] bg-[#8f51d9]" />Mark for Review</span><span className="font-semibold text-[#8f51d9]">{markReviewCount}</span></div>
       </div>
       <div className="mt-[18px] grid grid-cols-2 gap-[10px]">
-        <button type="button" onClick={() => setScreen('detail')} className="flex h-[40px] items-center justify-center rounded-[8px] border border-[#d9e1eb] text-[12px] font-semibold text-[#47556d]">Go to Tests</button>
-        <button type="button" onClick={submitExam} className="flex h-[40px] items-center justify-center rounded-[8px] bg-[#1f9c5a] text-[12px] font-semibold text-white">Submit Test</button>
+        <button type="button" onClick={() => goToScreenWithPauseHandling('detail')} className="flex h-[40px] items-center justify-center rounded-[8px] border border-[#d9e1eb] text-[12px] font-semibold text-[#47556d]">Go to Tests</button>
+        <button type="button" onClick={() => void submitExam()} disabled={submittingExam} className="flex h-[40px] items-center justify-center rounded-[8px] bg-[#1f9c5a] text-[12px] font-semibold text-white disabled:opacity-60">{submittingExam ? 'Submitting...' : 'Submit Test'}</button>
       </div>
+      {attemptError && <p className="mt-[10px] text-[12px] font-medium text-[#d13f3f]">{attemptError}</p>}
       <button type="button" data-testid="tests-palette-close-mobile" onClick={() => setMobilePaletteOpen(false)} className="mt-auto flex h-[42px] w-full items-center justify-center rounded-[8px] bg-[#2f8df4] text-[14px] font-semibold text-white">Close</button>
     </>
   ));
@@ -2703,16 +3177,12 @@ export const TestSeriesFigmaTab = ({
           <div className="rounded-[12px] border border-[#edf2f7] p-[10px]"><p className="text-[11px] text-[#7c889d]">Correct / Wrong</p><p className="mt-[6px] text-[18px] font-semibold text-[#1f2737]">{correctCount} / {incorrectCount}</p></div>
         </div>
         <div className="mt-[18px] grid grid-cols-2 gap-[10px]">
-          <button type="button" data-testid="tests-view-solutions" onClick={() => setScreen('solutions')} className="flex h-[40px] items-center justify-center rounded-[8px] border border-[#2f8df4] text-[13px] font-semibold text-[#2f8df4]">View Solutions</button>
+        <button type="button" data-testid="tests-view-solutions" onClick={() => setScreen('solutions')} className="flex h-[40px] items-center justify-center rounded-[8px] border border-[#2f8df4] text-[13px] font-semibold text-[#2f8df4]">View Solutions</button>
           <button type="button" onClick={() => setScreen('solutions')} className="flex h-[40px] items-center justify-center rounded-[8px] bg-[#2f8df4] text-[13px] font-semibold text-white">View Analysis</button>
         </div>
       </div>
       <div className="mt-[18px] rounded-[18px] border border-[#ebeef6] bg-white px-[18px] py-[18px] shadow-[0_10px_24px_rgba(18,39,74,0.06)]">
         <p className="text-[15px] font-semibold text-[#1f2737]">Other Actions</p>
-        <button type="button" onClick={restartCurrentAttempt} className="mt-[14px] flex w-full items-center justify-between rounded-[12px] border border-[#edf2f7] px-[14px] py-[12px] text-[13px] text-[#47556d]">
-          <span>Attempt Again</span>
-          <ChevronRight className="h-4 w-4" />
-        </button>
         <button type="button" onClick={() => { resetAttemptState(); setScreen('home'); }} className="mt-[10px] flex w-full items-center justify-between rounded-[12px] border border-[#edf2f7] px-[14px] py-[12px] text-[13px] text-[#47556d]">
           <span>Go to Test Series</span>
           <ChevronRight className="h-4 w-4" />
@@ -2746,7 +3216,6 @@ export const TestSeriesFigmaTab = ({
         ))}
         </div>
         <div className="mt-[12px] grid grid-cols-2 gap-[10px]">
-          <button type="button" onClick={restartCurrentAttempt} className="flex h-[40px] items-center justify-center rounded-[8px] border border-[#2f8df4] text-[12px] font-semibold text-[#2f8df4]">Reattempt</button>
           <button type="button" onClick={() => setScreen('detail')} className="flex h-[40px] items-center justify-center rounded-[8px] bg-[#2f8df4] text-[12px] font-semibold text-white">Go to Tests</button>
         </div>
       <div className="mt-[16px] space-y-[16px]">
@@ -2808,9 +3277,6 @@ export const TestSeriesFigmaTab = ({
           <button type="button" data-testid="tests-view-solutions-desktop" onClick={() => setScreen('solutions')} className="flex h-[42px] items-center justify-center rounded-[8px] border border-[#2f8df4] px-[18px] text-[13px] font-semibold text-[#2f8df4]">View Solutions</button>
           <button type="button" onClick={() => setScreen('detail')} className="flex h-[42px] items-center justify-center rounded-[8px] bg-[#2f8df4] px-[18px] text-[13px] font-semibold text-white">Go to Tests</button>
         </div>
-        <div className="mt-[14px] flex justify-center">
-          <button type="button" onClick={restartCurrentAttempt} className="flex h-[42px] items-center justify-center rounded-[8px] border border-[#2f8df4] px-[18px] text-[13px] font-semibold text-[#2f8df4]">Attempt Again</button>
-        </div>
       </div>
     </div>
   );
@@ -2821,7 +3287,6 @@ export const TestSeriesFigmaTab = ({
         <div className="flex items-center justify-between">
           <p className="text-[24px] font-semibold text-[#1f2737]">Solutions</p>
           <div className="flex items-center gap-[12px]">
-            <button type="button" onClick={restartCurrentAttempt} className="text-[13px] font-semibold text-[#2f8df4]">Reattempt</button>
             <button type="button" onClick={() => setScreen('detail')} className="text-[13px] font-semibold text-[#2f8df4]">Go to tests</button>
             <button type="button" onClick={() => setScreen('result')} className="text-[13px] font-semibold text-[#2f8df4]">Back to result</button>
           </div>
@@ -2879,6 +3344,247 @@ export const TestSeriesFigmaTab = ({
     </div>
   );
 
+  const examExitPrompt = exitPromptTarget ? (
+    <div className="fixed inset-0 z-[80] flex items-center justify-center bg-[rgba(15,23,42,0.52)] px-4">
+      <div className="w-full max-w-[830px] overflow-hidden rounded-[6px] bg-white shadow-[0_24px_60px_rgba(15,23,42,0.28)]">
+        <div className="border-b border-[#e5e7eb] px-5 py-5">
+          <p className="text-[18px] font-medium text-[#1f2737]">Are you sure you want to pause the test?</p>
+        </div>
+        <div className="flex justify-end gap-6 px-5 py-4">
+          <button
+            type="button"
+            onClick={continuePausedExam}
+            className="flex h-[44px] min-w-[72px] items-center justify-center rounded-[4px] px-4 text-[18px] font-medium text-[#111827]"
+          >
+            No
+          </button>
+          <button
+            type="button"
+            onClick={confirmPauseAndExit}
+            className="flex h-[48px] min-w-[68px] items-center justify-center rounded-[4px] bg-[#1ea7d7] px-5 text-[18px] font-medium text-white"
+          >
+            Yes
+          </button>
+        </div>
+      </div>
+    </div>
+  ) : null;
+
+  const pauseDialog = pauseDialogStep ? (
+    <div data-testid="tests-pause-dialog" className="fixed inset-0 z-[85] flex items-center justify-center bg-[rgba(15,23,42,0.46)] backdrop-blur-[3px] px-4 py-8">
+      {pauseDialogStep === 'confirm' ? (
+        <div data-testid="tests-pause-confirm" className="w-full max-w-[520px] overflow-hidden rounded-[24px] border border-white/70 bg-[linear-gradient(180deg,#ffffff_0%,#f8fbff_100%)] shadow-[0_28px_70px_rgba(15,23,42,0.24)]">
+          <div className="px-7 pb-6 pt-7">
+            <div className="flex items-start gap-4">
+              <div className="flex h-[54px] w-[54px] shrink-0 items-center justify-center rounded-[18px] bg-[linear-gradient(180deg,#e8f8ff_0%,#d7f1ff_100%)] text-[#1a9fcb] shadow-[inset_0_1px_0_rgba(255,255,255,0.8)]">
+                <Pause className="h-6 w-6" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-[22px] font-semibold tracking-[-0.02em] text-[#172033]">Pause Test</p>
+                <p className="mt-2 text-[15px] leading-[1.7] text-[#5b6880]">
+                  You can pause now and return to the test series without losing your current progress.
+                </p>
+                <p className="mt-4 text-[18px] font-medium text-[#1f2737]">Are you sure you want to pause the test?</p>
+              </div>
+            </div>
+          </div>
+          <div className="flex items-center justify-end gap-3 border-t border-[#e7eef6] bg-white/80 px-7 py-5">
+            <button
+              data-testid="tests-pause-confirm-no"
+              type="button"
+              onClick={closePauseDialog}
+              className="flex h-[46px] min-w-[110px] items-center justify-center rounded-[14px] border border-[#d8e2ef] bg-white px-5 text-[15px] font-semibold text-[#334155] transition hover:bg-[#f8fbff]"
+            >
+              No
+            </button>
+            <button
+              data-testid="tests-pause-confirm-yes"
+              type="button"
+              onClick={continueToPauseSummary}
+              className="flex h-[46px] min-w-[136px] items-center justify-center rounded-[14px] bg-[linear-gradient(90deg,#15b8cf,#1799d4)] px-6 text-[15px] font-semibold text-white shadow-[0_14px_28px_rgba(23,153,212,0.28)] transition hover:brightness-[1.03]"
+            >
+              Yes, Pause
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div data-testid="tests-pause-summary" className="flex max-h-[calc(100vh-48px)] w-full max-w-[1120px] flex-col overflow-hidden rounded-[28px] border border-white/70 bg-[linear-gradient(180deg,#ffffff_0%,#f7fbff_100%)] shadow-[0_30px_80px_rgba(15,23,42,0.28)]">
+          <div className="border-b border-[#e6eef7] bg-[radial-gradient(circle_at_top_left,#e8fbff_0%,#f7fbff_42%,#ffffff_100%)] px-7 py-6">
+            <div className="flex flex-wrap items-start justify-between gap-4">
+              <div>
+                <div className="inline-flex items-center gap-2 rounded-full bg-[#e9fbff] px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-[#0f97bc]">
+                  <Pause className="h-3.5 w-3.5" />
+                  Paused
+                </div>
+                <p className="mt-3 text-[26px] font-semibold tracking-[-0.03em] text-[#172033]">Paused Test Summary</p>
+                <p className="mt-2 max-w-[680px] text-[14px] leading-[1.65] text-[#5b6880]">
+                  Your progress is safe. Review where you stopped, then either resume the exam or go back to the test series.
+                </p>
+              </div>
+              <div className="rounded-[20px] border border-[#dceaf6] bg-white/90 px-5 py-3 text-right shadow-[0_12px_28px_rgba(15,23,42,0.05)]">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-[#7b8ba3]">Time Left</p>
+                <p className="mt-2 text-[28px] font-semibold tracking-[0.08em] text-[#d43838]">{formatClock(timeLeft)}</p>
+              </div>
+            </div>
+            <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+              {[
+                { label: 'Total Questions', value: pauseSummaryTotals.totalQuestions, surfaceClass: 'bg-[linear-gradient(180deg,#eef5ff_0%,#f9fbff_100%)]', valueColor: 'text-[#224fbe]' },
+                { label: 'Answered', value: pauseSummaryTotals.answered, surfaceClass: 'bg-[linear-gradient(180deg,#ecfff4_0%,#f8fffb_100%)]', valueColor: 'text-[#1f9c5a]' },
+                { label: 'Not Answered', value: pauseSummaryTotals.notAnswered, surfaceClass: 'bg-[linear-gradient(180deg,#fff7ee_0%,#fffdfa_100%)]', valueColor: 'text-[#d9821e]' },
+                { label: 'Marked Review', value: pauseSummaryTotals.markedForReview, surfaceClass: 'bg-[linear-gradient(180deg,#f7efff_0%,#fcf9ff_100%)]', valueColor: 'text-[#8756d8]' },
+                { label: 'Not Visited', value: pauseSummaryTotals.notVisited, surfaceClass: 'bg-[linear-gradient(180deg,#f5f7fb_0%,#fbfcfe_100%)]', valueColor: 'text-[#52627c]' },
+              ].map((item) => (
+                <div key={item.label} className={`rounded-[18px] border border-[#deebf7] px-4 py-3 shadow-[0_10px_20px_rgba(15,23,42,0.04)] ${item.surfaceClass}`}>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-[#74839a]">{item.label}</p>
+                  <p className={`mt-2 text-[28px] font-semibold tracking-[-0.03em] ${item.valueColor}`}>{item.value}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto px-7 py-5">
+            <div className="overflow-hidden rounded-[22px] border border-[#d9e4ef] bg-white shadow-[0_10px_24px_rgba(15,23,42,0.04)]">
+              <table className="w-full border-collapse">
+                <thead>
+                  <tr className="bg-[linear-gradient(180deg,#18bfd2_0%,#139fc6_100%)] text-white">
+                    {['Section', 'No. of questions', 'Answered', 'Not Answered', 'Marked for Review', 'Not Visited'].map((label) => (
+                      <th key={label} className="border-r border-white/30 px-4 py-4 text-center text-[14px] font-semibold last:border-r-0">
+                        {label}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {pauseSummaryRows.map((row) => (
+                    <tr key={row.id} className="border-t border-[#d9e4ef] text-[#2b2f36] odd:bg-white even:bg-[#fbfdff]">
+                      <td className="border-r border-[#d9e4ef] px-4 py-3.5 text-center text-[15px] font-medium">{row.title}</td>
+                      <td className="border-r border-[#d9e4ef] px-4 py-3.5 text-center text-[15px]">{row.totalQuestions}</td>
+                      <td className="border-r border-[#d9e4ef] px-4 py-3.5 text-center text-[15px] text-[#1f9c5a]">{row.answered}</td>
+                      <td className="border-r border-[#d9e4ef] px-4 py-3.5 text-center text-[15px] text-[#d9821e]">{row.notAnswered}</td>
+                      <td className="border-r border-[#d9e4ef] px-4 py-3.5 text-center text-[15px] text-[#8756d8]">{row.markedForReview}</td>
+                      <td className="px-4 py-3.5 text-center text-[15px] text-[#52627c]">{row.notVisited}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-4 border-t border-[#e6eef7] bg-white/90 px-7 py-5">
+            <div>
+              <p className="text-[15px] font-semibold text-[#172033]">Ready when you are</p>
+              <p className="mt-1 text-[13px] text-[#6c7b92]">Resume instantly or return to the test series overview.</p>
+            </div>
+            <div className="flex items-center gap-3">
+              <button
+                data-testid="tests-pause-summary-tests"
+                type="button"
+                onClick={openTestsFromPauseDialog}
+                className="flex h-[48px] min-w-[126px] items-center justify-center rounded-[14px] border border-[#d7e4f1] bg-white px-5 text-[15px] font-semibold text-[#334155] transition hover:bg-[#f8fbff]"
+              >
+                Go to Tests
+              </button>
+              <button
+                data-testid="tests-pause-summary-resume"
+                type="button"
+                onClick={resumeFromPauseDialog}
+                className="flex h-[48px] min-w-[154px] items-center justify-center rounded-[14px] bg-[linear-gradient(90deg,#15b8cf,#1799d4)] px-6 text-[15px] font-semibold text-white shadow-[0_14px_28px_rgba(23,153,212,0.28)] transition hover:brightness-[1.03]"
+              >
+                Resume Test
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  ) : null;
+
+  const companionVideoModal = activeCompanionVideoTest ? (
+    <div className="fixed inset-0 z-[220] flex items-center justify-center bg-[rgba(9,16,29,0.74)] px-4 py-6 backdrop-blur-[3px]">
+      <div className="flex max-h-[92vh] w-full max-w-[1080px] flex-col overflow-hidden rounded-[28px] border border-white/14 bg-[#091321] text-white shadow-[0_28px_90px_rgba(2,8,23,0.48)]">
+        <div className="flex items-start justify-between gap-4 border-b border-white/10 px-6 py-5">
+          <div>
+            <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-white/48">Test Series Video</p>
+            <h3 className="mt-2 text-[24px] font-semibold tracking-[-0.03em]">
+              {activeCompanionVideoTest.companionVideo?.title || activeCompanionVideoTest.title}
+            </h3>
+            <p className="mt-2 text-[14px] text-white/62">
+              Watch the secure explanation video for this mock test without leaving the test-series workspace.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={closeCompanionVideo}
+            className="flex h-11 w-11 items-center justify-center rounded-2xl border border-white/12 bg-white/6 text-white/78 transition hover:bg-white/10"
+          >
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-y-auto px-6 py-6">
+          <div className="rounded-[24px] border border-white/10 bg-[#040a14] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+            {loadingCompanionVideo ? (
+              <div className="flex h-[520px] flex-col items-center justify-center gap-4 text-center">
+                <div className="h-11 w-11 animate-spin rounded-full border-2 border-white/16 border-t-[#1cb5da]" />
+                <div>
+                  <p className="text-[18px] font-semibold">Preparing secure playback</p>
+                  <p className="mt-2 text-[14px] text-white/56">Loading the test-series video stream now.</p>
+                </div>
+              </div>
+            ) : companionVideoError ? (
+              <div className="flex h-[520px] flex-col items-center justify-center gap-4 text-center">
+                <div className="flex h-14 w-14 items-center justify-center rounded-full bg-[#30131c] text-[#ff8c9c]">
+                  <AlertTriangle className="h-6 w-6" />
+                </div>
+                <div>
+                  <p className="text-[18px] font-semibold">Video could not be opened</p>
+                  <p className="mt-2 max-w-[520px] text-[14px] leading-[1.7] text-white/56">{companionVideoError}</p>
+                </div>
+              </div>
+            ) : (activeCompanionVideoPlayback?.drmConfig?.manifestUrl || activeCompanionVideoPlayback?.streamUrl) ? (
+              <div className="space-y-4">
+                <div className="overflow-hidden rounded-[20px] border border-white/8 bg-black">
+                  <ResilientHlsVideo
+                    src={activeCompanionVideoPlayback.drmConfig?.manifestUrl || activeCompanionVideoPlayback.streamUrl || ''}
+                    drmConfig={activeCompanionVideoPlayback.drmConfig}
+                    title={activeCompanionVideoTest.companionVideo?.title || activeCompanionVideoTest.title}
+                    watermarkText={activeCompanionVideoPlayback.watermarkText}
+                    streamFormat={activeCompanionVideoPlayback.drmConfig?.manifestFormat || activeCompanionVideoPlayback.streamFormat}
+                    trackVideoId={activeCompanionVideoTest.companionVideo?.id || activeCompanionVideoTest._id}
+                    autoPlay
+                    className="aspect-video w-full"
+                  />
+                </div>
+                <div className="grid gap-3 md:grid-cols-3">
+                  <div className="rounded-[18px] border border-white/10 bg-white/4 px-4 py-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-white/46">Format</p>
+                    <p className="mt-2 text-[15px] font-semibold text-white">{activeCompanionVideoPlayback.drmConfig?.manifestFormat || activeCompanionVideoPlayback.streamFormat || 'source'}</p>
+                  </div>
+                  <div className="rounded-[18px] border border-white/10 bg-white/4 px-4 py-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-white/46">Status</p>
+                    <p className="mt-2 text-[15px] font-semibold text-white">{activeCompanionVideoPlayback.playbackStatus || 'ready'}</p>
+                  </div>
+                  <div className="rounded-[18px] border border-white/10 bg-white/4 px-4 py-3">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-white/46">Duration</p>
+                    <p className="mt-2 text-[15px] font-semibold text-white">{activeCompanionVideoTest.companionVideo?.durationMinutes || 0} min</p>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="flex h-[520px] flex-col items-center justify-center gap-4 text-center">
+                <div className="flex h-14 w-14 items-center justify-center rounded-full bg-[#113348] text-[#66d4ff]">
+                  <MonitorPlay className="h-6 w-6" />
+                </div>
+                <div>
+                  <p className="text-[18px] font-semibold">Video is not ready yet</p>
+                  <p className="mt-2 text-[14px] text-white/56">This test-series video has not produced a playable stream yet.</p>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  ) : null;
+
   return (
     <div data-testid="tests-figma-page" className="flex min-h-0 flex-1 flex-col bg-[#f5f7fb]">
       {screen === 'home' && (
@@ -2929,6 +3635,10 @@ export const TestSeriesFigmaTab = ({
           {mobileSolutions}
         </>
       )}
+
+      {examExitPrompt}
+      {pauseDialog}
+      {companionVideoModal}
     </div>
   );
 };

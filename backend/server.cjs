@@ -11,6 +11,7 @@ const { getHealthSnapshot } = require('./lib/health.js');
 const { securityHeaders, basicRateLimit } = require('./middleware/security.js');
 const { notFoundHandler, errorHandler } = require('./middleware/error-handler.js');
 const paymentRoutes = require('./payment/payment.routes.js');
+const razorpayRoutes = require('./payment/razorpay.routes.js');
 const engagementRoutes = require('./engagement/engagement.routes.js');
 const trackRoutes = require('./track/track.routes.js');
 const notificationsRoutes = require('./notifications/notifications.routes.js');
@@ -28,6 +29,7 @@ const { ensureReplayImporterWorker } = require('./live/live-replay.worker.js');
 const { connectDatabase, getDatabaseMode } = require('./lib/database.js');
 const { isFirestoreStateEnabled, getStateDocumentRef } = require('./lib/firebase-state.js');
 const { resetState, serializeState } = require('./lib/store.js');
+const { recoverPendingCourseVideoProcessingJobs } = require('./lib/video-processing.js');
 
 const parseCorsOrigin = (value) => {
   const normalized = String(value || '').trim();
@@ -47,7 +49,12 @@ const app = express();
 app.set('trust proxy', appConfig.trustProxy);
 app.disable('x-powered-by');
 app.use(cors({ origin: parseCorsOrigin(appConfig.corsOrigin) }));
-app.use(express.json({ limit: appConfig.jsonBodyLimit }));
+app.use(express.json({
+  limit: appConfig.jsonBodyLimit,
+  verify: (req, _res, buffer) => {
+    req.rawBody = Buffer.from(buffer);
+  },
+}));
 app.use(express.urlencoded({ extended: false, limit: '64kb' }));
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 app.use('/private_uploads', express.static(path.join(process.cwd(), 'private_uploads')));
@@ -115,6 +122,7 @@ app.get(['/api/live', '/backend/api/live'], (_req, res) => {
   app.use(`${prefix}/engagement`, engagementRoutes);
   app.use(`${prefix}/track`, trackRoutes);
   app.use(`${prefix}/payment`, paymentRoutes);
+  app.use(`${prefix}/razorpay`, razorpayRoutes);
   app.use(`${prefix}/platform`, platformRoutes);
   app.use(`${prefix}/live-classes`, liveRoutes);
 });
@@ -150,6 +158,15 @@ const startServer = async (options = {}) => {
   if (enableBackgroundWorkers) {
     startLiveEventBus();
     ensureReplayImporterWorker();
+    recoverPendingCourseVideoProcessingJobs()
+      .then((result) => {
+        if (result.scheduled > 0) {
+          console.log(`[video-processing] recovered ${result.scheduled} pending course video job(s) after scanning ${result.scanned} lesson(s)`);
+        }
+      })
+      .catch((error) => {
+        console.error('[video-processing] failed to recover pending course video jobs', error);
+      });
   }
 
   return new Promise((resolve, reject) => {

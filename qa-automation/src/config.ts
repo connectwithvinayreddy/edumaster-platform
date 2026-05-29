@@ -15,4 +15,8 @@ export const config: RunConfig = {
   openAiModel: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
 };
 
-export const automationRoot = path.resolve(process.cwd(), 'qa-automation');
+const currentWorkingDirectory = process.cwd();
+
+export const automationRoot = path.basename(currentWorkingDirectory) === 'qa-automation'
+  ? currentWorkingDirectory
+  : path.resolve(currentWorkingDirectory, 'qa-automation');

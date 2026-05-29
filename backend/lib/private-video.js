@@ -5,6 +5,7 @@ const { appConfig } = require('./config.js');
 
 const privateVideosRoot = path.join(process.cwd(), 'private_uploads', 'videos');
 const privateHlsRoot = path.join(process.cwd(), 'private_uploads', 'hls');
+const HLS_ACCESS_COOKIE_NAME = 'edumaster_hls';
 
 const ensurePrivateVideoRoot = () => {
   if (!fs.existsSync(privateVideosRoot)) {
@@ -192,6 +193,9 @@ const buildCompactAssetUrl = (payload, options = {}) => {
     e: String(issued.exp),
     s: issued.sig,
   });
+  if (payload.storageProvider) {
+    params.set('p', String(payload.storageProvider));
+  }
 
   return {
     url: `${routeBase}/${encodeCompactAssetPath(payload.storagePath)}?${params.toString()}`,
@@ -314,7 +318,14 @@ const resolvePrivateVideoPath = (storagePath) => {
   return resolved;
 };
 
+const getProtectedAssetStorageRoot = (assetPath) => String(assetPath || '')
+  .split('/')
+  .filter(Boolean)
+  .slice(0, 3)
+  .join('/');
+
 module.exports = {
+  HLS_ACCESS_COOKIE_NAME,
   privateVideosRoot,
   privateHlsRoot,
   ensurePrivateVideoRoot,
@@ -332,6 +343,7 @@ module.exports = {
   verifyManifestBundleSignature,
   encodeCompactAssetPath,
   decodeCompactAssetPath,
+  getProtectedAssetStorageRoot,
   resolvePrivateVideoPath,
   resolvePrivateHlsPath,
 };

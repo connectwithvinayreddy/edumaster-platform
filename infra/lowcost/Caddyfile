@@ -1,3 +1,7 @@
+varonenglishapp.in, www.varonenglishapp.in {
+  redir https://{$APP_DOMAIN}{uri} permanent
+}
+
 {$APP_DOMAIN} {
   encode gzip zstd
 

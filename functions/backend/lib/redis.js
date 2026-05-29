@@ -118,79 +118,176 @@ const parseResp = (buffer, offset = 0) => {
   };
 };
 
+const createRedisSocket = () => {
+  const target = parseRedisTarget();
+  if (!target) {
+    return null;
+  }
+
+  return target.secure
+    ? tls.connect({ host: target.host, port: target.port, servername: target.host })
+    : net.createConnection({ host: target.host, port: target.port });
+};
+
+const REDIS_COMMAND_POOL_SIZE = Math.max(1, Number(process.env.REDIS_COMMAND_POOL_SIZE || 8));
+let redisCommandPool = [];
+let redisCommandPoolTargetKey = null;
+let redisCommandPoolCursor = 0;
+
+const createRedisCommandClient = (target) => {
+  let socket = null;
+  let buffer = Buffer.alloc(0);
+  let connected = false;
+  let authenticated = !target.password;
+  let connectPromise = null;
+  let currentCommand = null;
+  let queue = Promise.resolve();
+
+  const resetState = () => {
+    connected = false;
+    authenticated = !target.password;
+    connectPromise = null;
+    buffer = Buffer.alloc(0);
+    if (currentCommand) {
+      currentCommand.reject(new Error('Redis connection closed'));
+      currentCommand = null;
+    }
+    if (socket) {
+      socket.removeAllListeners();
+      socket.destroy();
+      socket = null;
+    }
+  };
+
+  const awaitSingleResponse = () => new Promise((resolve, reject) => {
+    currentCommand = { resolve, reject };
+  });
+
+  const flushBuffer = () => {
+    while (buffer.length > 0 && currentCommand) {
+      const parsed = parseResp(buffer);
+      if (!parsed) {
+        return;
+      }
+
+      buffer = buffer.slice(parsed.bytesConsumed);
+      const pending = currentCommand;
+      currentCommand = null;
+
+      if (parsed.error) {
+        pending.reject(parsed.error);
+        return;
+      }
+
+      pending.resolve(parsed.value);
+    }
+  };
+
+  const ensureConnected = async () => {
+    if (connected && authenticated && socket) {
+      return;
+    }
+
+    if (connectPromise) {
+      return connectPromise;
+    }
+
+    connectPromise = new Promise((resolve, reject) => {
+      const nextSocket = target.secure
+        ? tls.connect({ host: target.host, port: target.port, servername: target.host })
+        : net.createConnection({ host: target.host, port: target.port });
+
+      socket = nextSocket;
+      socket.setTimeout(30_000);
+
+      const fail = (error) => {
+        resetState();
+        reject(error);
+      };
+
+      socket.on('connect', async () => {
+        connected = true;
+        try {
+          if (target.password) {
+            writeResp(
+              socket,
+              target.username
+                ? ['AUTH', target.username, target.password]
+                : ['AUTH', target.password],
+            );
+            await awaitSingleResponse();
+            authenticated = true;
+          }
+          resolve();
+        } catch (error) {
+          fail(error);
+        } finally {
+          connectPromise = null;
+        }
+      });
+
+      socket.on('data', (chunk) => {
+        buffer = Buffer.concat([buffer, chunk]);
+        flushBuffer();
+      });
+
+      socket.on('timeout', () => fail(new Error('Redis connection timed out')));
+      socket.on('error', (error) => {
+        if (connectPromise) {
+          fail(error);
+          return;
+        }
+        resetState();
+      });
+      socket.on('close', () => {
+        resetState();
+      });
+    });
+
+    return connectPromise;
+  };
+
+  const run = (commandParts) => {
+    queue = queue.then(async () => {
+      await ensureConnected();
+      writeResp(socket, commandParts);
+      return await awaitSingleResponse();
+    });
+
+    return queue.catch((error) => {
+      queue = Promise.resolve();
+      throw error;
+    });
+  };
+
+  return {
+    run,
+    close: resetState,
+  };
+};
+
+const getRedisCommandPool = (target) => {
+  const targetKey = `${target.secure ? 'rediss' : 'redis'}://${target.host}:${target.port}:${target.username || ''}`;
+  if (redisCommandPoolTargetKey !== targetKey || redisCommandPool.length === 0) {
+    redisCommandPool.forEach((client) => client.close());
+    redisCommandPool = Array.from({ length: REDIS_COMMAND_POOL_SIZE }, () => createRedisCommandClient(target));
+    redisCommandPoolTargetKey = targetKey;
+    redisCommandPoolCursor = 0;
+  }
+
+  return redisCommandPool;
+};
+
 const executeRedisCommand = async (commandParts) => {
   const target = parseRedisTarget();
   if (!target) {
     return null;
   }
 
-  return new Promise((resolve, reject) => {
-    const socket = target.secure
-      ? tls.connect({ host: target.host, port: target.port, servername: target.host })
-      : net.createConnection({ host: target.host, port: target.port });
-    let settled = false;
-    let authPending = Boolean(target.password);
-    let buffer = Buffer.alloc(0);
-
-    const finish = (error, value) => {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      socket.destroy();
-      if (error) {
-        reject(error);
-      } else {
-        resolve(value);
-      }
-    };
-
-    socket.setTimeout(5_000);
-
-    socket.on('connect', () => {
-      if (target.password) {
-        writeResp(
-          socket,
-          target.username
-            ? ['AUTH', target.username, target.password]
-            : ['AUTH', target.password],
-        );
-      } else {
-        writeResp(socket, commandParts);
-      }
-    });
-
-    socket.on('data', (chunk) => {
-      buffer = Buffer.concat([buffer, chunk]);
-
-      while (buffer.length > 0) {
-        const parsed = parseResp(buffer);
-        if (!parsed) {
-          return;
-        }
-
-        buffer = buffer.slice(parsed.bytesConsumed);
-
-        if (parsed.error) {
-          finish(parsed.error);
-          return;
-        }
-
-        if (authPending) {
-          authPending = false;
-          writeResp(socket, commandParts);
-          continue;
-        }
-
-        finish(null, parsed.value);
-        return;
-      }
-    });
-
-    socket.on('timeout', () => finish(new Error('Redis connection timed out')));
-    socket.on('error', (error) => finish(error));
-  });
+  const pool = getRedisCommandPool(target);
+  const client = pool[redisCommandPoolCursor % pool.length];
+  redisCommandPoolCursor = (redisCommandPoolCursor + 1) % pool.length;
+  return client.run(commandParts);
 };
 
 const getRedisValue = async (key) => {
@@ -281,6 +378,124 @@ const incrementRedisCounter = async (key, ttlSeconds) => {
   return Number(count);
 };
 
+const publishRedisMessage = async (channel, message) => {
+  if (!parseRedisTarget()) {
+    return 0;
+  }
+
+  const listeners = await executeRedisCommand(['PUBLISH', String(channel), String(message)]);
+  return Number(listeners || 0);
+};
+
+const subscribeRedisChannel = ({ channel, onMessage, onError, onStatus }) => {
+  const target = parseRedisTarget();
+  if (!target) {
+    return {
+      close() {},
+    };
+  }
+
+  let socket = null;
+  let buffer = Buffer.alloc(0);
+  let authPending = Boolean(target.password);
+  let closed = false;
+  let reconnectTimer = null;
+
+  const connect = () => {
+    if (closed) {
+      return;
+    }
+
+    socket = createRedisSocket();
+    if (!socket) {
+      return;
+    }
+
+    socket.setTimeout(0);
+
+    socket.on('connect', () => {
+      if (typeof onStatus === 'function') {
+        onStatus('connected');
+      }
+      if (target.password) {
+        writeResp(
+          socket,
+          target.username
+            ? ['AUTH', target.username, target.password]
+            : ['AUTH', target.password],
+        );
+      } else {
+        writeResp(socket, ['SUBSCRIBE', String(channel)]);
+      }
+    });
+
+    socket.on('data', (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+
+      while (buffer.length > 0) {
+        const parsed = parseResp(buffer);
+        if (!parsed) {
+          return;
+        }
+        buffer = buffer.slice(parsed.bytesConsumed);
+
+        if (parsed.error) {
+          if (typeof onError === 'function') {
+            onError(parsed.error);
+          }
+          return;
+        }
+
+        if (authPending) {
+          authPending = false;
+          writeResp(socket, ['SUBSCRIBE', String(channel)]);
+          continue;
+        }
+
+        const value = parsed.value;
+        if (Array.isArray(value) && value[0] === 'message' && value[1] === String(channel)) {
+          if (typeof onMessage === 'function') {
+            onMessage(String(value[2] || ''));
+          }
+        }
+      }
+    });
+
+    socket.on('error', (error) => {
+      if (typeof onError === 'function') {
+        onError(error);
+      }
+    });
+
+    socket.on('close', () => {
+      if (typeof onStatus === 'function') {
+        onStatus('closed');
+      }
+      if (closed) {
+        return;
+      }
+      authPending = Boolean(target.password);
+      buffer = Buffer.alloc(0);
+      reconnectTimer = setTimeout(connect, 1000);
+    });
+  };
+
+  connect();
+
+  return {
+    close() {
+      closed = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (socket) {
+        socket.destroy();
+      }
+    },
+  };
+};
+
 const checkRedisHealth = async () => {
   const target = parseRedisTarget();
   if (!target) {
@@ -343,4 +558,6 @@ module.exports = {
   getRedisJson,
   setRedisJson,
   incrementRedisCounter,
+  publishRedisMessage,
+  subscribeRedisChannel,
 };

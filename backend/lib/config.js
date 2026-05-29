@@ -71,21 +71,6 @@ const appConfig = {
   watchProgressCacheInvalidationPercentStep: toNumber(process.env.WATCH_PROGRESS_CACHE_INVALIDATION_PERCENT_STEP, 25),
   quizCacheTtlMs: toNumber(process.env.QUIZ_CACHE_TTL_MS, 3_000),
   notificationsCacheTtlMs: toNumber(process.env.NOTIFICATIONS_CACHE_TTL_MS, 2_000),
-  authOtpTtlSeconds: toNumber(process.env.AUTH_OTP_TTL_SECONDS, 600),
-  authOtpMaxAttempts: toNumber(process.env.AUTH_OTP_MAX_ATTEMPTS, 5),
-  authOtpDeliveryTimeoutMs: toNumber(process.env.AUTH_OTP_DELIVERY_TIMEOUT_MS, 10_000),
-  authOtpEmailWebhookUrl: process.env.AUTH_OTP_EMAIL_WEBHOOK_URL || '',
-  authOtpSmsWebhookUrl: process.env.AUTH_OTP_SMS_WEBHOOK_URL || '',
-  authOtpSenderName: process.env.AUTH_OTP_SENDER_NAME || 'Edumaster',
-  authOtpEmailProvider: process.env.AUTH_OTP_EMAIL_PROVIDER || '',
-  authOtpEmailApiKey: process.env.AUTH_OTP_EMAIL_API_KEY || '',
-  authOtpEmailFromAddress: process.env.AUTH_OTP_EMAIL_FROM_ADDRESS || '',
-  authOtpEmailReplyTo: process.env.AUTH_OTP_EMAIL_REPLY_TO || '',
-  authOtpSmsProvider: process.env.AUTH_OTP_SMS_PROVIDER || '',
-  authOtpSmsAccountSid: process.env.AUTH_OTP_SMS_ACCOUNT_SID || '',
-  authOtpSmsAuthToken: process.env.AUTH_OTP_SMS_AUTH_TOKEN || '',
-  authOtpSmsFromNumber: process.env.AUTH_OTP_SMS_FROM_NUMBER || '',
-  authOtpSmsMessagingServiceSid: process.env.AUTH_OTP_SMS_MESSAGING_SERVICE_SID || '',
   firebaseStateStorage: toBool(process.env.FIREBASE_STATE_STORAGE, false),
   firebaseStateDatabaseId: process.env.FIREBASE_STATE_DATABASE_ID || '',
   firebaseStateCollection: process.env.FIREBASE_STATE_COLLECTION || 'app_state',
@@ -97,6 +82,8 @@ const appConfig = {
   s3AccessKeyId: process.env.S3_ACCESS_KEY_ID || '',
   s3SecretAccessKey: process.env.S3_SECRET_ACCESS_KEY || '',
   s3ForcePathStyle: toBool(process.env.S3_FORCE_PATH_STYLE, false),
+  razorpayKeyId: process.env.RAZORPAY_KEY_ID || '',
+  razorpayKeySecret: process.env.RAZORPAY_KEY_SECRET || '',
   stripeSecretKey: process.env.STRIPE_SECRET_KEY || '',
   stripePublishableKey: process.env.VITE_STRIPE_PUBLISHABLE_KEY || '',
   aiProvider: process.env.AI_PROVIDER || 'auto',
@@ -117,25 +104,63 @@ const appConfig = {
   privateVideoDeliveryUrlTtlSeconds: toNumber(process.env.PRIVATE_VIDEO_DELIVERY_URL_TTL_SECONDS, 900),
   privateVideoHlsManifestCacheSeconds: toNumber(process.env.PRIVATE_VIDEO_HLS_MANIFEST_CACHE_SECONDS, 8),
   privateVideoHlsSegmentCacheSeconds: toNumber(process.env.PRIVATE_VIDEO_HLS_SEGMENT_CACHE_SECONDS, 31_536_000),
-  privateVideoHlsSegmentTokenTtlSeconds: toNumber(process.env.PRIVATE_VIDEO_HLS_SEGMENT_TOKEN_TTL_SECONDS, 21_600),
+  privateVideoHlsSegmentTokenTtlSeconds: toNumber(process.env.PRIVATE_VIDEO_HLS_SEGMENT_TOKEN_TTL_SECONDS, 900),
+  privateVideoHlsAesEncryptionEnabled: toBool(process.env.PRIVATE_VIDEO_HLS_AES_ENCRYPTION_ENABLED, true),
   privateVideoHlsCacheWarmBaseUrl: process.env.PRIVATE_VIDEO_HLS_CACHE_WARM_BASE_URL || '',
   privateVideoHlsChildManifestWarmAsync: toBool(process.env.PRIVATE_VIDEO_HLS_CHILD_MANIFEST_WARM_ASYNC, true),
   privateVideoHlsEagerHttpWarmEnabled: toBool(process.env.PRIVATE_VIDEO_HLS_EAGER_HTTP_WARM_ENABLED, false),
   privateVideoDrmEnabled: toBool(process.env.PRIVATE_VIDEO_DRM_ENABLED, false),
-  privateVideoStorageProvider: process.env.PRIVATE_VIDEO_STORAGE_PROVIDER || 'local',
-  courseDefaultValidityDays: toNumber(process.env.COURSE_DEFAULT_VALIDITY_DAYS, 183),
-  enableVideoTranscoding: toBool(process.env.ENABLE_VIDEO_TRANSCODING, true),
-  sourcePlaybackFallbackEnabled: toBool(process.env.SOURCE_PLAYBACK_FALLBACK_ENABLED, true),
-  videoDeliveryProfile: process.env.VIDEO_DELIVERY_PROFILE || 'cost-saver-hls',
-  videoTargetRenditions: (process.env.VIDEO_TARGET_RENDITIONS || '480p,720p')
+  privateVideoDrmManifestBaseUrl: process.env.PRIVATE_VIDEO_DRM_MANIFEST_BASE_URL || '',
+  privateVideoDrmManifestFileName: process.env.PRIVATE_VIDEO_DRM_MANIFEST_FILE_NAME || 'master.mpd',
+  privateVideoDrmManifestFormat: process.env.PRIVATE_VIDEO_DRM_MANIFEST_FORMAT || 'dash',
+  privateVideoDrmPreferredKeySystem: process.env.PRIVATE_VIDEO_DRM_PREFERRED_KEY_SYSTEM || '',
+  privateVideoDrmWidevineLicenseUrl: process.env.PRIVATE_VIDEO_DRM_WIDEVINE_LICENSE_URL || '',
+  privateVideoDrmFairplayLicenseUrl: process.env.PRIVATE_VIDEO_DRM_FAIRPLAY_LICENSE_URL || '',
+  privateVideoDrmFairplayCertificateUrl: process.env.PRIVATE_VIDEO_DRM_FAIRPLAY_CERTIFICATE_URL || '',
+  privateVideoDrmPlayreadyLicenseUrl: process.env.PRIVATE_VIDEO_DRM_PLAYREADY_LICENSE_URL || '',
+  privateVideoRequireDrmForPaidPlayback: toBool(
+    process.env.PRIVATE_VIDEO_REQUIRE_DRM_FOR_PAID_PLAYBACK,
+    toBool(process.env.PRIVATE_VIDEO_DRM_ENABLED, false),
+  ),
+  privateVideoStorageProvider: process.env.PRIVATE_VIDEO_STORAGE_PROVIDER || 's3',
+  privateVideoLegacyLessonWatchLimit: toNumber(process.env.PRIVATE_VIDEO_LEGACY_LESSON_WATCH_LIMIT, 2),
+  privateVideoNewUploadWatchLimit: toNumber(process.env.PRIVATE_VIDEO_NEW_UPLOAD_WATCH_LIMIT, 1),
+  videoWatchCompletionThresholdPercent: toNumber(process.env.VIDEO_WATCH_COMPLETION_THRESHOLD_PERCENT, 90),
+  videoHlsStorageProvider: process.env.VIDEO_HLS_STORAGE_PROVIDER || process.env.PRIVATE_VIDEO_STORAGE_PROVIDER || 's3',
+  videoProcessingProvider: process.env.VIDEO_PROCESSING_PROVIDER || (
+    process.env.NODE_ENV === 'production' ? 'cloudflare-stream' : 'local-hls'
+  ),
+  cloudflareStreamAccountId: process.env.CLOUDFLARE_STREAM_ACCOUNT_ID || process.env.CLOUDFLARE_ACCOUNT_ID || '',
+  cloudflareStreamApiToken: process.env.CLOUDFLARE_STREAM_API_TOKEN || '',
+  cloudflareStreamCustomerCode: process.env.CLOUDFLARE_STREAM_CUSTOMER_CODE || '',
+  cloudflareStreamWebhookSecret: process.env.CLOUDFLARE_STREAM_WEBHOOK_SECRET || '',
+  cloudflareStreamAllowedOrigins: (process.env.CLOUDFLARE_STREAM_ALLOWED_ORIGINS || process.env.APP_URL || '')
     .split(',')
     .map((entry) => entry.trim())
     .filter(Boolean),
-  videoHlsSegmentDurationSeconds: toNumber(process.env.VIDEO_HLS_SEGMENT_DURATION_SECONDS, 6),
+  cloudflareStreamSignedPlaybackRequired: toBool(process.env.CLOUDFLARE_STREAM_SIGNED_PLAYBACK_REQUIRED, false),
+  cloudflareStreamDirectUploadExpiryMinutes: toNumber(process.env.CLOUDFLARE_STREAM_DIRECT_UPLOAD_EXPIRY_MINUTES, 180),
+  cloudflareStreamDefaultMaxDurationSeconds: toNumber(process.env.CLOUDFLARE_STREAM_DEFAULT_MAX_DURATION_SECONDS, 6 * 60 * 60),
+  cloudflareStreamMaxUploadDurationSeconds: toNumber(process.env.CLOUDFLARE_STREAM_MAX_UPLOAD_DURATION_SECONDS, 10 * 60 * 60),
+  cloudflareStreamUploadDurationSafetySeconds: toNumber(process.env.CLOUDFLARE_STREAM_UPLOAD_DURATION_SAFETY_SECONDS, 30 * 60),
+  cloudflareStreamStatusPollInitialDelayMs: toNumber(process.env.CLOUDFLARE_STREAM_STATUS_POLL_INITIAL_DELAY_MS, 30_000),
+  cloudflareStreamStatusPollMaxAttempts: toNumber(process.env.CLOUDFLARE_STREAM_STATUS_POLL_MAX_ATTEMPTS, 36),
+  courseDefaultValidityDays: toNumber(process.env.COURSE_DEFAULT_VALIDITY_DAYS, 365),
+  enableVideoTranscoding: toBool(process.env.ENABLE_VIDEO_TRANSCODING, true),
+  sourcePlaybackFallbackEnabled: toBool(process.env.SOURCE_PLAYBACK_FALLBACK_ENABLED, false),
+  videoDeliveryProfile: process.env.VIDEO_DELIVERY_PROFILE || 'r2-private-hls',
+  videoTargetRenditions: (process.env.VIDEO_TARGET_RENDITIONS || '240p,360p,480p,720p')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean),
+  videoHlsSegmentDurationSeconds: toNumber(process.env.VIDEO_HLS_SEGMENT_DURATION_SECONDS, 4),
+  videoTranscodingConcurrency: Math.max(1, Math.floor(toNumber(process.env.VIDEO_TRANSCODING_CONCURRENCY, 1))),
+  videoTranscodingJobTimeoutMs: toNumber(process.env.VIDEO_TRANSCODING_JOB_TIMEOUT_MS, 45 * 60 * 1000),
+  videoProcessingStaleAfterMs: toNumber(process.env.VIDEO_PROCESSING_STALE_AFTER_MS, 20 * 60 * 1000),
   videoKeepSourceAfterProcessing: toBool(process.env.VIDEO_KEEP_SOURCE_AFTER_PROCESSING, false),
-  videoReplayViewLimitEnabled: toBool(process.env.VIDEO_REPLAY_VIEW_LIMIT_ENABLED, false),
-  videoReplayMaxViews: toNumber(process.env.VIDEO_REPLAY_MAX_VIEWS, 0),
-  videoReplayRetentionDays: toNumber(process.env.VIDEO_REPLAY_RETENTION_DAYS, 183),
+  videoReplayViewLimitEnabled: toBool(process.env.VIDEO_REPLAY_VIEW_LIMIT_ENABLED, true),
+  videoReplayMaxViews: toNumber(process.env.VIDEO_REPLAY_MAX_VIEWS, 2),
+  videoReplayRetentionDays: toNumber(process.env.VIDEO_REPLAY_RETENTION_DAYS, 365),
   maxVideoUploadMb: toNumber(process.env.MAX_VIDEO_UPLOAD_MB, 2048),
   environmentLabel: process.env.ENVIRONMENT_LABEL || 'local',
   exposeSampleCredentials: toBool(process.env.EXPOSE_SAMPLE_CREDENTIALS, false),
@@ -186,6 +211,7 @@ const getConfigSummary = () => ({
   allowMemoryFallback: appConfig.allowMemoryFallback,
   hasRedis: Boolean(appConfig.redisUrl),
   hasStripe: Boolean(appConfig.stripeSecretKey && appConfig.stripePublishableKey),
+  hasRazorpay: Boolean(appConfig.razorpayKeyId && appConfig.razorpayKeySecret),
   hasAiProvider: Boolean(appConfig.aiApiKey),
   aiProvider: appConfig.aiProvider,
   aiModel: appConfig.aiModel,
@@ -202,10 +228,20 @@ const getConfigSummary = () => ({
     && appConfig.youtubeUploadRefreshToken,
   ),
   hasPrivateVideoSigning: Boolean(appConfig.privateVideoTokenSecret),
+  privateVideoDrmEnabled: appConfig.privateVideoDrmEnabled,
+  privateVideoRequireDrmForPaidPlayback: appConfig.privateVideoRequireDrmForPaidPlayback,
+  privateVideoDrmManifestBaseUrlConfigured: Boolean(appConfig.privateVideoDrmManifestBaseUrl),
   privateVideoStorageProvider: appConfig.privateVideoStorageProvider,
+  videoHlsStorageProvider: appConfig.videoHlsStorageProvider,
+  videoProcessingProvider: appConfig.videoProcessingProvider,
+  hasCloudflareStream: Boolean(appConfig.cloudflareStreamAccountId && appConfig.cloudflareStreamApiToken),
+  cloudflareStreamCustomerCodeConfigured: Boolean(appConfig.cloudflareStreamCustomerCode),
   courseDefaultValidityDays: appConfig.courseDefaultValidityDays,
   enableVideoTranscoding: appConfig.enableVideoTranscoding,
   videoDeliveryProfile: appConfig.videoDeliveryProfile,
+  privateVideoLegacyLessonWatchLimit: appConfig.privateVideoLegacyLessonWatchLimit,
+  privateVideoNewUploadWatchLimit: appConfig.privateVideoNewUploadWatchLimit,
+  videoWatchCompletionThresholdPercent: appConfig.videoWatchCompletionThresholdPercent,
   videoReplayMaxViews: appConfig.videoReplayMaxViews,
   videoReplayViewLimitEnabled: appConfig.videoReplayViewLimitEnabled,
   videoReplayRetentionDays: appConfig.videoReplayRetentionDays,
@@ -222,6 +258,10 @@ const getProductionConfigDiagnostics = () => {
 
   if (isProduction && appConfig.allowMemoryFallback) {
     errors.push('ALLOW_MEMORY_FALLBACK must be disabled in production.');
+  }
+
+  if (isProduction && !usingObjectStorage) {
+    errors.push('PRIVATE_VIDEO_STORAGE_PROVIDER must be set to s3 for production recorded video storage.');
   }
 
   if (isProduction && appConfig.exposeSampleCredentials) {
@@ -268,8 +308,92 @@ const getProductionConfigDiagnostics = () => {
     warnings.push('PRIVATE_VIDEO_STORAGE_PROVIDER=local keeps protected recordings on the app server. Prefer S3-compatible object storage for production.');
   }
 
+  if (isProduction && appConfig.videoHlsStorageProvider === 'local') {
+    warnings.push('VIDEO_HLS_STORAGE_PROVIDER=local keeps processed lesson HLS assets on the app server. Prefer S3-compatible object storage for production.');
+  }
+
   if (isProduction && appConfig.enableVideoTranscoding) {
     warnings.push('ENABLE_VIDEO_TRANSCODING is on. Make sure ffmpeg is available in the runtime image for replay processing.');
+  }
+
+  if (isProduction && appConfig.videoProcessingProvider !== 'cloudflare-stream') {
+    warnings.push('VIDEO_PROCESSING_PROVIDER is not cloudflare-stream. Recorded lessons will use the configured private HLS processor and object storage.');
+  }
+
+  if (
+    isProduction
+    && appConfig.videoProcessingProvider !== 'cloudflare-stream'
+    && appConfig.cloudflareStreamAccountId
+    && appConfig.cloudflareStreamApiToken
+  ) {
+    warnings.push('Cloudflare Stream credentials are configured, but VIDEO_PROCESSING_PROVIDER is not cloudflare-stream. Admin uploads will not use Cloudflare Stream until the provider is switched.');
+  }
+
+  if (isProduction && appConfig.videoProcessingProvider === 'cloudflare-stream') {
+    if (!appConfig.cloudflareStreamAccountId) {
+      errors.push('CLOUDFLARE_STREAM_ACCOUNT_ID is required when VIDEO_PROCESSING_PROVIDER=cloudflare-stream.');
+    }
+
+    if (!appConfig.cloudflareStreamApiToken) {
+      errors.push('CLOUDFLARE_STREAM_API_TOKEN is required when VIDEO_PROCESSING_PROVIDER=cloudflare-stream.');
+    }
+
+    if (!appConfig.cloudflareStreamCustomerCode) {
+      errors.push('CLOUDFLARE_STREAM_CUSTOMER_CODE is required to build Cloudflare Stream HLS playback URLs.');
+    }
+
+    [
+      ['CLOUDFLARE_STREAM_ACCOUNT_ID', appConfig.cloudflareStreamAccountId],
+      ['CLOUDFLARE_STREAM_API_TOKEN', appConfig.cloudflareStreamApiToken],
+      ['CLOUDFLARE_STREAM_CUSTOMER_CODE', appConfig.cloudflareStreamCustomerCode],
+      ['CLOUDFLARE_STREAM_WEBHOOK_SECRET', appConfig.cloudflareStreamWebhookSecret],
+    ].forEach(([name, value]) => {
+      if (value && isPlaceholderValue(value)) {
+        errors.push(`${name} must be changed from placeholder/example value in production.`);
+      }
+    });
+
+    if (!appConfig.cloudflareStreamWebhookSecret) {
+      warnings.push('CLOUDFLARE_STREAM_WEBHOOK_SECRET is missing. Status polling will work, but signed Cloudflare webhook verification should be enabled for production.');
+    }
+
+    if (String(appConfig.videoDeliveryProfile || '').toLowerCase() !== 'cloudflare-stream') {
+      warnings.push('VIDEO_DELIVERY_PROFILE does not match cloudflare-stream. Update it so admin/status screens reflect the active production pipeline accurately.');
+    }
+  }
+
+  if (
+    isProduction
+    && appConfig.privateVideoRequireDrmForPaidPlayback
+    && appConfig.videoProcessingProvider !== 'cloudflare-stream'
+  ) {
+    if (!appConfig.privateVideoDrmEnabled) {
+      errors.push('PRIVATE_VIDEO_REQUIRE_DRM_FOR_PAID_PLAYBACK=true requires PRIVATE_VIDEO_DRM_ENABLED=true.');
+    }
+
+    if (!appConfig.privateVideoDrmManifestBaseUrl) {
+      errors.push('PRIVATE_VIDEO_DRM_MANIFEST_BASE_URL is required when DRM is mandatory for paid playback.');
+    }
+
+    if (!appConfig.privateVideoDrmWidevineLicenseUrl) {
+      errors.push('PRIVATE_VIDEO_DRM_WIDEVINE_LICENSE_URL is required when DRM is mandatory for paid playback.');
+    }
+
+    if (!appConfig.privateVideoDrmFairplayLicenseUrl) {
+      errors.push('PRIVATE_VIDEO_DRM_FAIRPLAY_LICENSE_URL is required when DRM is mandatory for paid playback.');
+    }
+
+    if (!appConfig.privateVideoDrmPlayreadyLicenseUrl) {
+      errors.push('PRIVATE_VIDEO_DRM_PLAYREADY_LICENSE_URL is required when DRM is mandatory for paid playback.');
+    }
+  }
+
+  if (
+    isProduction
+    && appConfig.videoProcessingProvider === 'cloudflare-stream'
+    && appConfig.privateVideoRequireDrmForPaidPlayback
+  ) {
+    warnings.push('PRIVATE_VIDEO_REQUIRE_DRM_FOR_PAID_PLAYBACK is enabled, but Cloudflare Stream recorded playback is running without DRM in this phase.');
   }
 
   if (isProduction && appConfig.hasManagedLiveHls && !appConfig.liveIngestPublisherSecret) {
@@ -333,6 +457,20 @@ const getProductionConfigDiagnostics = () => {
         errors.push(`${name} must be changed from placeholder/example value in production.`);
       }
     });
+  }
+
+  if (isProduction && appConfig.videoHlsStorageProvider === 's3') {
+    if (!appConfig.storageBucket) {
+      errors.push('VIDEO_HLS_STORAGE_PROVIDER=s3 requires S3_BUCKET.');
+    }
+
+    if (!appConfig.storageRegion) {
+      errors.push('VIDEO_HLS_STORAGE_PROVIDER=s3 requires S3_REGION.');
+    }
+
+    if (!appConfig.s3AccessKeyId || !appConfig.s3SecretAccessKey) {
+      errors.push('VIDEO_HLS_STORAGE_PROVIDER=s3 requires S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY.');
+    }
   }
 
   return { errors, warnings };

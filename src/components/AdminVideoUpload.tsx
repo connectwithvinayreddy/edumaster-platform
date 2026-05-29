@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Upload, Trash2, Play, Lock, Loader, AlertCircle, CheckCircle } from 'lucide-react';
 import { EduService } from '../EduService';
 
@@ -25,8 +25,16 @@ interface Video {
   deliveryProfile?: string | null;
   hlsProcessingStatus?: string | null;
   hlsProcessingError?: string | null;
+  playbackReady?: boolean;
+  streamProvider?: string | null;
+  storageProvider?: string | null;
+  deliveryStrategy?: string | null;
+  cloudflareStreamStatus?: string | null;
+  cloudflareStreamPctComplete?: number | null;
   targetQualities?: string[];
 }
+
+type ProcessingProvider = 'cloudflare-stream' | 'local-hls' | 'unknown';
 
 interface Module {
   id: string;
@@ -69,6 +77,95 @@ const formatDate = (dateString: string): string => {
   });
 };
 
+const isFailedVideo = (video: Video): boolean => {
+  const streamStatus = String(video.cloudflareStreamStatus || '').toLowerCase();
+  const processingStatus = String(video.hlsProcessingStatus || '').toLowerCase();
+  return streamStatus === 'failed' || processingStatus === 'failed';
+};
+
+const isProcessingVideo = (video: Video): boolean => {
+  if (video.playbackReady) {
+    return false;
+  }
+
+  const streamStatus = String(video.cloudflareStreamStatus || '').toLowerCase();
+  const processingStatus = String(video.hlsProcessingStatus || '').toLowerCase();
+  return ['queued', 'processing', 'upload-pending', 'pendingupload', 'inprogress'].includes(streamStatus)
+    || ['queued', 'processing'].includes(processingStatus);
+};
+
+const getVideoProcessingProvider = (video: Video): ProcessingProvider => {
+  const storageProvider = String(video.storageProvider || '').toLowerCase();
+  const streamProvider = String(video.streamProvider || '').toLowerCase();
+  const deliveryStrategy = String(video.deliveryStrategy || '').toLowerCase();
+  const deliveryProfile = String(video.deliveryProfile || '').toLowerCase();
+
+  if (
+    storageProvider === 'cloudflare-stream'
+    || streamProvider === 'cloudflare-stream'
+    || deliveryStrategy === 'cloudflare-stream'
+    || deliveryProfile === 'cloudflare-stream'
+  ) {
+    return 'cloudflare-stream';
+  }
+
+  if (
+    deliveryStrategy === 'hls'
+    || deliveryProfile.includes('hls')
+    || storageProvider === 's3'
+    || storageProvider === 'local'
+  ) {
+    return 'local-hls';
+  }
+
+  return 'unknown';
+};
+
+const getProviderLabel = (video: Video): string => {
+  const provider = getVideoProcessingProvider(video);
+  if (provider === 'cloudflare-stream') {
+    return 'Cloudflare Stream';
+  }
+  if (provider === 'local-hls') {
+    return 'Private adaptive HLS';
+  }
+  return 'Private video pipeline';
+};
+
+const getProcessingNotice = (video: Video): string => {
+  const provider = getVideoProcessingProvider(video);
+  if (provider === 'cloudflare-stream') {
+    return 'Students will not see this topic until Cloudflare Stream finishes encoding and marks it ready.';
+  }
+  if (provider === 'local-hls') {
+    return 'Students will not see this topic until the private adaptive HLS packaging job finishes.';
+  }
+  return 'Students will not see this topic until video processing finishes.';
+};
+
+const getStudentVisibilityLabel = (video: Video): string => {
+  if (video.playbackReady) {
+    return 'Visible to students';
+  }
+  if (isFailedVideo(video)) {
+    return 'Hidden from students';
+  }
+  if (isProcessingVideo(video)) {
+    return 'Hidden until encoding finishes';
+  }
+  return 'Availability pending';
+};
+
+const getVideoSortRank = (video: Video): number => {
+  if (video.playbackReady) {
+    return 0;
+  }
+  if (isFailedVideo(video)) {
+    return 2;
+  }
+  return 1;
+};
+
 export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onVideoUploaded }) => {
   const [selectedCourse, setSelectedCourse] = useState<string>(courses[0]?._id || '');
   const [selectedModule, setSelectedModule] = useState<string>('');
@@ -83,12 +180,26 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
     message: string;
   }>({ type: null, message: '' });
   const [deleteLoading, setDeleteLoading] = useState<string | null>(null);
+  const [bulkDeleteLoading, setBulkDeleteLoading] = useState(false);
   const [videos, setVideos] = useState<Video[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const activeUploadLabel = uploadStatus.type === 'info' && uploadStatus.message
+    ? uploadStatus.message
+    : 'Uploading topic...';
 
   const currentCourse = courses.find((c) => c._id === selectedCourse);
   const currentModule = currentCourse?.modules?.find((m) => m.id === selectedModule);
   const currentChapter = currentModule?.chapters?.find((chapter) => chapter.id === selectedChapter);
+  const sortedVideos = useMemo(() => [...videos].sort((left, right) => {
+    const rankDifference = getVideoSortRank(left) - getVideoSortRank(right);
+    if (rankDifference !== 0) {
+      return rankDifference;
+    }
+
+    return new Date(right.uploadedAt || 0).getTime() - new Date(left.uploadedAt || 0).getTime();
+  }), [videos]);
+  const failedVideoCount = sortedVideos.filter(isFailedVideo).length;
+  const hasProcessingVideos = sortedVideos.some(isProcessingVideo);
 
   const handleVideoSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -127,8 +238,14 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
     }
 
     setUploading(true);
+    setUploadStatus({
+      type: 'info',
+      message: videoFile.size > 90 * 1024 * 1024
+        ? `Uploading topic in chunks... 0% (0 Bytes / ${formatFileSize(videoFile.size)})`
+        : 'Uploading topic...',
+    });
     try {
-      await EduService.uploadVideoToModule(
+      const uploadResult = await EduService.uploadVideoToModule(
         selectedCourse,
         selectedModule,
         videoFile,
@@ -136,11 +253,22 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
         durationMinutes,
         isPremium,
         selectedChapter || undefined,
+        {
+          onProgress: ({ uploadedBytes, totalBytes, chunkIndex, totalChunks }) => {
+            const percentage = totalBytes > 0 ? Math.min(100, Math.round((uploadedBytes / totalBytes) * 100)) : 0;
+            setUploadStatus({
+              type: 'info',
+              message: `Uploading topic... ${percentage}% (${formatFileSize(uploadedBytes)} / ${formatFileSize(totalBytes)}) • chunk ${chunkIndex + 1} of ${totalChunks}`,
+            });
+          },
+        },
       );
 
       setUploadStatus({
         type: 'success',
-        message: `Topic "${lessonTitle}" uploaded successfully!`,
+        message: typeof (uploadResult as { message?: unknown })?.message === 'string'
+          ? String((uploadResult as { message?: string }).message)
+          : `Topic "${lessonTitle}" uploaded successfully.`,
       });
 
       // Reset form
@@ -169,33 +297,40 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
     }
   };
 
-  const loadModuleVideos = async () => {
+  const loadModuleVideos = useCallback(async () => {
     if (selectedModule && selectedCourse) {
       try {
-        const response = await EduService.listVideosInModule(selectedCourse, selectedModule);
+        const response = await EduService.listVideosInModule(selectedCourse, selectedModule, selectedChapter || null);
         if (Array.isArray(response)) {
           setVideos(response);
         } else if (response && typeof response === 'object' && 'videos' in response) {
           const moduleResponse = response as any;
-          const moduleDetails = moduleResponse.module || {};
-          if (selectedChapter) {
-            const matchedChapter = (moduleDetails.chapters || []).find((chapter: any) => chapter.id === selectedChapter);
-            setVideos(matchedChapter?.lessons || []);
-          } else {
-            setVideos(moduleResponse.videos || []);
-          }
+          setVideos(moduleResponse.videos || []);
         } else {
           setVideos([]);
         }
       } catch (err) {
         console.error('Failed to load topics:', err);
       }
+    } else {
+      setVideos([]);
     }
-  };
+  }, [selectedChapter, selectedCourse, selectedModule]);
 
-  React.useEffect(() => {
-    loadModuleVideos();
-  }, [selectedCourse, selectedModule, selectedChapter]);
+  useEffect(() => {
+    void loadModuleVideos();
+  }, [loadModuleVideos]);
+
+  useEffect(() => {
+    if (!hasProcessingVideos || uploading) {
+      return undefined;
+    }
+
+    const timer = window.setInterval(() => {
+      void loadModuleVideos();
+    }, 5_000);
+    return () => window.clearInterval(timer);
+  }, [hasProcessingVideos, loadModuleVideos, uploading]);
 
   const handleDeleteVideo = async (videoId: string) => {
     if (!confirm('Are you sure you want to delete this topic?')) {
@@ -217,6 +352,41 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
       });
     } finally {
       setDeleteLoading(null);
+    }
+  };
+
+  const handleDeleteFailedVideos = async () => {
+    const failedVideos = sortedVideos.filter(isFailedVideo);
+    if (failedVideos.length === 0) {
+      return;
+    }
+
+    if (!confirm(`Delete ${failedVideos.length} failed upload${failedVideos.length === 1 ? '' : 's'} from this ${currentChapter ? 'chapter' : 'subject'}?`)) {
+      return;
+    }
+
+    setBulkDeleteLoading(true);
+    setUploadStatus({
+      type: 'info',
+      message: `Removing ${failedVideos.length} failed upload${failedVideos.length === 1 ? '' : 's'}...`,
+    });
+
+    try {
+      for (const video of failedVideos) {
+        await EduService.deleteVideoFromModule(selectedCourse, selectedModule, video.id);
+      }
+      setUploadStatus({
+        type: 'success',
+        message: `Removed ${failedVideos.length} failed upload${failedVideos.length === 1 ? '' : 's'}.`,
+      });
+      await loadModuleVideos();
+    } catch (err) {
+      setUploadStatus({
+        type: 'error',
+        message: err instanceof Error ? err.message : 'Failed uploads could not be removed.',
+      });
+    } finally {
+      setBulkDeleteLoading(false);
     }
   };
 
@@ -374,7 +544,7 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
             onChange={(e) => setIsPremium(e.target.checked)}
             className="rounded border border-[var(--line)]"
           />
-          <span className="text-sm font-medium text-[var(--ink)]">Mark as premium (students must enroll to watch)</span>
+          <span className="text-sm font-medium text-[var(--ink)]">Mark as premium (leave off to make this a demo preview students can watch before buying)</span>
         </label>
 
         {uploadStatus.type && (
@@ -402,7 +572,7 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
           {uploading ? (
             <>
               <Loader className="h-5 w-5 animate-spin" />
-              Uploading topic...
+              <span className="truncate">{activeUploadLabel}</span>
             </>
           ) : (
             <>
@@ -422,7 +592,28 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
             <p className="mt-1 text-sm text-[var(--ink-soft)]">
               {currentChapter ? `Chapter inside ${currentModule.title}` : 'Direct topics under the selected subject'}
             </p>
+            {hasProcessingVideos && (
+              <p className="mt-2 inline-flex items-center gap-2 rounded-full bg-amber-100 px-3 py-1 text-xs font-semibold text-amber-700">
+                <Loader className="h-3.5 w-3.5 animate-spin" />
+                Checking upload readiness every few seconds
+              </p>
+            )}
           </div>
+
+          {failedVideoCount > 0 && (
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-[18px] border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+              <p>
+                {failedVideoCount} failed upload{failedVideoCount === 1 ? '' : 's'} found in this view. The ready topic stays untouched.
+              </p>
+              <button
+                onClick={handleDeleteFailedVideos}
+                disabled={bulkDeleteLoading}
+                className="rounded-xl border border-red-200 bg-white px-4 py-2 font-semibold text-red-700 transition hover:bg-red-100 disabled:opacity-50"
+              >
+                {bulkDeleteLoading ? 'Removing failed uploads...' : 'Remove failed uploads'}
+              </button>
+            </div>
+          )}
 
           {videos.length === 0 ? (
             <div className="rounded-[24px] border border-dashed border-[var(--line)] p-6 text-center text-[var(--ink-soft)]">
@@ -430,10 +621,14 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
             </div>
           ) : (
             <div className="space-y-3">
-              {videos.map((video) => (
+              {sortedVideos.map((video) => (
                 <div
                   key={video.id}
-                  className="flex items-start justify-between gap-4 rounded-[20px] border border-[var(--line)] bg-[var(--accent-cream)] p-4"
+                  className={`flex items-start justify-between gap-4 rounded-[20px] border p-4 ${
+                    isFailedVideo(video)
+                      ? 'border-red-200 bg-red-50/70'
+                      : 'border-[var(--line)] bg-[var(--accent-cream)]'
+                  }`}
                 >
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
@@ -443,6 +638,17 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
                           <Lock className="h-4 w-4 text-[var(--accent-rust)]" />
                         </div>
                       )}
+                      <span
+                        className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+                          video.playbackReady
+                            ? 'bg-[var(--success-soft)] text-[var(--success)]'
+                            : isFailedVideo(video)
+                              ? 'bg-red-100 text-red-700'
+                              : 'bg-amber-100 text-amber-700'
+                        }`}
+                      >
+                        {getStudentVisibilityLabel(video)}
+                      </span>
                     </div>
                     <div className="mt-1 flex flex-wrap gap-3 text-xs text-[var(--ink-soft)]">
                       <span>Duration: {video.durationMinutes || 0} min</span>
@@ -457,13 +663,19 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
                       {video.deliveryProfile && (
                         <>
                           <span>•</span>
-                          <span>Profile: {video.deliveryProfile}</span>
+                          <span>Pipeline: {getProviderLabel(video)}</span>
                         </>
                       )}
                       {video.hlsProcessingStatus && (
                         <>
                           <span>•</span>
-                          <span>Processing: {video.hlsProcessingStatus}</span>
+                          <span>{video.playbackReady ? 'Ready' : `Encoding: ${video.hlsProcessingStatus}`}</span>
+                        </>
+                      )}
+                      {typeof video.cloudflareStreamPctComplete === 'number' && !video.playbackReady && (
+                        <>
+                          <span>•</span>
+                          <span>{Math.round(video.cloudflareStreamPctComplete)}%</span>
                         </>
                       )}
                     </div>
@@ -475,6 +687,16 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
                     {video.hlsProcessingError ? (
                       <p className="mt-2 text-xs text-red-600">
                         HLS processing issue: {video.hlsProcessingError}
+                      </p>
+                    ) : null}
+                    {isFailedVideo(video) ? (
+                      <p className="mt-2 text-xs font-medium text-red-700">
+                        This failed upload is safe to remove if a replacement topic is already ready.
+                      </p>
+                    ) : null}
+                    {isProcessingVideo(video) ? (
+                      <p className="mt-2 text-xs font-medium text-amber-700">
+                        {getProcessingNotice(video)}
                       </p>
                     ) : null}
                   </div>
@@ -490,7 +712,7 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
                     </button>
                     <button
                       onClick={() => handleDeleteVideo(video.id)}
-                      disabled={deleteLoading === video.id}
+                      disabled={deleteLoading === video.id || bulkDeleteLoading}
                       className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-red-600 transition hover:bg-red-100 disabled:opacity-50"
                       title="Delete"
                     >
@@ -516,6 +738,7 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
           <li>New uploads are queued for lower-cost adaptive delivery so popular long lectures can shift to cheaper HLS playback</li>
           <li>Students receive only short-lived signed playback links from the secure backend API</li>
           <li>Mark topics as premium so only enrolled students can request playback tokens and access the stream</li>
+          <li>Leave premium turned off when you want a demo preview video visible before the course is purchased</li>
           <li>Topics appear in order and later topics can stay locked until the previous topic is completed</li>
           <li>Manage or delete topics anytime using the buttons above</li>
         </ul>

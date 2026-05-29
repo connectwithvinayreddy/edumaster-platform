@@ -23,6 +23,7 @@ const requireAuthFromQuery = async (req, res, next) => {
 };
 
 router.get('/', controller.listLiveClasses);
+router.get('/ingest/on-publish', controller.validateIngestPublish);
 router.post('/ingest/on-publish', controller.validateIngestPublish);
 router.get('/stream/:token', controller.streamProtectedLiveAsset);
 router.get('/admin', requireAuth, controller.listAdminLiveClasses);
@@ -44,6 +45,7 @@ router.post('/:liveClassId/session/leave', requireAuth, controller.leaveSession)
 router.post('/:liveClassId/session/heartbeat', requireAuth, controller.heartbeat);
 router.post('/:liveClassId/session/media', requireAuth, controller.updateMedia);
 router.post('/:liveClassId/session/raise-hand', requireAuth, controller.updateRaisedHand);
+router.post('/:liveClassId/poll/vote', requireAuth, controller.submitPollVote);
 router.post('/:liveClassId/session/participants/:participantUserId/approval', requireAuth, controller.updateSpeakerApproval);
 router.post('/:liveClassId/session/participants/:participantUserId/mute', requireAuth, controller.updateParticipantMute);
 router.post('/:liveClassId/session/participants/:participantUserId/remove', requireAuth, controller.removeParticipant);

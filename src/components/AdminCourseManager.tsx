@@ -3,6 +3,15 @@ import { Loader, Pencil, Save, Trash2, X } from 'lucide-react';
 import { EduService } from '../EduService';
 import { CourseCard } from '../types';
 
+const currency = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 });
+
+const getDiscountedPrice = (price: number, offerPercentage: number) => {
+  const safePrice = Math.max(Number(price || 0), 0);
+  const safeOffer = Math.min(Math.max(Number(offerPercentage || 0), 0), 100);
+  const discountedPrice = safePrice * (1 - (safeOffer / 100));
+  return Math.max(Number(discountedPrice.toFixed(2)), 0);
+};
+
 interface AdminCourseManagerProps {
   courses: CourseCard[];
   onCoursesChanged?: () => void | Promise<void>;
@@ -16,7 +25,8 @@ const createForm = (course: CourseCard | null) => ({
   subject: course?.subject || '',
   instructor: course?.instructor || '',
   officialChannelUrl: course?.officialChannelUrl || '',
-  price: course?.price || 0,
+  price: Math.max(Number(course?.price || 0), 0),
+  offerPercentage: Number(course?.offerPercentage || 0),
   validityDays: course?.validityDays || 183,
   level: course?.level || 'Full Course',
   thumbnailUrl: course?.thumbnailUrl || '',
@@ -144,7 +154,9 @@ export const AdminCourseManager: React.FC<AdminCourseManagerProps> = ({ courses,
               <p><span className="font-semibold text-[var(--ink)]">Exam:</span> {selectedCourse.exam}</p>
               <p className="mt-2"><span className="font-semibold text-[var(--ink)]">Subjects:</span> {selectedCourse.modules.length}</p>
               <p className="mt-2"><span className="font-semibold text-[var(--ink)]">Topics:</span> {selectedCourse.lessonCount || totalTopics}</p>
-              <p className="mt-2"><span className="font-semibold text-[var(--ink)]">Price:</span> {selectedCourse.price === 0 ? 'Free' : `INR ${selectedCourse.price}`}</p>
+              <p className="mt-2"><span className="font-semibold text-[var(--ink)]">Course fee:</span> {Number(selectedCourse.price || 0) === 0 ? 'Free' : currency.format(selectedCourse.price || 0)}</p>
+              <p className="mt-2"><span className="font-semibold text-[var(--ink)]">Offer:</span> {Number(selectedCourse.offerPercentage || 0)}%</p>
+              <p className="mt-2"><span className="font-semibold text-[var(--ink)]">Payable:</span> {Number(selectedCourse.price || 0) === 0 ? 'Free' : currency.format(getDiscountedPrice(selectedCourse.price || 0, selectedCourse.offerPercentage || 0))}</p>
             </div>
           )}
         </div>
@@ -199,17 +211,58 @@ export const AdminCourseManager: React.FC<AdminCourseManagerProps> = ({ courses,
               </div>
 
               <div className="grid gap-4 md:grid-cols-2">
-                <input value={form.title} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, title: event.target.value }))} className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
-                <input value={form.subject} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, subject: event.target.value }))} className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
-                <input value={form.instructor} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, instructor: event.target.value }))} className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
-                <input value={form.officialChannelUrl} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, officialChannelUrl: event.target.value }))} className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
-                <input type="number" value={form.price} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, price: Number(event.target.value) }))} className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
-                <input type="number" value={form.validityDays} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, validityDays: Number(event.target.value) }))} className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
-                <input value={form.category} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, category: event.target.value }))} className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
-                <input value={form.level} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, level: event.target.value }))} className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
-                <input value={form.exam} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, exam: event.target.value }))} className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
-                <input value={form.thumbnailUrl} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, thumbnailUrl: event.target.value }))} className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
-                <textarea value={form.description} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, description: event.target.value }))} className="h-32 rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70 md:col-span-2" />
+                <label className="space-y-2">
+                  <span className="block text-sm font-semibold text-[var(--ink)]">Course Title</span>
+                  <input value={form.title} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, title: event.target.value }))} className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
+                </label>
+                <label className="space-y-2">
+                  <span className="block text-sm font-semibold text-[var(--ink)]">Subject</span>
+                  <input value={form.subject} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, subject: event.target.value }))} className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
+                </label>
+                <label className="space-y-2">
+                  <span className="block text-sm font-semibold text-[var(--ink)]">Instructor</span>
+                  <input value={form.instructor} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, instructor: event.target.value }))} className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
+                </label>
+                <label className="space-y-2">
+                  <span className="block text-sm font-semibold text-[var(--ink)]">Official Channel URL</span>
+                  <input value={form.officialChannelUrl} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, officialChannelUrl: event.target.value }))} className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
+                </label>
+                <label className="space-y-2">
+                  <span className="block text-sm font-semibold text-[var(--ink)]">Course Fee (INR)</span>
+                  <input type="number" min="0" value={form.price} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, price: Number(event.target.value) }))} className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
+                  <span className="block text-xs text-[var(--ink-soft)]">Use `0` to keep the course free.</span>
+                </label>
+                <label className="space-y-2">
+                  <span className="block text-sm font-semibold text-[var(--ink)]">Offer Percentage</span>
+                  <input type="number" min="0" max="100" value={form.offerPercentage} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, offerPercentage: Number(event.target.value) }))} className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
+                </label>
+                <label className="space-y-2">
+                  <span className="block text-sm font-semibold text-[var(--ink)]">Validity (Days)</span>
+                  <input type="number" min="1" value={form.validityDays} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, validityDays: Number(event.target.value) }))} className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
+                </label>
+                <label className="space-y-2">
+                  <span className="block text-sm font-semibold text-[var(--ink)]">Category</span>
+                  <input value={form.category} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, category: event.target.value }))} className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
+                </label>
+                <label className="space-y-2">
+                  <span className="block text-sm font-semibold text-[var(--ink)]">Level</span>
+                  <input value={form.level} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, level: event.target.value }))} className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
+                </label>
+                <label className="space-y-2">
+                  <span className="block text-sm font-semibold text-[var(--ink)]">Exam</span>
+                  <input value={form.exam} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, exam: event.target.value }))} className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
+                </label>
+                <label className="space-y-2">
+                  <span className="block text-sm font-semibold text-[var(--ink)]">Thumbnail URL</span>
+                  <input value={form.thumbnailUrl} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, thumbnailUrl: event.target.value }))} className="w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
+                </label>
+                <label className="space-y-2 md:col-span-2">
+                  <span className="block text-sm font-semibold text-[var(--ink)]">Course Description</span>
+                  <textarea value={form.description} disabled={!editing} onChange={(event) => setForm((current) => ({ ...current, description: event.target.value }))} className="h-32 w-full rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 outline-none disabled:opacity-70" />
+                </label>
+                <div className="rounded-2xl border border-[var(--line)] bg-[var(--accent-cream)] px-4 py-3 text-sm text-[var(--ink-soft)] md:col-span-2">
+                  Payable amount shown to learners: <span className="font-semibold text-[var(--ink)]">{form.price === 0 ? 'Free' : currency.format(getDiscountedPrice(form.price, form.offerPercentage))}</span>
+                </div>
               </div>
 
               {message.type && (

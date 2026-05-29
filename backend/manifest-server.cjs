@@ -11,12 +11,16 @@ const { appConfig } = require('./lib/config.js');
 const { securityHeaders } = require('./middleware/security.js');
 const { notFoundHandler, errorHandler } = require('./middleware/error-handler.js');
 const {
+  HLS_ACCESS_COOKIE_NAME,
+  verifyPlaybackToken,
   verifyManifestBundleSignature,
   decodeCompactAssetPath,
   resolvePrivateHlsPath,
+  getProtectedAssetStorageRoot,
 } = require('./lib/private-video.js');
+const { sessionRepository } = require('./lib/repositories.js');
 const {
-  getSignedPrivateVideoUrl,
+  getPrivateStorageObjectBuffer,
   isS3Provider,
 } = require('./lib/private-video-storage.js');
 const { getHlsAssetMimeType } = require('./lib/hls-manifest.js');
@@ -41,6 +45,39 @@ const parseCorsOrigin = (value) => {
 };
 
 const MANIFEST_ROUTE_PREFIX = '/course-manifests/b/';
+
+const parseRequestCookies = (req) => String(req.headers.cookie || '')
+  .split(';')
+  .map((entry) => entry.trim())
+  .filter(Boolean)
+  .reduce((accumulator, entry) => {
+    const separatorIndex = entry.indexOf('=');
+    if (separatorIndex <= 0) {
+      return accumulator;
+    }
+
+    const name = entry.slice(0, separatorIndex).trim();
+    const value = entry.slice(separatorIndex + 1).trim();
+    accumulator[name] = decodeURIComponent(value);
+    return accumulator;
+  }, {});
+
+const getValidHlsGrantFromRequest = async (req, storageRoot) => {
+  const cookieToken = parseRequestCookies(req)[HLS_ACCESS_COOKIE_NAME] || '';
+  const payload = verifyPlaybackToken(cookieToken);
+  if (!payload || payload.kind !== 'course-hls-grant' || String(payload.storageRoot || '') !== String(storageRoot || '')) {
+    return null;
+  }
+
+  if (payload.sessionId && payload.userId) {
+    const activeSessionId = await sessionRepository.getActiveSessionId(String(payload.userId), String(payload.sessionId));
+    if (activeSessionId !== payload.sessionId) {
+      return null;
+    }
+  }
+
+  return payload;
+};
 
 const parseBundleRequest = (capturedPath) => {
   const segments = String(capturedPath || '')
@@ -145,6 +182,14 @@ app.get(['/api/course-manifests/b/*', '/backend/api/course-manifests/b/*'], asyn
       return;
     }
     const authLatencyMs = Number(process.hrtime.bigint() - authStarted) / 1_000_000;
+    const storageRoot = getProtectedAssetStorageRoot(parsed.bundlePath);
+    const hlsGrant = await getValidHlsGrantFromRequest(req, storageRoot);
+    if (!hlsGrant) {
+      recordAuthFailure();
+      res.status(401).json({ message: 'Playback grant is missing or expired.' });
+      finish({ authLatencyMs });
+      return;
+    }
 
     if (assetKind === 'manifest') {
       const bundleStarted = process.hrtime.bigint();
@@ -177,19 +222,19 @@ app.get(['/api/course-manifests/b/*', '/backend/api/course-manifests/b/*'], asyn
 
     const storagePath = path.posix.join(parsed.bundlePath, parsed.assetPath);
     if (isS3Provider(parsed.storageProvider)) {
-      const signedUrl = await getSignedPrivateVideoUrl({
+      const assetBuffer = await getPrivateStorageObjectBuffer({
+        storageProvider: parsed.storageProvider,
         storagePath,
-        mimeType: getHlsAssetMimeType(parsed.assetPath),
       });
 
-      if (!signedUrl) {
+      if (!assetBuffer) {
         res.status(404).json({ message: 'HLS segment is unavailable.' });
         finish({ authLatencyMs });
         return;
       }
 
-      setManifestCacheHeaders(res, parsed.assetPath, 'segment-redirect');
-      res.redirect(307, signedUrl);
+      setManifestCacheHeaders(res, parsed.assetPath, 'segment-proxy');
+      res.send(assetBuffer);
       finish({ authLatencyMs });
       return;
     }

@@ -54,6 +54,9 @@ npm run validate:production
 Live-class release guide:
 
 - [LIVE_CLASSES_RELEASE_GUIDE.md](./LIVE_CLASSES_RELEASE_GUIDE.md)
+- [Low-Cost Video Streaming Architecture](./docs/LOW_COST_VIDEO_STREAMING_ARCHITECTURE.md)
+- [Low-Cost Video Streaming Dev Prompt](./docs/LOW_COST_VIDEO_STREAMING_DEV_PROMPT.md)
+- [Free DRM-Like Dev Stack](./docs/FREE_DRM_DEV_STACK.md)
 
 ## Firebase deployment
 

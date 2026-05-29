@@ -50,4 +50,13 @@ const upload = multer({
   },
 });
 
+const chunkUpload = multer({
+  storage,
+  limits: {
+    fileSize: appConfig.maxVideoUploadMb * 1024 * 1024,
+  },
+});
+
 module.exports = upload;
+module.exports.chunkUpload = chunkUpload;
+module.exports.uploadDir = uploadDir;

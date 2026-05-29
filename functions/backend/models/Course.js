@@ -7,6 +7,7 @@ const CourseSchema = new mongoose.Schema({
   level: { type: String, default: 'Full Course' },
   description: { type: String },
   price: { type: Number, default: 0 },
+  offerPercentage: { type: Number, default: 0 },
   validityDays: { type: Number, default: 365 },
   thumbnailUrl: { type: String },
   instructor: { type: String },

@@ -10,17 +10,14 @@ const { ACTIVE_TRACK_SET, HEARTBEAT_TTL_SECONDS } = require('../track/track.cont
 
 const AGGREGATION_INTERVAL_MS = Number(process.env.TRACK_AGGREGATION_INTERVAL_MS || 60_000);
 const STALE_SESSION_MS = Number(process.env.TRACK_STALE_SESSION_MS || 120_000);
+const WATCH_COMPLETION_THRESHOLD = Math.min(
+  Math.max(Number(process.env.VIDEO_WATCH_COMPLETION_THRESHOLD_PERCENT || 90) / 100, 0.5),
+  1,
+);
 
 const nowIso = () => new Date().toISOString();
 
 const finalizeSession = async (key, session, reason = 'completed') => {
-  if (!session?.viewCountedAt && session?.userId && session?.courseId) {
-    await platformRepository.incrementEnrollmentViewCount({
-      userId: session.userId,
-      courseId: session.courseId,
-    });
-  }
-
   await removeRedisSetMember(ACTIVE_TRACK_SET, key);
   await deleteRedisKey(key);
   console.log(`[watch-aggregator] finalized ${key} (${reason})`);
@@ -50,15 +47,27 @@ const processSession = async (key) => {
   );
 
   const stale = (Date.now() - lastSeenAt) > STALE_SESSION_MS;
-  const shouldCount = !session.viewCountedAt && watchSeconds >= (durationSeconds * 0.8);
+  const shouldCount = !session.viewCountedAt && watchSeconds >= (durationSeconds * WATCH_COMPLETION_THRESHOLD);
 
   if (shouldCount) {
     session.viewCountedAt = nowIso();
     await setRedisJson(key, session, { ttlSeconds: HEARTBEAT_TTL_SECONDS });
-    await platformRepository.incrementEnrollmentViewCount({
-      userId: session.userId,
-      courseId: session.courseId,
-    });
+    if (session.lessonId) {
+      await platformRepository.recordCompletedVideoWatch({
+        userId: session.userId,
+        courseId: session.courseId,
+        lessonId: session.lessonId,
+        progressSeconds: watchSeconds,
+        durationSeconds,
+        sessionId: session.sessionId || null,
+        device: session.device || null,
+      });
+    } else {
+      await platformRepository.incrementEnrollmentViewCount({
+        userId: session.userId,
+        courseId: session.courseId,
+      });
+    }
     await removeRedisSetMember(ACTIVE_TRACK_SET, key);
     await deleteRedisKey(key);
     console.log(`[watch-aggregator] counted view for ${session.userId}/${session.courseId}`);

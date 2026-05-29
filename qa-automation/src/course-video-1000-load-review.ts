@@ -2,6 +2,8 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
+import dotenv from 'dotenv';
 import { config } from './config.js';
 import { qaFetch } from './network.js';
 
@@ -59,6 +61,29 @@ type PlayerPayload = {
   streamFormat?: string | null;
   playbackStatus?: string | null;
   tokenExpiresAt?: string | null;
+};
+
+type PlayerBootstrap = {
+  player: PlayerPayload;
+  playbackGrantCookie: string | null;
+};
+
+type LessonBootstrapPayload = {
+  course?: {
+    _id?: string;
+    title?: string;
+  } | null;
+  lessons?: Array<{
+    id?: string;
+    _id?: string;
+    title?: string;
+  }>;
+  lesson?: {
+    id?: string;
+    _id?: string;
+    title?: string;
+  } | null;
+  player?: PlayerPayload | null;
 };
 
 type CourseAssignment = {
@@ -162,6 +187,8 @@ type FailureAttribution = {
 
 const runId = new Date().toISOString().replace(/[:.]/g, '-');
 const rootDir = path.resolve(process.cwd());
+dotenv.config({ path: path.resolve(rootDir, '../.env') });
+const require = createRequire(import.meta.url);
 const REPORT_PREFIX = (process.env.COURSE_LOAD_REPORT_PREFIX || 'course-video-1000').trim() || 'course-video-1000';
 const reportDir = path.join(rootDir, 'reports', `${REPORT_PREFIX}-${runId}`);
 const manifestPath = path.join(reportDir, 'prepared-users.json');
@@ -206,6 +233,10 @@ const WATCH_START_JITTER_SECONDS = Math.max(0, Number(process.env.COURSE_LOAD_WA
 const WATCH_RETRY_ATTEMPTS = Math.max(1, Number(process.env.COURSE_LOAD_WATCH_RETRY_ATTEMPTS || 3));
 const WATCH_RETRY_BACKOFF_MS = Math.max(250, Number(process.env.COURSE_LOAD_WATCH_RETRY_BACKOFF_MS || 1500));
 const WATCH_PROGRESS_MIN_DELTA_SECONDS = Math.max(15, Number(process.env.COURSE_LOAD_WATCH_PROGRESS_MIN_DELTA_SECONDS || 180));
+const USE_LESSON_BOOTSTRAP = String(process.env.COURSE_LOAD_USE_LESSON_BOOTSTRAP || 'true').toLowerCase() !== 'false';
+const ENROLL_ON_START = ['1', 'true', 'yes', 'on'].includes(String(process.env.COURSE_LOAD_ENROLL_ON_START || '').toLowerCase());
+const LOCAL_ENROLL_ON_START = String(process.env.COURSE_LOAD_LOCAL_ENROLL || '').toLowerCase() !== 'false'
+  && /127\.0\.0\.1|localhost/.test(apiOrigin);
 const MIXED_ADDITIONAL_ASSIGNMENTS_JSON = String(process.env.COURSE_LOAD_MIXED_ASSIGNMENTS_JSON || '').trim();
 const HOT_COURSE_PERCENT = Math.max(0, Math.min(100, Number(process.env.COURSE_LOAD_HOT_COURSE_PERCENT || 95)));
 const RESOURCE_TELEMETRY_COMMAND = String(process.env.COURSE_LOAD_RESOURCE_COMMAND || '').trim();
@@ -311,28 +342,91 @@ const pickId = (value: unknown): string | null => {
   return direct ? String(direct) : null;
 };
 
+const enrollUserLocally = async (userId: string, courseId: string) => {
+  const repositories = require(path.resolve(rootDir, '../backend/lib/repositories.js'));
+  const platformRepository = repositories.platformRepository || repositories.default?.platformRepository;
+  if (!platformRepository) {
+    throw new Error('Local enrollment repositories are unavailable.');
+  }
+
+  await platformRepository.enroll({
+    userId,
+    courseId,
+    source: 'course-video-1000-load-review',
+    accessType: 'course',
+  });
+};
+
+const enrollUserForCourse = async (token: string, user: LoadUser, courseId: string, userLabel: string) => {
+  if (LOCAL_ENROLL_ON_START && user.userId) {
+    await enrollUserLocally(user.userId, courseId);
+    return { local: true };
+  }
+
+  return request('course.enroll', 'POST', '/platform/enroll', {
+    courseId,
+    source: 'load-test',
+  }, token, userLabel);
+};
+
 const getClientProfile = (user?: string) => {
   const index = Number(String(user || '').match(/_(\d+)@/)?.[1] || 0);
   if (index % 3 === 1) {
     return {
-      name: 'mobile-ios-web',
+      name: 'mobile-ios-safari',
       userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+      app: 'web',
+      platform: 'ios',
+      browser: 'safari',
     };
   }
   if (index % 3 === 2) {
     return {
-      name: 'mobile-android-web',
+      name: 'android-app',
       userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36',
+      app: 'native',
+      platform: 'android',
+      browser: 'android-webview',
     };
   }
   return {
-    name: 'desktop-web',
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+    name: 'desktop-windows-edge',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0',
+    app: 'web',
+    platform: 'windows',
+    browser: 'edge',
   };
 };
 
+const buildClientHeaders = (clientProfile: ReturnType<typeof getClientProfile>, user?: string, token?: string) => ({
+  'user-agent': clientProfile.userAgent,
+  'x-qa-client-profile': clientProfile.name,
+  'x-edumaster-app': clientProfile.app,
+  'x-edumaster-client-platform': clientProfile.platform,
+  'x-edumaster-client-browser': clientProfile.browser,
+  'x-edumaster-device-id': `course-load-${clientProfile.platform}-${Buffer.from(String(user || 'anonymous')).toString('hex').slice(0, 24)}`,
+  ...(token ? { authorization: `Bearer ${token}` } : {}),
+});
+
 const recordIssue = (issue: Issue) => {
   issues.push(issue);
+};
+
+const extractCookiePair = (setCookieHeader: string | null, cookieName: string) => {
+  if (!setCookieHeader) {
+    return null;
+  }
+
+  const cookieMatch = setCookieHeader
+    .split(/,(?=[^;]+=[^;]+)/)
+    .map((item) => item.trim())
+    .find((item) => item.startsWith(`${cookieName}=`));
+
+  if (!cookieMatch) {
+    return null;
+  }
+
+  return cookieMatch.split(';')[0] || null;
 };
 
 const parseAdditionalAssignments = (): CourseAssignment[] => {
@@ -459,9 +553,7 @@ const request = async <T = unknown>(
     const response = await qaFetch(`${apiBase}${route}`, {
       method,
       headers: {
-        'user-agent': clientProfile.userAgent,
-        'x-qa-client-profile': clientProfile.name,
-        ...(token ? { authorization: `Bearer ${token}` } : {}),
+        ...buildClientHeaders(clientProfile, user, token),
         ...(body ? { 'content-type': 'application/json' } : {}),
       },
       body: body ? JSON.stringify(body) : undefined,
@@ -576,10 +668,260 @@ const request = async <T = unknown>(
   }
 };
 
+const requestPlayerBootstrap = async (
+  route: string,
+  token: string,
+  user?: string,
+  context: RequestContext = {},
+): Promise<PlayerBootstrap | null> => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const started = performance.now();
+  let status = 0;
+  let responsePayload: unknown = null;
+  const clientProfile = getClientProfile(user);
+  const recordedAt = new Date().toISOString();
+
+  try {
+    const response = await qaFetch(`${apiBase}${route}`, {
+      method: 'GET',
+      headers: buildClientHeaders(clientProfile, user, token),
+      signal: controller.signal,
+    });
+    status = response.status;
+    const text = await response.text();
+    responsePayload = text ? JSON.parse(text) : null;
+    const durationMs = Math.round(performance.now() - started);
+    const telemetry = readResponseTelemetry(response);
+    metrics.push({
+      name: 'course.player',
+      method: 'GET',
+      path: route,
+      status,
+      ok: response.ok,
+      durationMs,
+      recordedAt,
+      user,
+      userId: context.userId,
+      courseId: context.courseId,
+      lessonId: context.lessonId,
+      soakMinute: context.soakSecond != null ? Math.floor(context.soakSecond / 60) : undefined,
+      tickIndex: context.tickIndex,
+      endpointKind: context.endpointKind,
+      phase: context.phase,
+      retryAttempt: context.retryAttempt,
+      clientProfile: clientProfile.name,
+      bytes: text.length,
+      worker: telemetry.worker,
+      cacheStatus: telemetry.cacheStatus,
+      cacheDetail: telemetry.cacheDetail,
+      cacheKey: telemetry.cacheKey,
+      upstreamResponseTime: telemetry.upstreamResponseTime,
+    });
+
+    if (!response.ok) {
+      const message = typeof responsePayload === 'object' && responsePayload
+        ? String((responsePayload as Record<string, unknown>).message || (responsePayload as Record<string, unknown>).error || `${status}`)
+        : `${status}`;
+      throw Object.assign(new Error(`GET ${route} failed with ${status}: ${message}`), {
+        status,
+        payload: responsePayload,
+        metricRecorded: true,
+        ...telemetry,
+      });
+    }
+
+    return {
+      player: (responsePayload || {}) as PlayerPayload,
+      playbackGrantCookie: extractCookiePair(response.headers.get('set-cookie'), 'edumaster_hls'),
+    };
+  } catch (error) {
+    const durationMs = Math.round(performance.now() - started);
+    const message = error instanceof Error ? error.message : String(error);
+    if (!(error as { metricRecorded?: boolean })?.metricRecorded) {
+      metrics.push({
+        name: 'course.player',
+        method: 'GET',
+        path: route,
+        status,
+        ok: false,
+        durationMs,
+        recordedAt,
+        user,
+        userId: context.userId,
+        courseId: context.courseId,
+        lessonId: context.lessonId,
+        soakMinute: context.soakSecond != null ? Math.floor(context.soakSecond / 60) : undefined,
+        tickIndex: context.tickIndex,
+        endpointKind: context.endpointKind,
+        phase: context.phase,
+        retryAttempt: context.retryAttempt,
+        clientProfile: clientProfile.name,
+        error: message,
+      });
+    }
+    failureAttribution.push({
+      recordedAt,
+      minuteOfSoak: context.soakSecond != null ? Math.floor(context.soakSecond / 60) : 0,
+      endpoint: 'course.player',
+      method: 'GET',
+      path: route,
+      statusCode: status,
+      category: classifyFailure(status, message),
+      durationMs,
+      retryAttempt: context.retryAttempt || 0,
+      user: user || null,
+      userId: context.userId || null,
+      courseId: context.courseId || null,
+      lessonId: context.lessonId || null,
+      worker: (error as { worker?: string | null })?.worker || null,
+      cacheStatus: (error as { cacheStatus?: string | null })?.cacheStatus || null,
+      cacheDetail: (error as { cacheDetail?: string | null })?.cacheDetail || null,
+      cacheKey: (error as { cacheKey?: string | null })?.cacheKey || null,
+      upstreamResponseTime: (error as { upstreamResponseTime?: string | null })?.upstreamResponseTime || null,
+      phase: context.phase || null,
+      endpointKind: context.endpointKind || null,
+      tickIndex: context.tickIndex ?? null,
+      errorMessage: message,
+    });
+    throw Object.assign(new Error(message), { status, payload: responsePayload });
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const requestLessonBootstrap = async (
+  route: string,
+  token: string,
+  user?: string,
+  context: RequestContext = {},
+): Promise<PlayerBootstrap | null> => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const started = performance.now();
+  let status = 0;
+  let responsePayload: unknown = null;
+  const clientProfile = getClientProfile(user);
+  const recordedAt = new Date().toISOString();
+
+  try {
+    const response = await qaFetch(`${apiBase}${route}`, {
+      method: 'GET',
+      headers: buildClientHeaders(clientProfile, user, token),
+      signal: controller.signal,
+    });
+    status = response.status;
+    const text = await response.text();
+    responsePayload = text ? JSON.parse(text) : null;
+    const durationMs = Math.round(performance.now() - started);
+    const telemetry = readResponseTelemetry(response);
+    metrics.push({
+      name: 'course.lessonBootstrap',
+      method: 'GET',
+      path: route,
+      status,
+      ok: response.ok,
+      durationMs,
+      recordedAt,
+      user,
+      userId: context.userId,
+      courseId: context.courseId,
+      lessonId: context.lessonId,
+      soakMinute: context.soakSecond != null ? Math.floor(context.soakSecond / 60) : undefined,
+      tickIndex: context.tickIndex,
+      endpointKind: context.endpointKind,
+      phase: context.phase,
+      retryAttempt: context.retryAttempt,
+      clientProfile: clientProfile.name,
+      bytes: text.length,
+      worker: telemetry.worker,
+      cacheStatus: telemetry.cacheStatus,
+      cacheDetail: telemetry.cacheDetail,
+      cacheKey: telemetry.cacheKey,
+      upstreamResponseTime: telemetry.upstreamResponseTime,
+    });
+
+    if (!response.ok) {
+      const message = typeof responsePayload === 'object' && responsePayload
+        ? String((responsePayload as Record<string, unknown>).message || (responsePayload as Record<string, unknown>).error || `${status}`)
+        : `${status}`;
+      throw Object.assign(new Error(`GET ${route} failed with ${status}: ${message}`), {
+        status,
+        payload: responsePayload,
+        metricRecorded: true,
+        ...telemetry,
+      });
+    }
+
+    const payload = (responsePayload || {}) as LessonBootstrapPayload;
+    if (!payload.player) {
+      return null;
+    }
+
+    return {
+      player: payload.player,
+      playbackGrantCookie: extractCookiePair(response.headers.get('set-cookie'), 'edumaster_hls'),
+    };
+  } catch (error) {
+    const durationMs = Math.round(performance.now() - started);
+    const message = error instanceof Error ? error.message : String(error);
+    if (!(error as { metricRecorded?: boolean })?.metricRecorded) {
+      metrics.push({
+        name: 'course.lessonBootstrap',
+        method: 'GET',
+        path: route,
+        status,
+        ok: false,
+        durationMs,
+        recordedAt,
+        user,
+        userId: context.userId,
+        courseId: context.courseId,
+        lessonId: context.lessonId,
+        soakMinute: context.soakSecond != null ? Math.floor(context.soakSecond / 60) : undefined,
+        tickIndex: context.tickIndex,
+        endpointKind: context.endpointKind,
+        phase: context.phase,
+        retryAttempt: context.retryAttempt,
+        clientProfile: clientProfile.name,
+        error: message,
+      });
+    }
+    failureAttribution.push({
+      recordedAt,
+      minuteOfSoak: context.soakSecond != null ? Math.floor(context.soakSecond / 60) : 0,
+      endpoint: 'course.lessonBootstrap',
+      method: 'GET',
+      path: route,
+      statusCode: status,
+      category: classifyFailure(status, message),
+      durationMs,
+      retryAttempt: context.retryAttempt || 0,
+      user: user || null,
+      userId: context.userId || null,
+      courseId: context.courseId || null,
+      lessonId: context.lessonId || null,
+      worker: (error as { worker?: string | null })?.worker || null,
+      cacheStatus: (error as { cacheStatus?: string | null })?.cacheStatus || null,
+      cacheDetail: (error as { cacheDetail?: string | null })?.cacheDetail || null,
+      cacheKey: (error as { cacheKey?: string | null })?.cacheKey || null,
+      upstreamResponseTime: (error as { upstreamResponseTime?: string | null })?.upstreamResponseTime || null,
+      phase: context.phase || null,
+      endpointKind: context.endpointKind || null,
+      tickIndex: context.tickIndex ?? null,
+      errorMessage: message,
+    });
+    throw Object.assign(new Error(message), { status, payload: responsePayload });
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
 const fetchText = async (
   name: string,
   url: string,
   token?: string,
+  cookieHeader?: string | null,
   user?: string,
   context: RequestContext = {},
 ) => {
@@ -594,9 +936,8 @@ const fetchText = async (
     const response = await qaFetch(url, {
       method: 'GET',
       headers: {
-        'user-agent': clientProfile.userAgent,
-        'x-qa-client-profile': clientProfile.name,
-        ...(token ? { authorization: `Bearer ${token}` } : {}),
+        ...buildClientHeaders(clientProfile, user, token),
+        ...(cookieHeader ? { cookie: cookieHeader } : {}),
       },
       signal: controller.signal,
     });
@@ -705,6 +1046,7 @@ const fetchBinary = async (
   name: string,
   url: string,
   token?: string,
+  cookieHeader?: string | null,
   user?: string,
   context: RequestContext = {},
 ) => {
@@ -719,9 +1061,8 @@ const fetchBinary = async (
     const response = await qaFetch(url, {
       method: 'GET',
       headers: {
-        'user-agent': clientProfile.userAgent,
-        'x-qa-client-profile': clientProfile.name,
-        ...(token ? { authorization: `Bearer ${token}` } : {}),
+        ...buildClientHeaders(clientProfile, user, token),
+        ...(cookieHeader ? { cookie: cookieHeader } : {}),
       },
       signal: controller.signal,
     });
@@ -1146,12 +1487,13 @@ const prepareUsers = async (): Promise<LoadUser[]> => {
   const preparedUsers: Array<LoadUser | undefined> = new Array(VUS);
   const users = await runPool(indexes, SETUP_CONCURRENCY, async (index) => {
     const email = `course_load_${suffix}_${index}@edumaster.local`;
+    const mobileNumber = `9${String(Date.now()).slice(-4)}${String(index).padStart(5, '0')}`;
     try {
       await withPrepareRetry(`signup:${email}`, () => request('auth.signup', 'POST', '/auth/register', {
         name: `Course Load User ${index + 1}`,
         email,
         password: USER_PASSWORD,
-        mobileNumber: `90100${String(index).padStart(5, '0')}`,
+        mobileNumber,
       }, undefined, email));
     } catch (error) {
       recordIssue({
@@ -1198,6 +1540,7 @@ const absoluteUrl = (raw: string) => new URL(raw, apiOrigin).toString();
 const fetchManifestAndSegments = async (
   player: PlayerPayload,
   token: string,
+  cookieHeader: string | null,
   userLabel: string,
   segmentCount: number,
   context: RequestContext = {},
@@ -1208,7 +1551,7 @@ const fetchManifestAndSegments = async (
 
   const startedMaster = performance.now();
   const masterUrl = absoluteUrl(String(player.streamUrl));
-  const masterManifest = await fetchText('course.video.masterManifest', masterUrl, token, userLabel, {
+  const masterManifest = await fetchText('course.video.masterManifest', masterUrl, token, cookieHeader, userLabel, {
     ...context,
     endpointKind: 'master-manifest',
   });
@@ -1220,7 +1563,7 @@ const fetchManifestAndSegments = async (
 
   const startedMedia = performance.now();
   const playlistUrl = absoluteUrl(masterEntries.find((entry) => entry.endsWith('.m3u8')) || masterEntries[0]);
-  const mediaManifest = await fetchText('course.video.mediaManifest', playlistUrl, token, userLabel, {
+  const mediaManifest = await fetchText('course.video.mediaManifest', playlistUrl, token, cookieHeader, userLabel, {
     ...context,
     endpointKind: 'media-manifest',
   });
@@ -1236,7 +1579,7 @@ const fetchManifestAndSegments = async (
   const startedSegments = performance.now();
   for (const [index, entry] of mediaEntries.entries()) {
     const segmentUrl = absoluteUrl(entry);
-    await fetchBinary(`course.video.segment.${index + 1}`, segmentUrl, token, userLabel, {
+    await fetchBinary(`course.video.segment.${index + 1}`, segmentUrl, token, cookieHeader, userLabel, {
       ...context,
       endpointKind: `segment-${index + 1}`,
     });
@@ -1251,8 +1594,12 @@ const fetchManifestAndSegments = async (
   };
 };
 
-const runVideoFetchFlow = async (player: PlayerPayload, token: string, userLabel: string) =>
-  fetchManifestAndSegments(player, token, userLabel, SEGMENTS_PER_USER);
+const runVideoFetchFlow = async (
+  player: PlayerPayload,
+  token: string,
+  playbackGrantCookie: string | null,
+  userLabel: string,
+) => fetchManifestAndSegments(player, token, playbackGrantCookie, userLabel, SEGMENTS_PER_USER);
 
 const maybeSleepForWatch = async (
   playbackStartedAtMs: number,
@@ -1386,17 +1733,44 @@ const runUserJourney = async (user: LoadUser) => {
   };
 
   try {
-    await step('Courses list', () => request('courses.list', 'GET', '/courses', undefined, currentToken, userLabel));
-    await step('Course detail', () => request('courses.detail', 'GET', `/courses/${assignment.courseId}`, undefined, currentToken, userLabel));
-    await step('Course lessons', () => request('courses.lessons', 'GET', `/courses/${assignment.courseId}/lessons`, undefined, currentToken, userLabel));
-    await step('Course enroll', () => request('course.enroll', 'POST', '/platform/enroll', {
-      courseId: assignment.courseId,
-      source: 'load-test',
-    }, currentToken, userLabel));
+    let playerBootstrap = null;
+    if (USE_LESSON_BOOTSTRAP) {
+      if (ENROLL_ON_START) {
+        await step('Course enroll', () => enrollUserForCourse(currentToken, user, assignment.courseId, userLabel));
+      }
 
-    const player = await step('Course lesson player', () => request<PlayerPayload>('course.player', 'GET', `/courses/${assignment.courseId}/lessons/${assignment.lessonId}/player`, undefined, currentToken, userLabel), 'Critical') as PlayerPayload | null;
-    if (player) {
-      await step('Course video startup fetch', () => runVideoFetchFlow(player, currentToken, userLabel), 'Critical');
+      playerBootstrap = await step(
+        'Course lesson bootstrap',
+        () => requestLessonBootstrap(`/courses/${assignment.courseId}/lessons/${assignment.lessonId}/bootstrap`, currentToken, userLabel, {
+          userId: user.userId,
+          courseId: assignment.courseId,
+          lessonId: assignment.lessonId,
+        }),
+        'Critical',
+      ) as PlayerBootstrap | null;
+    } else {
+      await step('Courses list', () => request('courses.list', 'GET', '/courses', undefined, currentToken, userLabel));
+      await step('Course detail', () => request('courses.detail', 'GET', `/courses/${assignment.courseId}`, undefined, currentToken, userLabel));
+      await step('Course lessons', () => request('courses.lessons', 'GET', `/courses/${assignment.courseId}/lessons`, undefined, currentToken, userLabel));
+      await step('Course enroll', () => enrollUserForCourse(currentToken, user, assignment.courseId, userLabel));
+
+      playerBootstrap = await step(
+        'Course lesson player',
+        () => requestPlayerBootstrap(`/courses/${assignment.courseId}/lessons/${assignment.lessonId}/player`, currentToken, userLabel, {
+          userId: user.userId,
+          courseId: assignment.courseId,
+          lessonId: assignment.lessonId,
+        }),
+        'Critical',
+      ) as PlayerBootstrap | null;
+    }
+
+    if (playerBootstrap?.player) {
+      const {
+        player,
+        playbackGrantCookie,
+      } = playerBootstrap;
+      await step('Course video startup fetch', () => runVideoFetchFlow(player, currentToken, playbackGrantCookie, userLabel), 'Critical');
 
       if (WATCH_MODE) {
         if (userStartJitterSeconds > 0) {
@@ -1514,7 +1888,7 @@ const runUserJourney = async (user: LoadUser) => {
               refreshContext,
               telemetry,
               tick,
-              (retryAttempt) => fetchManifestAndSegments(player, currentToken, userLabel, WATCH_SEGMENT_WINDOW_SIZE, {
+              (retryAttempt) => fetchManifestAndSegments(player, currentToken, playbackGrantCookie, userLabel, WATCH_SEGMENT_WINDOW_SIZE, {
                 ...refreshContext,
                 retryAttempt,
               }),

@@ -30,6 +30,7 @@ export const CourseSchema = new Schema({
   level: { type: String, default: 'Full Course' },
   description: { type: String, default: '' },
   price: { type: Number, default: 0 },
+  offerPercentage: { type: Number, default: 0 },
   validityDays: { type: Number, default: 365 },
   thumbnailUrl: { type: String, default: null },
   instructor: { type: String, default: 'VARONENGLISH Faculty' },

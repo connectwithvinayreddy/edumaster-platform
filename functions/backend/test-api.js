@@ -236,7 +236,7 @@ const testEndpoints = async () => {
     );
 
     await runStep('GET /notifications', () =>
-      request('GET', `/notifications?userId=${encodeURIComponent(studentUserId)}`),
+      request('GET', `/notifications?userId=${encodeURIComponent(studentUserId)}`, null, studentToken),
     );
     const notification = await runStep('POST /notifications/send', () =>
       request('POST', '/notifications/send', {
@@ -244,7 +244,7 @@ const testEndpoints = async () => {
         title: 'Test Reminder',
         message: 'Your next mock test starts at 7 PM.',
         type: 'reminder',
-      }),
+      }, adminToken),
     );
 
     await runStep('POST /engagement/referral', () =>

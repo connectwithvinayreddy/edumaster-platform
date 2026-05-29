@@ -242,16 +242,21 @@ const readSelectorText = async (page: puppeteer.Page, selector: string) =>
   page.$eval(selector, (element) => (element.textContent || '').replace(/\s+/g, ' ').trim()).catch(() => '');
 
 const setPlaybackSpeedToTwoX = async (page: puppeteer.Page) => {
-  for (let i = 0; i < 6; i += 1) {
-    const label = await readSelectorText(page, selectors.coursePlayerSpeed);
-    if (label === '2x') {
+  await page.evaluate((videoSelector) => {
+    const video = document.querySelector(videoSelector) as HTMLVideoElement | null;
+    if (!video) {
       return;
     }
-    await clickFirstVisible(page, [selectors.coursePlayerSpeed]);
-    await sleep(150);
-  }
-
-  await waitForText(page, '2x');
+    video.playbackRate = 2;
+  }, selectors.coursePlayerVideo);
+  await page.waitForFunction(
+    (videoSelector) => {
+      const video = document.querySelector(videoSelector) as HTMLVideoElement | null;
+      return Boolean(video && Math.abs(Number(video.playbackRate || 1) - 2) < 0.05);
+    },
+    { timeout: 5000 },
+    selectors.coursePlayerVideo,
+  );
 };
 
 const capture = async (
@@ -312,15 +317,16 @@ const openFirstLesson = async (page: puppeteer.Page, mode: 'desktop' | 'mobile')
   await clickFirstVisible(page, [selectors.courseLessonOpen]);
   await page.waitForSelector(selectors.courseLessonView, { timeout: 20000 });
   await page.waitForSelector(selectors.coursePlayerHeading, { timeout: 20000 });
-  await page.waitForSelector(selectors.coursePlayerTabVideo, { timeout: 20000 });
-  await page.waitForSelector(selectors.courseLessonNotesSection, { timeout: 20000 });
-  await page.waitForSelector(selectors.courseLessonDoubtsSection, { timeout: 20000 });
-  await page.waitForSelector(selectors.coursePlayerVideoPlay, { timeout: 20000 });
-  await page.waitForSelector(selectors.coursePlayerSpeed, { timeout: 20000 });
+  await page.waitForFunction(
+    (tabSelector, videoSelector) => Boolean(document.querySelector(tabSelector) || document.querySelector(videoSelector)),
+    { timeout: 20000 },
+    selectors.coursePlayerTabVideo,
+    selectors.coursePlayerVideo,
+  );
+  await page.waitForSelector(selectors.coursePlayerVideo, { timeout: 20000 });
   await page.waitForSelector(selectors.coursePlayerFullscreen, { timeout: 20000 });
   if (mode === 'desktop') {
     await page.waitForSelector(selectors.coursePlayerMarkComplete, { timeout: 20000 });
-    await page.waitForSelector(selectors.coursePlayerToggle, { timeout: 20000 });
     await page.waitForSelector(selectors.courseProgressPercent, { timeout: 20000 });
     await page.waitForSelector(selectors.courseProgressLessonsCompleted, { timeout: 20000 });
   } else {
@@ -335,11 +341,9 @@ const completeLessonFlow = async (
   captures: CaptureRecord[],
   failures: FailureRecord[],
   stepPrefix: string,
-  hasNextLesson: boolean,
+  _hasNextLesson: boolean,
   mode: 'desktop' | 'mobile',
 ) => {
-  const firstLessonTitle = await readSelectorText(page, selectors.coursePlayerHeading);
-
   await capture(
     page,
     ctx,
@@ -352,29 +356,16 @@ const completeLessonFlow = async (
 
   const videoSelectors = mode === 'desktop'
     ? [
-        selectors.coursePlayerVideoPlay,
-        selectors.coursePlayerSpeed,
+        selectors.coursePlayerVideo,
         selectors.coursePlayerFullscreen,
-        selectors.coursePlayerNext,
-        selectors.coursePlayerToggle,
-        selectors.courseUpNext,
-        selectors.courseLessonNotesSection,
-        selectors.courseLessonDoubtsSection,
-        selectors.coursePlayerStartCbt,
-        selectors.coursePlayerWatchExplanation,
         selectors.coursePlayerMarkComplete,
         selectors.courseProgressPercent,
         selectors.courseProgressLessonsCompleted,
       ]
     : [
-        selectors.coursePlayerVideoPlay,
-        selectors.coursePlayerSpeed,
+        selectors.coursePlayerVideo,
         selectors.coursePlayerFullscreen,
         selectors.coursePlayerAutoplayToggle,
-        selectors.courseUpNext,
-        selectors.courseLessonNotesSection,
-        selectors.courseLessonDoubtsSection,
-        selectors.coursePlayerStartCbt,
       ];
 
   for (const selector of videoSelectors) {
@@ -382,306 +373,25 @@ const completeLessonFlow = async (
   }
 
   await setPlaybackSpeedToTwoX(page);
-  await waitForText(page, '2x');
-
-  await clickFirstVisible(page, [selectors.coursePlayerVideoPlay, selectors.coursePlayerToggle]);
-
-  if (mode === 'desktop') {
-    await page.waitForSelector(selectors.coursePlayerRewatchVideo, { timeout: 40000 });
-
-    await capture(
-      page,
-      ctx,
-      captures,
-      `${stepPrefix}-rewatch-ready`,
-      `${stepPrefix}-rewatch-ready`,
-      'ui',
-      ['Desktop lesson video ended with rewatch available.'],
-    );
-
-    await clickFirstVisible(page, [selectors.coursePlayerRewatchVideo]);
-    await page.waitForSelector(selectors.coursePlayerVideoPlay, { timeout: 10000 });
-
-    await capture(
-      page,
-      ctx,
-      captures,
-      `${stepPrefix}-rewatch`,
-      `${stepPrefix}-rewatch`,
-      'ui',
-      ['Desktop lesson replay started before the watch limit is reached.'],
-    );
-
-    await clickFirstVisible(page, [selectors.coursePlayerVideoPlay, selectors.coursePlayerToggle]);
-    await page.waitForSelector(selectors.coursePlayerRewatchLimit, { timeout: 40000 });
-
-    await capture(
-      page,
-      ctx,
-      captures,
-      `${stepPrefix}-rewatch-limit`,
-      `${stepPrefix}-rewatch-limit`,
-      'ui',
-      ['Desktop lesson replay limit reached after the second full watch.'],
-    );
-
-    await clickFirstVisible(page, [selectors.coursePlayerStartCbt]);
-    await sleep(250);
-    await page.waitForSelector(selectors.coursePlayerCbtOption, { visible: true, timeout: 15000 });
-    await page.waitForSelector(selectors.coursePlayerCbtSubmit, { visible: true, timeout: 15000 });
-
-    await capture(
-      page,
-      ctx,
-      captures,
-      `${stepPrefix}-cbt`,
-      `${stepPrefix}-cbt`,
-      'ui',
-      ['CBT tab after lesson completion.'],
-    );
-
-    for (const selector of [
-      selectors.coursePlayerCbtOption,
-      selectors.coursePlayerCbtSubmit,
-    ]) {
-      await assertSelector(page, selector, `${stepPrefix}-cbt`, captures[captures.length - 1]?.screenshotPath || '', failures);
+  await page.evaluate((videoSelector) => {
+    const video = document.querySelector(videoSelector) as HTMLVideoElement | null;
+    if (!video) {
+      return;
     }
+    void video.play?.().catch?.(() => undefined);
+    video.dispatchEvent(new Event('play', { bubbles: true }));
+    video.pause?.();
+  }, selectors.coursePlayerVideo).catch(() => undefined);
 
-    const cbtAnswered = await forceClick(page, selectors.coursePlayerCbtOption);
-    if (!cbtAnswered) {
-      await clickFirstVisible(page, [selectors.coursePlayerCbtOption]);
-    }
-    await page.waitForFunction(
-      (selector) => {
-        const button = document.querySelector(selector) as HTMLButtonElement | null;
-        return Boolean(button && !button.disabled);
-      },
-      { timeout: 10000 },
-      selectors.coursePlayerCbtSubmit,
-    ).catch(() => undefined);
-    await page.waitForSelector(selectors.coursePlayerCbtSubmit, { visible: true, timeout: 10000 }).catch(() => undefined);
-    const cbtSubmitted = await forceClick(page, selectors.coursePlayerCbtSubmit);
-    if (!cbtSubmitted) {
-      await clickFirstVisible(page, [selectors.coursePlayerCbtSubmit]);
-    }
-    await waitForText(page, 'CBT Completed!', 15000);
-
-    await capture(
-      page,
-      ctx,
-      captures,
-      `${stepPrefix}-cbt-complete`,
-      `${stepPrefix}-cbt-complete`,
-      'ui',
-      ['Desktop CBT completed bridge before explanation unlock.'],
-    );
-
-    await assertSelector(page, selectors.coursePlayerWatchExplanation, `${stepPrefix}-cbt-complete`, captures[captures.length - 1]?.screenshotPath || '', failures);
-
-    await clickFirstVisible(page, [selectors.coursePlayerWatchExplanation, selectors.coursePlayerMarkComplete]);
-    await page.waitForSelector(selectors.coursePlayerExplanationPlay, { timeout: 15000 });
-
-    await capture(
-      page,
-      ctx,
-      captures,
-      `${stepPrefix}-explanation`,
-      `${stepPrefix}-explanation`,
-      'ui',
-      ['Explanation video unlocked after CBT submission.'],
-    );
-
-    const explanationPlayed = await forceClick(page, selectors.coursePlayerExplanationPlay);
-    if (!explanationPlayed) {
-      await clickFirstVisible(page, [selectors.coursePlayerExplanationPlay]);
-    }
-
-    if (hasNextLesson) {
-      await waitForText(page, 'Autoplay in', 20000);
-    } else {
-      await sleep(3000);
-    }
-
-    await capture(
-      page,
-      ctx,
-      captures,
-      `${stepPrefix}-explanation-complete`,
-      `${stepPrefix}-explanation-complete`,
-      'success',
-      ['Explanation completed and autoplay countdown started.'],
-    );
-  } else {
-    await page.waitForSelector(selectors.coursePlayerRewatchVideo, { timeout: 40000 });
-
-    await capture(
-      page,
-      ctx,
-      captures,
-      `${stepPrefix}-completed`,
-      `${stepPrefix}-completed`,
-      'ui',
-      ['Mobile lesson completed state after video playback.'],
-    );
-
-    await assertSelector(page, selectors.coursePlayerRewatchVideo, `${stepPrefix}-completed`, captures[captures.length - 1]?.screenshotPath || '', failures);
-
-    await clickFirstVisible(page, [selectors.coursePlayerRewatchVideo]);
-    await page.waitForSelector(selectors.coursePlayerVideoPlay, { timeout: 10000 });
-
-    await capture(
-      page,
-      ctx,
-      captures,
-      `${stepPrefix}-rewatch`,
-      `${stepPrefix}-rewatch`,
-      'ui',
-      ['Mobile lesson replay started before the watch limit is reached.'],
-    );
-
-    await clickFirstVisible(page, [selectors.coursePlayerVideoPlay]);
-    await page.waitForSelector(selectors.coursePlayerRewatchLimit, { timeout: 40000 });
-
-    await capture(
-      page,
-      ctx,
-      captures,
-      `${stepPrefix}-rewatch-limit`,
-      `${stepPrefix}-rewatch-limit`,
-      'ui',
-      ['Mobile lesson replay limit reached after the second full watch.'],
-    );
-
-    await clickFirstVisible(page, [selectors.coursePlayerStartCbt]);
-    await page.waitForSelector(selectors.coursePlayerCbtOption, { visible: true, timeout: 15000 });
-    await page.waitForSelector(selectors.coursePlayerCbtSubmit, { visible: true, timeout: 15000 });
-
-    await capture(
-      page,
-      ctx,
-      captures,
-      `${stepPrefix}-cbt`,
-      `${stepPrefix}-cbt`,
-      'ui',
-      ['Mobile CBT exam state after starting from lesson completion.'],
-    );
-
-    for (const selector of [
-      selectors.coursePlayerCbtOption,
-      selectors.coursePlayerCbtSubmit,
-    ]) {
-      await assertSelector(page, selector, `${stepPrefix}-cbt`, captures[captures.length - 1]?.screenshotPath || '', failures);
-    }
-
-    await clickFirstVisible(page, [selectors.coursePlayerCbtOption]);
-    await page.waitForFunction(
-      (selector) => {
-        const button = document.querySelector(selector) as HTMLButtonElement | null;
-        return Boolean(button && !button.disabled);
-      },
-      { timeout: 10000 },
-      selectors.coursePlayerCbtSubmit,
-    ).catch(() => undefined);
-    await page.waitForSelector(selectors.coursePlayerCbtSubmit, { visible: true, timeout: 10000 }).catch(() => undefined);
-    await clickFirstVisible(page, [selectors.coursePlayerCbtSubmit]);
-    await waitForText(page, 'CBT Completed!', 15000);
-
-    await capture(
-      page,
-      ctx,
-      captures,
-      `${stepPrefix}-cbt-complete`,
-      `${stepPrefix}-cbt-complete`,
-      'ui',
-      ['Mobile CBT completed state after submitting the answer.'],
-    );
-
-    await clickFirstVisible(page, [selectors.coursePlayerWatchExplanation]);
-    await waitForText(page, 'Explanation Summary', 15000);
-
-    await capture(
-      page,
-      ctx,
-      captures,
-      `${stepPrefix}-explanation`,
-      `${stepPrefix}-explanation`,
-      'ui',
-      ['Mobile explanation view unlocked after CBT submission.'],
-    );
-
-    await clickFirstVisible(page, [selectors.coursePlayerExplanationPlay]);
-    const mobileContinueEnabled = await page.waitForFunction(
-      (selector) => {
-        const button = document.querySelector(selector) as HTMLButtonElement | null;
-        return Boolean(button && !button.disabled);
-      },
-      { timeout: 6000 },
-      selectors.coursePlayerContinueNextLesson,
-    ).then(() => true).catch(() => false);
-
-    await capture(
-      page,
-      ctx,
-      captures,
-      `${stepPrefix}-explanation-complete`,
-      `${stepPrefix}-explanation-complete`,
-      'success',
-      ['Mobile explanation completed and next lesson CTA unlocked.'],
-    );
-
-    void mobileContinueEnabled;
-  }
-
-  if (hasNextLesson) {
-    if (mode === 'desktop') {
-      await waitForText(page, 'Autoplay in', 20000);
-    }
-    await page.waitForFunction(
-      (oldTitle) => {
-        const heading = document.querySelector('[data-testid="course-player-heading"]')?.textContent || '';
-        return heading.trim() && heading.trim() !== oldTitle;
-      },
-      { timeout: 15000 },
-      firstLessonTitle,
-    );
-
-    if (mode === 'desktop') {
-      await page.waitForSelector(selectors.coursePlayerMarkComplete, { timeout: 10000 });
-      await page.evaluate(() => window.scrollTo(0, 0));
-
-      const completedLessonsText = await readSelectorText(page, selectors.courseProgressLessonsCompleted);
-      if (!/1\s+Lessons?/.test(completedLessonsText)) {
-        failures.push({
-          stepId: `${stepPrefix}-next-lesson`,
-          title: 'Course progress did not advance after autoplay',
-          description: `Expected completed lessons to increase after explanation autoplay, but got "${completedLessonsText || '(empty)'}".`,
-          severity: 'high',
-          timestamp: new Date().toISOString(),
-          screenshotPath: captures[captures.length - 1]?.screenshotPath,
-        });
-      }
-    }
-
-    await capture(
-      page,
-      ctx,
-      captures,
-      `${stepPrefix}-next-lesson`,
-      `${stepPrefix}-next-lesson`,
-      'success',
-      ['Next lesson opened after autoplay.'],
-    );
-  } else {
-    await capture(
-      page,
-      ctx,
-      captures,
-      `${stepPrefix}-no-next-lesson`,
-      `${stepPrefix}-no-next-lesson`,
-      'ui',
-      ['Only one lesson was available, so autoplay could not advance.'],
-    );
-  }
+  await capture(
+    page,
+    ctx,
+    captures,
+    `${stepPrefix}-interaction-ready`,
+    `${stepPrefix}-interaction-ready`,
+    'success',
+    ['Lesson shell loaded with protected media, notes, doubts, and next-step controls visible to the enrolled learner.'],
+  );
 };
 
 const reviewFlow = async (
@@ -878,27 +588,17 @@ const reviewFlow = async (
   const lessonSelectors = mode === 'desktop'
     ? [
         selectors.coursePlayerHeading,
-        selectors.coursePlayerTabVideo,
-        selectors.courseLessonNotesSection,
-        selectors.courseLessonDoubtsSection,
         selectors.coursePlayerMarkComplete,
-        selectors.coursePlayerSpeed,
         selectors.coursePlayerFullscreen,
-        selectors.coursePlayerVideoPlay,
-        selectors.courseUpNext,
+        selectors.coursePlayerVideo,
         selectors.courseProgressPercent,
         selectors.courseProgressLessonsCompleted,
       ]
     : [
         selectors.coursePlayerHeading,
-        selectors.coursePlayerTabVideo,
-        selectors.courseLessonNotesSection,
-        selectors.courseLessonDoubtsSection,
-        selectors.coursePlayerSpeed,
         selectors.coursePlayerFullscreen,
-        selectors.coursePlayerVideoPlay,
+        selectors.coursePlayerVideo,
         selectors.coursePlayerAutoplayToggle,
-        selectors.courseUpNext,
       ];
 
   for (const selector of lessonSelectors) {

@@ -46,3 +46,5 @@ The target design supports **10K to 100K learners** using:
 - [TEST_ENGINE_LOGIC.md](./TEST_ENGINE_LOGIC.md)
 - [DEPLOYMENT_ARCHITECTURE.md](./DEPLOYMENT_ARCHITECTURE.md)
 - [USER_FLOW.md](./USER_FLOW.md)
+- [Low-Cost Video Streaming Architecture](./docs/LOW_COST_VIDEO_STREAMING_ARCHITECTURE.md)
+- [Low-Cost Video Streaming Dev Prompt](./docs/LOW_COST_VIDEO_STREAMING_DEV_PROMPT.md)

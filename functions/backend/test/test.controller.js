@@ -1,23 +1,52 @@
 // Test Controller
 const { testsRepository } = require('../lib/repositories.js');
-const { requireString } = require('../lib/http.js');
+const { ApiError, requireString } = require('../lib/http.js');
+
+const getAttemptViewer = (req) => ({
+  userId: req.user?.id || null,
+  userRole: req.user?.role || 'guest',
+});
+
+const sendRepositoryError = (res, err) => {
+  if (err instanceof ApiError) {
+    return res.status(err.status).json({
+      message: err.message,
+      code: err.code,
+      details: err.details,
+    });
+  }
+
+  return res.status(500).json({ message: err.message });
+};
 
 const getTests = async (req, res) => {
   try {
-    const tests = await testsRepository.listForAttempt();
+    const tests = await testsRepository.listForAttempt(getAttemptViewer(req));
     res.json(tests);
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    sendRepositoryError(res, err);
   }
 };
 
 const getTest = async (req, res) => {
   try {
-    const test = await testsRepository.findAttemptById(req.params.id);
+    const test = await testsRepository.findAttemptById(req.params.id, getAttemptViewer(req));
     if (!test) return res.status(404).json({ message: 'Test not found' });
     res.json(test);
   } catch (err) {
+    if (err instanceof ApiError) {
+      return sendRepositoryError(res, err);
+    }
     res.status(400).json({ message: 'Invalid test id' });
+  }
+};
+
+const getMyTestAttempts = async (req, res) => {
+  try {
+    const attempts = await testsRepository.listAttempts(req.user?.id);
+    return res.json(attempts);
+  } catch (err) {
+    return sendRepositoryError(res, err);
   }
 };
 
@@ -33,7 +62,7 @@ const createTest = async (req, res) => {
     });
     res.status(201).json(test);
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    sendRepositoryError(res, err);
   }
 };
 
@@ -56,7 +85,7 @@ const updateTest = async (req, res) => {
 
     return res.json(test);
   } catch (err) {
-    return res.status(500).json({ message: err.message });
+    return sendRepositoryError(res, err);
   }
 };
 
@@ -83,6 +112,7 @@ const submitTest = async (req, res) => {
 
     const attempt = await testsRepository.submit(req.params.id, {
       userId: req.user?.id,
+      userRole: req.user?.role || 'student',
       answers,
       startedAt,
     });
@@ -93,8 +123,8 @@ const submitTest = async (req, res) => {
 
     return res.json(attempt);
   } catch (err) {
-    return res.status(500).json({ message: err.message });
+    return sendRepositoryError(res, err);
   }
 };
 
-module.exports = { getTests, getTest, createTest, updateTest, deleteTest, submitTest };
+module.exports = { getTests, getTest, getMyTestAttempts, createTest, updateTest, deleteTest, submitTest };

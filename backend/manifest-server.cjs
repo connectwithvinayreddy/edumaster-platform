@@ -45,7 +45,6 @@ const parseCorsOrigin = (value) => {
 };
 
 const MANIFEST_ROUTE_PREFIX = '/course-manifests/b/';
-
 const parseRequestCookies = (req) => String(req.headers.cookie || '')
   .split(';')
   .map((entry) => entry.trim())

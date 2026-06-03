@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const path = require('path');
+const { randomUUID } = require('crypto');
 
 dotenv.config({ path: path.join(process.cwd(), '.env') });
 dotenv.config({ path: path.join(__dirname, '.env') });
@@ -29,7 +30,7 @@ const { ensureReplayImporterWorker } = require('./live/live-replay.worker.js');
 const { connectDatabase, getDatabaseMode } = require('./lib/database.js');
 const { isFirestoreStateEnabled, getStateDocumentRef } = require('./lib/firebase-state.js');
 const { resetState, serializeState } = require('./lib/store.js');
-const { recoverPendingCourseVideoProcessingJobs } = require('./lib/video-processing.js');
+const { recoverPendingCourseVideoProcessingJobs, startVideoProcessingRecoveryLoop } = require('./lib/video-processing.js');
 
 const parseCorsOrigin = (value) => {
   const normalized = String(value || '').trim();
@@ -49,6 +50,12 @@ const app = express();
 app.set('trust proxy', appConfig.trustProxy);
 app.disable('x-powered-by');
 app.use(cors({ origin: parseCorsOrigin(appConfig.corsOrigin) }));
+app.use((req, res, next) => {
+  const requestId = String(req.headers['x-request-id'] || req.headers['cf-ray'] || randomUUID());
+  req.requestId = requestId;
+  res.setHeader('X-Request-Id', requestId);
+  next();
+});
 app.use(express.json({
   limit: appConfig.jsonBodyLimit,
   verify: (req, _res, buffer) => {
@@ -57,7 +64,6 @@ app.use(express.json({
 }));
 app.use(express.urlencoded({ extended: false, limit: '64kb' }));
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
-app.use('/private_uploads', express.static(path.join(process.cwd(), 'private_uploads')));
 app.use(securityHeaders);
 app.use(basicRateLimit);
 
@@ -124,7 +130,9 @@ app.get(['/api/live', '/backend/api/live'], (_req, res) => {
   app.use(`${prefix}/payment`, paymentRoutes);
   app.use(`${prefix}/razorpay`, razorpayRoutes);
   app.use(`${prefix}/platform`, platformRoutes);
-  app.use(`${prefix}/live-classes`, liveRoutes);
+  if (appConfig.liveClassesEnabled) {
+    app.use(`${prefix}/live-classes`, liveRoutes);
+  }
 });
 
 const PORT = appConfig.port;
@@ -158,15 +166,19 @@ const startServer = async (options = {}) => {
   if (enableBackgroundWorkers) {
     startLiveEventBus();
     ensureReplayImporterWorker();
-    recoverPendingCourseVideoProcessingJobs()
+    recoverPendingCourseVideoProcessingJobs({ forceRestartRecovery: true })
       .then((result) => {
-        if (result.scheduled > 0) {
-          console.log(`[video-processing] recovered ${result.scheduled} pending course video job(s) after scanning ${result.scanned} lesson(s)`);
-        }
+        console.log(`[video-processing] ${JSON.stringify({
+          event: 'startup-recovery-complete',
+          scannedLessons: result.scanned,
+          scheduledJobs: result.scheduled,
+          at: new Date().toISOString(),
+        })}`);
       })
       .catch((error) => {
         console.error('[video-processing] failed to recover pending course video jobs', error);
       });
+    startVideoProcessingRecoveryLoop();
   }
 
   return new Promise((resolve, reject) => {
@@ -182,6 +194,12 @@ const startServer = async (options = {}) => {
 };
 
 if (require.main === module) {
+  process.on('unhandledRejection', (error) => {
+    console.error('[process] unhandledRejection', error);
+  });
+  process.on('uncaughtException', (error) => {
+    console.error('[process] uncaughtException', error);
+  });
   startServer().catch((err) => {
     console.error(err);
     process.exit(1);

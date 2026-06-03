@@ -1,5 +1,6 @@
 const { platformRepository } = require('../lib/repositories.js');
 const { generateAssessmentDraft } = require('../lib/ai-content.js');
+const { buildSecurePlaybackClientContext } = require('../lib/secure-playback.js');
 const {
   ApiError,
   asyncHandler,
@@ -65,6 +66,7 @@ const updateWatchProgress = asyncHandler(async (req, res) => {
   const userId = req.user?.id || null;
   const courseId = requireString(req.body?.courseId, 'courseId');
   const lessonId = requireString(req.body?.lessonId, 'lessonId');
+  const requestContext = buildSecurePlaybackClientContext(req);
   if (!userId) {
     throw new ApiError(401, 'Authorization token required', { code: 'AUTH_REQUIRED' });
   }
@@ -84,13 +86,19 @@ const updateWatchProgress = asyncHandler(async (req, res) => {
     explanationSeconds: optionalNumber(req.body?.explanationSeconds, null, { min: 0 }),
     videoWatchCount: optionalNumber(req.body?.videoWatchCount, null, { integer: true, min: 0 }),
     explanationWatchCount: optionalNumber(req.body?.explanationWatchCount, null, { integer: true, min: 0 }),
+    durationSeconds: optionalNumber(req.body?.durationSeconds, null, { min: 0 }),
+    eventType: optionalString(req.body?.eventType, '', { maxLength: 64 }) || null,
+    playbackTabId: optionalString(req.body?.playbackTabId, '', { maxLength: 160 }) || null,
+    requestTimestamp: optionalString(req.body?.requestTimestamp, '', { maxLength: 64 }) || null,
     sessionId: req.user?.session || null,
+    requestContext,
     device: {
-      id: req.headers['x-edumaster-device-id'] || null,
-      platform: req.headers['x-edumaster-client-platform'] || null,
-      browser: req.headers['x-edumaster-client-browser'] || null,
-      app: req.headers['x-edumaster-app'] || 'web',
-      userAgent: req.headers['user-agent'] || null,
+      id: requestContext.deviceId || req.headers['x-edumaster-device-id'] || null,
+      playbackTabId: requestContext.playbackTabId || optionalString(req.body?.playbackTabId, '', { maxLength: 160 }) || null,
+      platform: requestContext.platform || req.headers['x-edumaster-client-platform'] || null,
+      browser: requestContext.browser || req.headers['x-edumaster-client-browser'] || null,
+      app: requestContext.appMode || req.headers['x-edumaster-app'] || 'web',
+      userAgent: requestContext.userAgent || req.headers['user-agent'] || null,
     },
   });
 

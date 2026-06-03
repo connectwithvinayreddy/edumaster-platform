@@ -50,6 +50,39 @@ export interface CourseLesson {
   watchCompletionPercent?: number;
   releaseAt?: string | null;
   securePlaybackRequired?: boolean;
+  accessBlockReason?: string | null;
+  attachments?: CoursePdfAttachment[];
+}
+
+export interface CoursePdfAttachment {
+  id: string;
+  title: string;
+  fileName?: string | null;
+  mimeType?: string | null;
+  fileSize?: number | null;
+  premium?: boolean;
+  locked?: boolean;
+  accessBlockReason?: string | null;
+  scope?: 'module' | 'chapter' | 'lesson' | string;
+  uploadedAt?: string | null;
+  uploadedBy?: string | null;
+}
+
+export interface CourseEditorialVideo {
+  id: string;
+  title: string;
+  description?: string | null;
+  weekLabel?: string | null;
+  editorialDate?: string | null;
+  durationMinutes?: number;
+  published?: boolean;
+  uploadedAt?: string | null;
+  uploadedBy?: string | null;
+  playbackReady?: boolean;
+  hlsProcessingStatus?: string | null;
+  watchLimit?: number;
+  watchCompletionPercent?: number;
+  locked?: boolean;
 }
 
 export interface CourseChapter {
@@ -57,6 +90,9 @@ export interface CourseChapter {
   title: string;
   description?: string;
   order?: number;
+  locked?: boolean;
+  accessBlockReason?: string | null;
+  attachments?: CoursePdfAttachment[];
   lessons: CourseLesson[];
 }
 
@@ -65,6 +101,7 @@ export interface CourseModule {
   title: string;
   description?: string;
   order?: number;
+  attachments?: CoursePdfAttachment[];
   chapters?: CourseChapter[];
   lessons: CourseLesson[];
 }
@@ -84,7 +121,30 @@ export interface CourseCard {
   instructor: string;
   officialChannelUrl?: string | null;
   modules: CourseModule[];
+  editorials?: CourseEditorialVideo[];
   enrolled?: boolean;
+  isPurchased?: boolean;
+  paymentStatus?: 'success' | 'failed' | 'pending' | 'refunded' | 'manual' | 'none' | string;
+  enrollmentStatus?: 'active' | 'expired' | 'disabled' | 'missing' | string;
+  accessStatus?: 'enabled' | 'disabled' | 'expired' | 'pending_access' | 'not_purchased' | string;
+  validUntil?: string | null;
+  isExpired?: boolean;
+  canAccessCourse?: boolean;
+  canPlayReleasedVideos?: boolean;
+  accessBlockReason?: string | null;
+  transactionId?: string | null;
+  gatewayOrderId?: string | null;
+  gatewayPaymentId?: string | null;
+  gatewayStatus?: string | null;
+  verificationStatus?: string | null;
+  verificationReason?: string | null;
+  expectedAmount?: number | null;
+  receivedAmount?: number | null;
+  currency?: string | null;
+  manualReviewRequired?: boolean;
+  accessSource?: string | null;
+  courseAccessLabel?: string | null;
+  courseVideoAccessMode?: 'free_order' | 'sequential' | string;
   progressPercent?: number;
   continueLesson?: (CourseLesson & { moduleTitle?: string; chapterTitle?: string }) | null;
   continueProgressSeconds?: number;
@@ -122,10 +182,40 @@ export interface ProtectedLessonPlayback {
   completed: boolean;
   tokenExpiresAt: string | null;
   drmEnabled: boolean;
+  courseId?: string | null;
+  videoId?: string | null;
+  playbackSessionId?: string | null;
+  videoType?: 'course' | 'explanation' | string | null;
   watchLimit?: number | null;
   watchCompletionPercent?: number | null;
+  watchState?: VideoWatchStateSummary | null;
   playbackGrantExpiresAt?: string | null;
   playbackGrantRemainingViews?: number | null;
+}
+
+export interface VideoWatchStateSummary {
+  videoType: 'course' | 'explanation' | string;
+  allowedFullWatches: number;
+  completedFullWatches: number;
+  fullWatchThresholdPercentage: number;
+  completionThresholdPercentage?: number;
+  currentCycleUniqueWatchedSeconds: number;
+  totalUniqueWatchedSeconds: number;
+  repeatWatchedSeconds: number;
+  revisionBufferSeconds: number;
+  revisionBufferUsedSeconds: number;
+  remainingRevisionBufferSeconds: number;
+  stableEndWindowWatchedSeconds?: number;
+  completionProofSatisfied?: boolean;
+  completionProofSatisfiedAt?: string | null;
+  endStabilityWindowSeconds?: number;
+  endStabilitySatisfied?: boolean;
+  graceTotalSeconds?: number;
+  graceUsedSeconds?: number;
+  graceRemainingSeconds?: number;
+  replayState?: 'resume_current_cycle' | 'restart_new_cycle' | 'grace_cycle' | 'locked' | string | null;
+  locked: boolean;
+  lockedAt?: string | null;
 }
 
 export interface ProtectedPlaybackDrmConfig {
@@ -568,6 +658,7 @@ export interface SubscriptionPlan {
 
 export interface NotificationItem {
   _id: string;
+  userId?: string;
   title: string;
   message: string;
   type: string;
@@ -575,6 +666,8 @@ export interface NotificationItem {
   actionUrl?: string | null;
   actionLabel?: string | null;
   payload?: Record<string, unknown>;
+  isRead?: boolean;
+  readAt?: string | null;
   createdAt: string;
 }
 
@@ -585,7 +678,19 @@ export interface LessonDoubtMessage {
   role: 'student' | 'admin' | string;
   userName: string;
   message: string;
+  attachments?: SupportAttachment[];
   createdAt: string;
+}
+
+export interface SupportAttachment {
+  id: string;
+  kind: 'image' | 'video' | 'audio' | 'file' | string;
+  url: string;
+  fileName: string;
+  mimeType?: string | null;
+  fileSize?: number | null;
+  uploadedAt?: string | null;
+  uploadedByRole?: 'student' | 'admin' | string;
 }
 
 export interface LessonDoubtThread {
@@ -606,6 +711,45 @@ export interface LessonDoubtThread {
   updatedAt: string;
   pathLabel: string;
   messages: LessonDoubtMessage[];
+}
+
+export interface LessonReportRecord {
+  _id: string;
+  userId: string;
+  courseId: string;
+  lessonId: string;
+  videoId?: string | null;
+  userName: string;
+  userEmail?: string | null;
+  courseTitle: string;
+  moduleTitle?: string | null;
+  chapterTitle?: string | null;
+  lessonTitle: string;
+  issueType: string;
+  description: string;
+  status: 'open' | 'in_progress' | 'resolved' | 'rejected' | string;
+  screenshotUrl?: string | null;
+  attachmentMeta?: Record<string, unknown>;
+  attachments?: SupportAttachment[];
+  adminAttachments?: SupportAttachment[];
+  adminNote?: string | null;
+  adminReply?: string | null;
+  source?: string | null;
+  pageUrl?: string | null;
+  userAgent?: string | null;
+  pathLabel: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AdminLessonDoubtListResponse {
+  items: LessonDoubtThread[];
+  pagination: AdminPagination;
+}
+
+export interface AdminLessonReportListResponse {
+  items: LessonReportRecord[];
+  pagination: AdminPagination;
 }
 
 export interface AnalyticsSnapshot {
@@ -716,6 +860,615 @@ export interface AdminOverview {
   recentDeviceActivity: DeviceActivity[];
 }
 
+export interface AdminPagination {
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+}
+
+export interface AdminStudentSummary {
+  studentId: string;
+  name: string;
+  email: string;
+  mobileNumber?: string | null;
+  accountStatus: 'active' | 'disabled' | 'blocked' | string;
+  statusNote?: string | null;
+  createdAt: string | null;
+  lastLoginAt: string | null;
+  lastActiveAt?: string | null;
+  lastLogoutAt?: string | null;
+  loggedInNow?: boolean;
+  deviceSessionStatus: 'active' | 'inactive' | string;
+  enrolledCoursesCount: number;
+  activeCourseAccessCount?: number;
+  testAttemptsCount: number;
+  manualReviewCount?: number;
+  deviceCount?: number;
+  latestPaymentId?: string | null;
+  latestPaymentStatus?: string | null;
+  latestPaymentTransactionId?: string | null;
+  latestPaymentOrderId?: string | null;
+  latestPaymentGatewayPaymentId?: string | null;
+  latestPaymentCourseName?: string | null;
+  latestPaymentVerificationStatus?: string | null;
+  latestPaymentCreatedAt?: string | null;
+  latestDeviceLabel?: string | null;
+  paymentSummary: {
+    successful: number;
+    failed: number;
+    pending: number;
+  };
+}
+
+export interface AdminPurchaseRecord {
+  purchaseId: string;
+  paymentId?: string | null;
+  studentId: string | null;
+  studentName: string;
+  studentEmail: string | null;
+  studentMobile?: string | null;
+  courseId: string | null;
+  courseName: string;
+  transactionId?: string | null;
+  paymentGatewayName?: string | null;
+  paymentAmount?: number | null;
+  courseFee?: number | null;
+  paymentStatus: 'success' | 'failed' | 'pending' | 'refunded' | 'manual' | string;
+  purchaseDate: string | null;
+  courseStartDate?: string | null;
+  validUntil?: string | null;
+  accessStatus: 'enabled' | 'disabled' | 'expired' | 'pending_access' | 'removed' | string;
+  paymentProof?: string | null;
+  accessSource?: string | null;
+  createdAt: string | null;
+  updatedAt?: string | null;
+  adminNote?: string | null;
+  gatewayOrderId?: string | null;
+  gatewayPaymentId?: string | null;
+  gatewayStatus?: string | null;
+  verificationStatus?: string | null;
+  verificationReason?: string | null;
+}
+
+export interface AdminTransactionRecord {
+  paymentId: string;
+  transactionId: string;
+  studentId: string;
+  studentName: string;
+  studentEmail: string | null;
+  studentMobile?: string | null;
+  courseId?: string | null;
+  courseName?: string | null;
+  amount: number;
+  currency: string;
+  paymentMethod: string;
+  paymentGatewayResponse: Record<string, unknown>;
+  paymentStatus: 'paid' | 'failed' | 'pending' | 'refunded' | string;
+  paymentDateTime: string | null;
+  gatewayOrderId?: string | null;
+  gatewayPaymentId?: string | null;
+  gatewayStatus?: string | null;
+  verificationDecision?: string | null;
+  verificationReason?: string | null;
+  expectedAmount?: number | null;
+  receivedAmount?: number | null;
+  bankRrn?: string | null;
+  capturedAt?: string | null;
+  signatureVerified: boolean;
+  failureReason?: string | null;
+  refundStatus?: string | null;
+  disputeStatus?: string | null;
+  accessSource?: string | null;
+  manualReviewRequired?: boolean;
+  lastSyncedAt?: string | null;
+  accessStatus?: string | null;
+  validUntil?: string | null;
+  courseAccessLabel?: string | null;
+}
+
+export interface AdminLoginSessionRecord {
+  sessionId: string;
+  studentId: string;
+  studentName: string;
+  email?: string | null;
+  mobileNumber?: string | null;
+  loginTime?: string | null;
+  logoutTime?: string | null;
+  lastActiveTime?: string | null;
+  deviceId?: string | null;
+  browser?: string | null;
+  os?: string | null;
+  ipAddress?: string | null;
+  userAgent?: string | null;
+  sessionStatus: 'online' | 'offline' | string;
+  rawStatus?: string | null;
+  reason?: string | null;
+}
+
+export interface AdminLoginSessionSummary {
+  loggedInNow: number;
+  recentLogins: number;
+  recentLogouts: number;
+  failedLoginAttempts: number;
+  multipleDeviceLoginCount: number;
+}
+
+export interface AdminCourseAccessRecord {
+  studentId: string | null;
+  studentName: string;
+  email?: string | null;
+  mobileNumber?: string | null;
+  courseId: string | null;
+  courseName: string;
+  accessSource: string;
+  accessStatus: string;
+  validUntil?: string | null;
+  paymentStatus: string;
+  verificationStatus?: string | null;
+  canAccessCourse: boolean;
+  accessBlockReason?: string | null;
+  adminNote?: string | null;
+  paymentId?: string | null;
+  gatewayOrderId?: string | null;
+  gatewayPaymentId?: string | null;
+}
+
+export interface AdminCourseAccessSummary {
+  activeAccessCount: number;
+  expiredAccessCount: number;
+  disabledAccessCount: number;
+  manuallyGrantedAccessCount: number;
+  paymentLinkedAccessCount: number;
+}
+
+export interface AdminCourseContentAccessRule {
+  ruleId: string;
+  courseId: string;
+  courseTitle: string;
+  studentScope: 'all_students' | 'student' | string;
+  studentId?: string | null;
+  studentName?: string | null;
+  studentEmail?: string | null;
+  contentScope: 'course' | 'chapter' | 'lesson' | string;
+  moduleId?: string | null;
+  moduleTitle?: string | null;
+  chapterId?: string | null;
+  chapterTitle?: string | null;
+  lessonId?: string | null;
+  lessonTitle?: string | null;
+  access: 'allow' | 'block' | string;
+  adminNote?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface AdminStudentLessonWatchOverride {
+  overrideId: string;
+  courseId: string;
+  courseTitle: string;
+  studentId: string;
+  studentName?: string | null;
+  studentEmail?: string | null;
+  moduleId: string;
+  moduleTitle?: string | null;
+  chapterId?: string | null;
+  chapterTitle?: string | null;
+  lessonId: string;
+  lessonTitle?: string | null;
+  allowedFullWatches: number;
+  watchCompletionPercent?: number | null;
+  adminNote?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface AdminManualReviewRecord {
+  paymentId: string;
+  studentId: string;
+  studentName: string;
+  email?: string | null;
+  mobileNumber?: string | null;
+  courseId?: string | null;
+  courseName?: string | null;
+  amountExpected: number;
+  amountReceived: number;
+  localOrderId: string;
+  razorpayOrderId?: string | null;
+  razorpayPaymentId?: string | null;
+  verificationDecision?: string | null;
+  reason?: string | null;
+  adminNote?: string | null;
+  createdTime?: string | null;
+  refundStatus?: string | null;
+  disputeStatus?: string | null;
+  status: string;
+}
+
+export interface AdminManualReviewSummary {
+  total: number;
+  amountMismatch: number;
+  orderMismatch: number;
+  userMismatch: number;
+  courseMismatch: number;
+  localTransactionNotFound: number;
+  refundedOrDisputed: number;
+}
+
+export interface AdminRazorpaySyncResult {
+  success: boolean;
+  summary: {
+    paymentFound: boolean;
+    paymentId?: string | null;
+    transactionId?: string | null;
+    orderId?: string | null;
+    gatewayStatus?: string | null;
+    localStatus?: string | null;
+    verificationDecision?: string | null;
+    verificationReason?: string | null;
+    method?: string | null;
+    expectedAmount?: number | null;
+    receivedAmount?: number | null;
+    currency?: string | null;
+    bankRrn?: string | null;
+    enrollmentCreated: boolean;
+    accessEnabled: boolean;
+    validityUpdated: boolean;
+    cacheRefreshed: boolean;
+    manualReviewRequired?: boolean;
+    courseAccessLabel?: string | null;
+  };
+  diagnosis?: AdminAccessDiagnosis | null;
+}
+
+export interface AdminBulkRazorpaySyncResult {
+  totalChecked: number;
+  capturedFixed: number;
+  verifiedCapturedActivated?: number;
+  stillPending: number;
+  failed: number;
+  refunded: number;
+  amountMismatch?: number;
+  orderMismatch?: number;
+  userMismatch?: number;
+  courseMismatch?: number;
+  manualReviewRequired?: number;
+  enrollmentCreated: number;
+  accessEnabled: number;
+  cacheRefreshed: number;
+  errors: Array<{
+    paymentId?: string | null;
+    orderId?: string | null;
+    message: string;
+  }>;
+  items: Array<{
+    paymentId?: string | null;
+    orderId?: string | null;
+    gatewayPaymentId?: string | null;
+    status: string;
+    verificationDecision?: string | null;
+    courseId?: string | null;
+    userId?: string | null;
+  }>;
+}
+
+export interface AdminAuditLogRecord {
+  _id: string;
+  adminUserId: string;
+  adminUserName?: string;
+  actionType: string;
+  targetUserId?: string | null;
+  targetUserName?: string | null;
+  courseId?: string | null;
+  courseName?: string | null;
+  transactionId?: string | null;
+  oldValue: Record<string, unknown>;
+  newValue: Record<string, unknown>;
+  reason?: string | null;
+  ipAddress?: string | null;
+  userAgent?: string | null;
+  createdAt: string;
+}
+
+export interface AdminWatchProgressRecord {
+  stateId: string;
+  courseId: string;
+  courseTitle: string;
+  lessonId?: string | null;
+  videoId: string;
+  videoType: string;
+  completedFullWatches: number;
+  allowedFullWatches: number;
+  currentCycleUniqueWatchedSeconds?: number;
+  totalUniqueWatchedSeconds?: number;
+  repeatWatchedSeconds?: number;
+  revisionBufferUsedSeconds?: number;
+  remainingRevisionBufferSeconds?: number;
+  stableEndWindowWatchedSeconds?: number;
+  completionThresholdPercentage?: number;
+  completionProofSatisfied?: boolean;
+  completionProofSatisfiedAt?: string | null;
+  endStabilityWindowSeconds?: number;
+  endStabilitySatisfied?: boolean;
+  progressSeconds: number;
+  lastHeartbeatAt?: string | null;
+  activeSessionStatus: string;
+  deviceId?: string | null;
+  ipAddress?: string | null;
+  userAgent?: string | null;
+  locked: boolean;
+  updatedAt?: string | null;
+}
+
+export interface AdminTestAttemptSummary {
+  attemptId: string;
+  testId: string;
+  testName: string;
+  score: number;
+  totalMarks: number;
+  correctCount: number;
+  wrongCount: number;
+  skippedCount: number;
+  status: string;
+  startedAt?: string | null;
+  submittedAt?: string | null;
+  analysisAvailable: boolean;
+}
+
+export interface AdminStudentSupportIssueSummary {
+  issueId: string;
+  issueType: 'lesson_doubt' | 'video_report';
+  courseId?: string | null;
+  lessonId?: string | null;
+  pathLabel: string;
+  status: string;
+  studentMessage?: string | null;
+  adminReply?: string | null;
+  adminNote?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface AdminStudentDetails {
+  student: AuthUser & {
+    accountStatus: string;
+    statusNote?: string | null;
+    lastLoginAt?: string | null;
+    created_at?: string;
+  };
+  purchases: AdminPurchaseRecord[];
+  watchProgress: AdminWatchProgressRecord[];
+  testAttempts: AdminTestAttemptSummary[];
+  supportIssues: AdminStudentSupportIssueSummary[];
+  sessions: Array<{
+    sessionId: string;
+    status: string;
+    device?: string | Record<string, unknown> | null;
+    reason?: string | null;
+    createdAt?: string | null;
+    lastSeenAt?: string | null;
+    endedAt?: string | null;
+  }>;
+  deviceActivity: Array<{
+    _id: string;
+    eventType: string;
+    device?: string | Record<string, unknown> | null;
+    meta?: Record<string, unknown>;
+    createdAt?: string | null;
+  }>;
+  auditLog: AdminAuditLogRecord[];
+}
+
+export interface AdminDashboardSummary {
+  totalStudents: number;
+  activeStudents: number;
+  disabledStudents: number;
+  blockedStudents?: number;
+  activeStudentsNow?: number;
+  loggedInStudentsNow?: number;
+  loggedOutStudentsToday?: number;
+  totalCoursePurchases: number;
+  successfulPayments: number;
+  failedPayments: number;
+  pendingPayments: number;
+  refundedPayments?: number;
+  manualReviewPayments?: number;
+  capturedInGatewayPendingLocally?: number;
+  activeCourseAccessCount: number;
+  expiredCourseAccessCount: number;
+  studentsCurrentlyWatchingVideos?: number;
+  activePlaybackSessions?: number;
+  adminGrantedAccessCount?: number;
+  backendHealth?: string;
+  dbHealth?: string;
+  recentTransactions: AdminTransactionRecord[];
+  paymentDateRange?: {
+    preset: string;
+    label: string;
+    timezone: string;
+    startIso: string;
+    endIso: string;
+    dbStartIso: string;
+    dbEndIso: string;
+    razorpayStartIso: string;
+    razorpayEndIso: string;
+    paymentMode: 'live' | 'test' | string;
+    lastReconciliationTime?: string | null;
+  };
+  paymentOverview?: {
+    razorpayCapturedPayments: number;
+    localSuccessfulTransactions: number;
+    capturedButPendingLocally: number;
+    localSuccessButNotVerifiedInRazorpay: number;
+    pendingPayments: number;
+    failedPayments: number;
+    refundedPayments: number;
+    manualReviewPayments: number;
+    adminGrantedAccess: number;
+    activeCourseAccess: number;
+    differenceCount: number;
+    localVerifiedSuccessfulTransactions?: number;
+  };
+  paymentReconciliationPreview?: {
+    differenceCount: number;
+    matchedCapturedPayments: number;
+    capturedButPendingLocally: number;
+    localSuccessButNotVerifiedInRazorpay: number;
+    duplicateLocalSuccessfulTransactions: number;
+    wrongDateTimezoneRecords: number;
+  };
+}
+
+export interface AdminStudentLiveMetricsSummary {
+  onlineNow: number;
+  loggedOutToday: number;
+  activeNow: number;
+  refreshedAt: string;
+}
+
+export interface AdminPaymentRangeParams {
+  rangePreset?: 'today' | 'yesterday' | 'last_7_days' | 'last_30_days' | 'current_month' | 'custom' | 'all_time';
+  startDate?: string;
+  endDate?: string;
+  timezone?: string;
+  paymentMode?: 'live' | 'test' | string;
+}
+
+export interface AdminPaymentReconciliationRow {
+  localTransactionId?: string | null;
+  razorpayOrderId?: string | null;
+  razorpayPaymentId?: string | null;
+  localStatus?: string | null;
+  razorpayStatus?: string | null;
+  verificationStatus?: string | null;
+  amountExpected?: number | null;
+  amountReceived?: number | null;
+  currency?: string | null;
+  student?: string | null;
+  course?: string | null;
+  createdAt?: string | null;
+  capturedAt?: string | null;
+  reason?: string | null;
+}
+
+export interface AdminPaymentReconciliationReport {
+  range: {
+    preset: string;
+    label: string;
+    timezone: string;
+    startIso: string;
+    endIso: string;
+  };
+  paymentMode: string;
+  lastReconciledAt: string;
+  cards: NonNullable<AdminDashboardSummary['paymentOverview']>;
+  matchedCapturedPayments: AdminPaymentReconciliationRow[];
+  capturedButPendingLocally: AdminPaymentReconciliationRow[];
+  localSuccessButNotVerifiedInRazorpay: AdminPaymentReconciliationRow[];
+  duplicateLocalSuccessfulTransactions: Array<{
+    razorpayPaymentId: string;
+    localRows: AdminPaymentReconciliationRow[];
+  }>;
+  manualGrantsWronglyCountedAsPayments: AdminPaymentReconciliationRow[];
+  refundedOrDisputedRecords: AdminPaymentReconciliationRow[];
+  wrongDateTimezoneRecords: AdminPaymentReconciliationRow[];
+  testModeLiveModeMismatchRecords: AdminPaymentReconciliationRow[];
+  amountMismatchRecords: AdminPaymentReconciliationRow[];
+  orderMismatchRecords: AdminPaymentReconciliationRow[];
+  userMismatchRecords: AdminPaymentReconciliationRow[];
+  courseMismatchRecords: AdminPaymentReconciliationRow[];
+  localTransactionNotFoundRecords: AdminPaymentReconciliationRow[];
+}
+
+export interface AdminSystemHealthSummary {
+  backendStatus: string;
+  appReplica1Health: string;
+  appReplica2Health: string;
+  dbStatus: string;
+  dbConnections: {
+    total: number | null;
+    idle: number | null;
+    waiting: number | null;
+  };
+  apiErrorRate: number | null;
+  paymentSyncErrorRate: number | null;
+  adminActionFailureRate: number | null;
+  p95Latency: number | null;
+  p99Latency: number | null;
+  status502Count: number | null;
+  status503Count: number | null;
+  status504Count: number | null;
+  lastSuccessfulBulkSyncTime?: string | null;
+  dependencies?: Record<string, unknown>;
+  checkedAt?: string | null;
+}
+
+export interface AdminAccessDiagnosis {
+  studentId: string;
+  studentName: string;
+  studentEmail?: string | null;
+  studentMobile?: string | null;
+  studentAccountStatus?: string | null;
+  studentCreatedAt?: string | null;
+  studentLastLoginAt?: string | null;
+  courseId?: string | null;
+  courseName?: string | null;
+  paymentSuccess: boolean;
+  enrollmentExists: boolean;
+  accessEnabled: boolean;
+  validityActive: boolean;
+  courseIdMatched: boolean;
+  userIdMatched: boolean;
+  frontendPurchaseFlagExpected: boolean;
+  shouldShowBuyButton: boolean;
+  shouldShowStartCourse: boolean;
+  accessBlockReason?: string | null;
+  courseAccessLabel?: string | null;
+  reasonStudentSeesBuyButton?: string | null;
+  duplicateAccounts: Array<{
+    studentId: string;
+    name: string;
+    email: string;
+    mobileNumber?: string | null;
+  }>;
+  payment?: {
+    paymentId: string;
+    transactionId?: string | null;
+    providerOrderId?: string | null;
+    status: string;
+    amount: number;
+    courseId?: string | null;
+    userId?: string | null;
+    meta: Record<string, unknown>;
+  } | null;
+  enrollment?: {
+    enrollmentId: string;
+    accessStatus: string;
+    expiresAt?: string | null;
+    source?: string | null;
+    adminNote?: string | null;
+  } | null;
+}
+
+export interface AdminRepairResult {
+  success: boolean;
+  actions: string[];
+  diagnosisBefore: AdminAccessDiagnosis;
+  diagnosisAfter: AdminAccessDiagnosis;
+  repairSummary: {
+    paymentFound: boolean;
+    transactionId?: string | null;
+    courseName?: string | null;
+    enrollmentCreated: boolean;
+    accessEnabled: boolean;
+    validityUpdated: boolean;
+    cacheRefreshed: boolean;
+    finalAccessStatus: string;
+    studentShouldNowSee: 'Start Course' | 'Continue Learning' | 'Buy' | 'Expired' | 'Access Disabled' | 'Payment Pending' | string;
+    repairNote?: string | null;
+  };
+}
+
 export interface PlatformOverview {
   user: AuthUser | null;
   highlights: {
@@ -739,6 +1492,7 @@ export interface PlatformOverview {
   liveClasses: LiveClass[];
   subscriptions: SubscriptionPlan[];
   notifications: NotificationItem[];
+  notificationCount?: number;
   analytics: AnalyticsSnapshot;
   ai: {
     headline: string;

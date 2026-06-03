@@ -133,6 +133,22 @@ const REDIS_COMMAND_POOL_SIZE = Math.max(1, Number(process.env.REDIS_COMMAND_POO
 let redisCommandPool = [];
 let redisCommandPoolTargetKey = null;
 let redisCommandPoolCursor = 0;
+const memoryRedisValues = new Map();
+const memoryRedisSets = new Map();
+
+const readMemoryRedisEntry = (key) => {
+  const entry = memoryRedisValues.get(String(key));
+  if (!entry) {
+    return null;
+  }
+
+  if (entry.expiresAtMs && entry.expiresAtMs <= Date.now()) {
+    memoryRedisValues.delete(String(key));
+    return null;
+  }
+
+  return entry;
+};
 
 const createRedisCommandClient = (target) => {
   let socket = null;
@@ -292,7 +308,7 @@ const executeRedisCommand = async (commandParts) => {
 
 const getRedisValue = async (key) => {
   if (!parseRedisTarget()) {
-    return null;
+    return readMemoryRedisEntry(key)?.value ?? null;
   }
 
   return executeRedisCommand(['GET', key]);
@@ -300,7 +316,14 @@ const getRedisValue = async (key) => {
 
 const setRedisValue = async (key, value, options = {}) => {
   if (!parseRedisTarget()) {
-    return false;
+    const ttlSeconds = Number(options.ttlSeconds || 0);
+    memoryRedisValues.set(String(key), {
+      value: String(value),
+      expiresAtMs: Number.isFinite(ttlSeconds) && ttlSeconds > 0
+        ? Date.now() + (ttlSeconds * 1000)
+        : null,
+    });
+    return true;
   }
 
   const command = ['SET', key, value];
@@ -314,7 +337,9 @@ const setRedisValue = async (key, value, options = {}) => {
 
 const deleteRedisKey = async (key) => {
   if (!parseRedisTarget()) {
-    return false;
+    memoryRedisValues.delete(String(key));
+    memoryRedisSets.delete(String(key));
+    return true;
   }
 
   await executeRedisCommand(['DEL', key]);
@@ -323,7 +348,11 @@ const deleteRedisKey = async (key) => {
 
 const addRedisSetMember = async (key, member) => {
   if (!parseRedisTarget()) {
-    return false;
+    const normalizedKey = String(key);
+    const nextSet = memoryRedisSets.get(normalizedKey) || new Set();
+    nextSet.add(String(member));
+    memoryRedisSets.set(normalizedKey, nextSet);
+    return true;
   }
 
   await executeRedisCommand(['SADD', key, member]);
@@ -332,7 +361,15 @@ const addRedisSetMember = async (key, member) => {
 
 const removeRedisSetMember = async (key, member) => {
   if (!parseRedisTarget()) {
-    return false;
+    const normalizedKey = String(key);
+    const nextSet = memoryRedisSets.get(normalizedKey);
+    if (nextSet) {
+      nextSet.delete(String(member));
+      if (nextSet.size === 0) {
+        memoryRedisSets.delete(normalizedKey);
+      }
+    }
+    return true;
   }
 
   await executeRedisCommand(['SREM', key, member]);
@@ -341,7 +378,7 @@ const removeRedisSetMember = async (key, member) => {
 
 const getRedisSetMembers = async (key) => {
   if (!parseRedisTarget()) {
-    return [];
+    return [...(memoryRedisSets.get(String(key)) || new Set())];
   }
 
   const members = await executeRedisCommand(['SMEMBERS', key]);
@@ -367,7 +404,16 @@ const setRedisJson = async (key, value, options = {}) => {
 
 const incrementRedisCounter = async (key, ttlSeconds) => {
   if (!parseRedisTarget()) {
-    return null;
+    const normalizedKey = String(key);
+    const currentValue = Number(readMemoryRedisEntry(normalizedKey)?.value || 0);
+    const nextValue = currentValue + 1;
+    memoryRedisValues.set(normalizedKey, {
+      value: String(nextValue),
+      expiresAtMs: Number.isFinite(ttlSeconds) && ttlSeconds > 0
+        ? Date.now() + (ttlSeconds * 1000)
+        : readMemoryRedisEntry(normalizedKey)?.expiresAtMs || null,
+    });
+    return nextValue;
   }
 
   const count = await executeRedisCommand(['INCR', key]);
@@ -506,45 +552,33 @@ const checkRedisHealth = async () => {
     };
   }
 
-  return new Promise((resolve) => {
-    const socket = net.createConnection({ host: target.host, port: target.port });
-    let settled = false;
-
-    const finish = (status, detail) => {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      socket.destroy();
-      resolve({
+  try {
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Redis connection timed out')), 5_000);
+    });
+    const response = await Promise.race([
+      executeRedisCommand(['PING']),
+      timeoutPromise,
+    ]);
+    if (String(response || '').toUpperCase() === 'PONG') {
+      return {
         enabled: true,
-        status,
-        detail,
-      });
+        status: 'up',
+        detail: `${target.host}:${target.port}`,
+      };
+    }
+    return {
+      enabled: true,
+      status: 'down',
+      detail: `Unexpected Redis health response: ${String(response)}`,
     };
-
-    socket.setTimeout(5_000);
-
-    socket.on('connect', () => {
-      if (target.password) {
-        writeResp(socket, ['AUTH', target.password]);
-      }
-      writeResp(socket, ['PING']);
-    });
-
-    socket.on('data', (data) => {
-      const response = data.toString('utf8');
-      if (response.includes('+PONG')) {
-        finish('up', `${target.host}:${target.port}`);
-      } else if (response.startsWith('-ERR')) {
-        finish('down', response.trim());
-      }
-    });
-
-    socket.on('timeout', () => finish('down', 'Redis connection timed out'));
-    socket.on('error', (error) => finish('down', error.message));
-  });
+  } catch (error) {
+    return {
+      enabled: true,
+      status: 'down',
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
 };
 
 module.exports = {

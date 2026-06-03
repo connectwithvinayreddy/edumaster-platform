@@ -85,14 +85,89 @@ Recommended replayable flow after backend deploy:
 3. Repeat with:
    - `COURSE_LOAD_USERS=500 COURSE_LOAD_ACTIVE_CONCURRENCY=500`
    - `COURSE_LOAD_USERS=750 COURSE_LOAD_ACTIVE_CONCURRENCY=750`
+   - `COURSE_LOAD_USERS=1000 COURSE_LOAD_ACTIVE_CONCURRENCY=1000`
 
-One-command ladder helper from the repo root:
+One-command recorded-video API ladder helper from the repo root:
 
 `QA_BASE_URL=https://app.178.105.48.179.nip.io ./scripts/run-course-video-ladder.sh`
 
 If you already have a prepared user manifest:
 
 `QA_BASE_URL=https://app.178.105.48.179.nip.io COURSE_LOAD_USERS_FILE=/absolute/path/to/prepared-users.json ./scripts/run-course-video-ladder.sh`
+
+Defaults:
+
+- `COURSE_VIDEO_LADDER_STAGES=250,500,750,1000`
+- `COURSE_LOAD_REPORT_PREFIX_BASE=course-video-scale`
+
+Real-browser recorded-video ladder helper from the repo root:
+
+`QA_BASE_URL=https://app.178.105.48.179.nip.io ./scripts/run-recorded-browser-ladder.sh`
+
+Defaults:
+
+- `QA_VIDEO_BROWSER_STAGES=50,100,250`
+- prepares a fresh QA browser manifest automatically when one is not supplied
+
+Mixed app-traffic ladder helper from the repo root:
+
+`QA_BASE_URL=https://app.178.105.48.179.nip.io ./scripts/run-platform-scale-ladder.sh`
+
+Defaults:
+
+- `PLATFORM_LADDER_STAGES=2000,5000,10000,15000`
+- `PLATFORM_LOAD_ENABLE_VIDEO_PROGRESS=1`
+- `PLATFORM_LOAD_ENABLE_PAYMENT_CHECKOUT=0`
+- `PLATFORM_LOAD_ENABLE_LIVE=0`
+- `PLATFORM_LOAD_ENABLE_ENROLL=0`
+- `PLATFORM_LOAD_ENABLE_PROFILE_UPDATE=0`
+
+Named mixed-traffic cohort model for the `5k` certification target:
+
+- `PLATFORM_LOAD_TRAFFIC_MODEL=5k-mixed`
+- `PLATFORM_LOAD_BROWSE_READ_PERCENT=70`
+- `PLATFORM_LOAD_VIDEO_ACTIVE_PERCENT=15`
+- `PLATFORM_LOAD_AUTH_SESSION_PERCENT=10`
+- `PLATFORM_LOAD_LIGHT_WRITE_PERCENT=5`
+
+One-command `5k` mixed readiness flow from the repo root:
+
+```bash
+QA_BASE_URL=https://app.example.com \
+QA_COURSE_TEXT='Course name' \
+QA_LESSON_TEXT='Lesson name' \
+QA_WATCH_LIMIT_COURSE_ID=course_id \
+QA_WATCH_LIMIT_LESSON_ID=lesson_id \
+./scripts/run-5k-mixed-readiness.sh
+```
+
+This wrapper runs:
+
+- desktop/mobile recorded-video regressions
+- recorded-browser `50 -> 100 -> 250`
+- recorded-video synthetic `250 -> 500 -> 750 -> 1000`
+- mixed app `2000 -> 5000`
+
+Findings-first `2k` mixed validation flow from the repo root:
+
+```bash
+ENV_FILE=.env.staging.private-mirror \
+QA_BASE_URL=https://app.46.225.218.53.nip.io \
+QA_STREAM_CERT_TARGETS_FILE=qa-automation/stream-cert-targets.example.json \
+./scripts/run-2k-findings-first-validation.sh
+```
+
+This runner:
+
+- captures baseline host snapshots for staging and prod
+- logs stray restarting or unhealthy containers before load
+- runs targeted recorded-video correctness checks on staging
+- runs recorded-browser stages `50 -> 100 -> 250`
+- runs recorded-video synthetic stages `250 -> 500 -> 750 -> 1000`
+- runs mixed app stages `500 -> 1000 -> 1500 -> 2000`
+- stops on the first failing stage
+- classifies failures into app/API, media path, DB, Redis, browser-only, or staging-host-exhaustion buckets
+- runs production smoke only after staging is green
 
 The course video load runner supports:
 
@@ -153,6 +228,12 @@ Optional infrastructure telemetry:
 COURSE_LOAD_RESOURCE_COMMAND='docker stats --no-stream'
 COURSE_LOAD_RESOURCE_INTERVAL_SECONDS=60
 ```
+
+Current honest capacity verdict and the future `10k-15k` mixed-traffic upgrade path live in:
+
+- `docs/capacity-verdict-and-10k-mixed-traffic-plan.md`
+- `docs/5k-mixed-traffic-readiness-plan.md`
+- `docs/cheapest-practical-5k-infrastructure-plan.md`
 
 The production course video QA runner extends the existing framework instead of replacing it. It adds:
 

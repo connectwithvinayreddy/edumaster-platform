@@ -33,7 +33,7 @@ const {
   getHlsAssetMimeType,
   rewriteHlsManifestUris,
 } = require('../lib/hls-manifest.js');
-const ffmpegPath = require('ffmpeg-static');
+const { resolveFfmpegPath } = require('../lib/ffmpeg.js');
 
 const slugify = (value) => String(value || '')
   .toLowerCase()
@@ -222,6 +222,7 @@ const getLocalDevHlsSourcePath = () => {
 };
 
 const ensureLocalDevHlsAssets = async (streamName) => {
+  const ffmpegPath = resolveFfmpegPath();
   const sourcePath = getLocalDevHlsSourcePath();
   if (!fs.existsSync(sourcePath)) {
     throw new ApiError(503, 'Local live HLS source is unavailable', {

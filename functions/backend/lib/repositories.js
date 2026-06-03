@@ -4420,11 +4420,76 @@ const coursesRepository = {
 
   async delete(courseId) {
     if (isPostgresMode()) {
-      await pgExec('DELETE FROM courses WHERE id = $1', [String(courseId)]);
+      const normalizedCourseId = String(courseId);
+      const affectedUserIds = await pgMany(
+        `
+          SELECT DISTINCT user_id
+          FROM (
+            SELECT user_id FROM enrollments WHERE course_id = $1
+            UNION
+            SELECT user_id FROM watch_history WHERE course_id = $1
+            UNION
+            SELECT user_id FROM payments WHERE course_id = $1
+          ) affected
+        `,
+        [normalizedCourseId],
+        (row) => String(row.user_id || ''),
+      );
+
+      await runInTransaction(async (client) => {
+        await pgExec(
+          `
+            UPDATE tests
+            SET course_id = NULL
+            WHERE course_id = $1
+          `,
+          [normalizedCourseId],
+          client,
+        );
+        await pgExec(
+          `
+            UPDATE live_classes
+            SET course_id = NULL
+            WHERE course_id = $1
+          `,
+          [normalizedCourseId],
+          client,
+        );
+        await pgExec(
+          `
+            UPDATE live_classes
+            SET replay_course_id = NULL
+            WHERE replay_course_id = $1
+          `,
+          [normalizedCourseId],
+          client,
+        );
+        await pgExec(
+          `
+            UPDATE payments
+            SET course_id = NULL,
+                updated_at = now()
+            WHERE course_id = $1
+          `,
+          [normalizedCourseId],
+          client,
+        );
+        await pgExec(
+          `
+            UPDATE admin_uploads
+            SET course_id = NULL
+            WHERE course_id = $1
+          `,
+          [normalizedCourseId],
+          client,
+        );
+        await pgExec('DELETE FROM courses WHERE id = $1', [normalizedCourseId], client);
+      });
       invalidateGlobalPlatformCaches();
       try {
-        await deleteRedisKey(cacheKey('course', String(courseId)));
+        await deleteRedisKey(cacheKey('course', normalizedCourseId));
       } catch (error) {}
+      affectedUserIds.filter(Boolean).forEach((userId) => invalidateUserPlatformCaches(userId));
       return true;
     }
 
@@ -4434,14 +4499,46 @@ const coursesRepository = {
       return true;
     }
 
-    const courseIndex = state.courses.findIndex((course) => course._id === String(courseId));
+    const normalizedCourseId = String(courseId);
+    const affectedUserIds = new Set([
+      ...state.enrollments.filter((entry) => entry.courseId === normalizedCourseId).map((entry) => String(entry.userId || '')),
+      ...state.watchHistory.filter((entry) => entry.courseId === normalizedCourseId).map((entry) => String(entry.userId || '')),
+      ...state.payments.filter((entry) => entry.courseId === normalizedCourseId).map((entry) => String(entry.userId || '')),
+    ].filter(Boolean));
+    const courseIndex = state.courses.findIndex((course) => course._id === normalizedCourseId);
     if (courseIndex >= 0) {
       state.courses.splice(courseIndex, 1);
     }
+    state.enrollments = state.enrollments.filter((entry) => entry.courseId !== normalizedCourseId);
+    state.watchHistory = state.watchHistory.filter((entry) => entry.courseId !== normalizedCourseId);
+    state.videoWatchStates = state.videoWatchStates.filter((entry) => entry.courseId !== normalizedCourseId);
+    state.videoAccessGrants = state.videoAccessGrants.filter((entry) => entry.courseId !== normalizedCourseId);
+    state.liveReplayAccessGrants = state.liveReplayAccessGrants.filter((entry) => entry.courseId !== normalizedCourseId);
+    state.payments = state.payments.map((entry) => (
+      entry.courseId === normalizedCourseId
+        ? { ...entry, courseId: null }
+        : entry
+    ));
+    state.tests = state.tests.map((entry) => (
+      entry.courseId === normalizedCourseId
+        ? { ...entry, courseId: null }
+        : entry
+    ));
+    state.liveClasses = state.liveClasses.map((entry) => ({
+      ...entry,
+      courseId: entry.courseId === normalizedCourseId ? null : entry.courseId,
+      replayCourseId: entry.replayCourseId === normalizedCourseId ? null : entry.replayCourseId,
+    }));
+    state.uploads = state.uploads.map((entry) => (
+      entry.courseId === normalizedCourseId
+        ? { ...entry, courseId: null }
+        : entry
+    ));
     invalidateGlobalPlatformCaches();
     try {
-      await deleteRedisKey(cacheKey('course', String(courseId)));
+      await deleteRedisKey(cacheKey('course', normalizedCourseId));
     } catch (error) {}
+    affectedUserIds.forEach((userId) => invalidateUserPlatformCaches(userId));
     return courseIndex >= 0;
   },
 

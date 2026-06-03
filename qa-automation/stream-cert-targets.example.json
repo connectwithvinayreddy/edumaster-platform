@@ -1,0 +1,26 @@
+[
+  {
+    "key": "ssc",
+    "courseId": "course_d6cb25587e594d3bbb75b58597770ff2",
+    "courseText": "SSC CGL",
+    "lessonId": "video_1780146736089_8d3b641cf7",
+    "lessonText": "INTRODUCTION",
+    "pdfAttachmentId": "replace-with-ssc-pdf-attachment-id",
+    "pdfAttachmentTitle": "SSC protected PDF",
+    "testId": "replace-with-ssc-test-id",
+    "testTitle": "SSC mock test",
+    "expectedDeliveryPath": "protected_hls_gateway"
+  },
+  {
+    "key": "bank",
+    "courseId": "course_d256c7b0f62c4c7daf387ce3c8f80081",
+    "courseText": "Bank",
+    "lessonId": "video_1780457459994",
+    "lessonText": "VERB",
+    "pdfAttachmentId": "replace-with-bank-pdf-attachment-id",
+    "pdfAttachmentTitle": "Bank protected PDF",
+    "testId": "replace-with-bank-test-id",
+    "testTitle": "Bank mock test",
+    "expectedDeliveryPath": "protected_hls_gateway"
+  }
+]

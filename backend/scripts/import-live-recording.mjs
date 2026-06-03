@@ -11,7 +11,7 @@ const {
   getPrivateVideoStorageProvider,
   uploadPrivateStorageFile,
 } = require('../lib/private-video-storage.js');
-const ffmpegPath = require('ffmpeg-static');
+const { resolveFfmpegPath } = require('../lib/ffmpeg.js');
 
 const supportedMimeTypes = {
   '.flv': 'video/mp4',
@@ -22,6 +22,7 @@ const supportedMimeTypes = {
 };
 
 const prepareRecordingUploadAsset = async (filePath) => {
+  const ffmpegPath = resolveFfmpegPath();
   const extension = path.extname(filePath).toLowerCase();
   if (extension !== '.flv') {
     return {
@@ -32,7 +33,7 @@ const prepareRecordingUploadAsset = async (filePath) => {
   }
 
   if (!ffmpegPath) {
-    throw new Error('ffmpeg-static is required to import FLV live recordings.');
+    throw new Error('ffmpeg runtime is unavailable. Install ffmpeg in the runtime image or set FFMPEG_PATH.');
   }
 
   const convertedPath = path.join(

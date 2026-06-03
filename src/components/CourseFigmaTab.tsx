@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import Hls from 'hls.js';
+import { flushSync } from 'react-dom';
 import {
   Bell,
   Bookmark,
@@ -29,20 +29,27 @@ import {
   AlertTriangle,
   Video,
   Wallet,
+  X,
 } from 'lucide-react';
 import {
   CourseCard,
   CourseLesson,
+  CourseEditorialVideo,
+  CoursePdfAttachment,
   LessonDoubtMessage,
   LessonDoubtThread,
+  LessonReportRecord,
   MockTest,
   PlatformOverview,
   ProtectedLessonPlayback,
+  SupportAttachment,
 } from '../types';
 import { cn } from '../lib/utils';
+import { loadHlsRuntime, type HlsRuntimeInstance, type HlsRuntimeLevel } from '../lib/hlsRuntime';
 import { wireHlsPlaybackMetrics } from '../lib/hlsPlaybackMetrics';
+import { classifyRecordedVideoDeliveryPath } from '../lib/recordedVideoDelivery';
 import { openRazorpayCheckout } from '../lib/razorpayCheckout';
-import { ResilientHlsVideo } from './ResilientHlsVideo';
+import { ResilientHlsVideo, type ResilientHlsVideoHandle } from './ResilientHlsVideo';
 import {
   createProtectedVodHlsConfig,
   getDefaultRecordedVideoQualityHeight,
@@ -54,11 +61,44 @@ import {
 } from '../lib/hlsPlaybackTuning';
 import { useAuth } from '../AuthContext';
 import { EduService } from '../EduService';
+import { ProtectedPdfReader } from './ProtectedPdfReader';
 
 const currency = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 });
-const WATERMARK_VISIBLE_DURATION_MS = 5000;
-const WATERMARK_HIDDEN_INTERVAL_MS = 10000;
+const PLAYBACK_SPEED_OPTIONS = [
+  { value: 0.75, label: '0.75x' },
+  { value: 1, label: '1x' },
+  { value: 1.25, label: '1.25x' },
+  { value: 1.5, label: '1.5x' },
+  { value: 1.75, label: '1.75x' },
+  { value: 2, label: '2x' },
+] as const;
 const LESSON_DOUBT_POLL_INTERVAL_MS = 10000;
+const PROTECTED_PLAYBACK_BOOTSTRAP_TIMEOUT_MS = 30_000;
+const PROTECTED_PLAYBACK_BOOTSTRAP_TIMEOUT_RETRY_LIMIT = 2;
+const PROTECTED_PLAYBACK_BOOTSTRAP_RETRY_DELAY_MS = 2_500;
+const LESSON_REPORT_ISSUE_OPTIONS: Array<{ value: LessonReportIssueType; label: string }> = [
+  { value: 'video_not_playing', label: 'Video not playing' },
+  { value: 'audio_issue', label: 'Audio issue' },
+  { value: 'video_buffering', label: 'Video buffering' },
+  { value: 'wrong_lesson', label: 'Wrong lesson' },
+  { value: 'fullscreen_issue', label: 'Fullscreen issue' },
+  { value: 'seek_progress_issue', label: 'Seek/progress issue' },
+  { value: 'payment_access_issue', label: 'Payment/access issue' },
+  { value: 'other', label: 'Other' },
+];
+
+const buildLegacyNotesAttachment = (_lesson: CourseLesson): CoursePdfAttachment | null => null;
+
+const formatSupportFileSize = (bytes?: number | null) => {
+  const size = Number(bytes || 0);
+  if (!size) {
+    return '';
+  }
+  if (size < 1024 * 1024) {
+    return `${Math.max(1, Math.round(size / 1024))} KB`;
+  }
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+};
 
 const getDiscountedCoursePrice = (course: CourseCard) => {
   const basePrice = Math.max(Number(course.price || 0), 1);
@@ -90,17 +130,57 @@ const getCoursePricingMeta = (course: CourseCard) => {
   const finalPrice = getDiscountedCoursePrice(course);
   const offerPercentage = Number(course.offerPercentage || 0);
   const savings = Math.max(basePrice - finalPrice, 0);
+  const hasOffer = offerPercentage > 0 && savings > 0 && finalPrice < basePrice;
 
   return {
     basePrice,
     finalPrice,
     offerPercentage,
     savings,
+    hasOffer,
   };
 };
 
 const getCoursePurchaseLabel = (course: CourseCard) =>
   `Buy course for ${getCoursePriceSummary(course)}`;
+
+const hasActiveCourseAccess = (course?: CourseCard | null) =>
+  Boolean(course && (course.canAccessCourse ?? course.enrolled));
+
+const getCourseAccessStatus = (course?: CourseCard | null) => {
+  if (!course) {
+    return 'not_purchased';
+  }
+  if (course.accessStatus) {
+    return String(course.accessStatus).toLowerCase();
+  }
+  if (hasActiveCourseAccess(course)) {
+    return 'enabled';
+  }
+  return course.isPurchased ? 'pending_access' : 'not_purchased';
+};
+
+const getCoursePrimaryActionLabel = (course: CourseCard, progressPercent = 0) => {
+  if (hasActiveCourseAccess(course)) {
+    return progressPercent > 0 ? 'Continue Course' : 'Start Course';
+  }
+  const accessStatus = getCourseAccessStatus(course);
+  if (accessStatus === 'expired') {
+    return 'Renew Course';
+  }
+  if (accessStatus === 'disabled') {
+    return 'Contact Support';
+  }
+  return 'Buy Course';
+};
+
+const shouldShowCoursePaymentButton = (course?: CourseCard | null) => {
+  if (!course || hasActiveCourseAccess(course)) {
+    return false;
+  }
+  const accessStatus = getCourseAccessStatus(course);
+  return accessStatus !== 'disabled';
+};
 
 type CourseFigmaTabProps = {
   overview: PlatformOverview;
@@ -108,6 +188,8 @@ type CourseFigmaTabProps = {
   initialCourseId?: string | null;
   initialLessonId?: string | null;
   initialDoubtThreadId?: string | null;
+  initialReportId?: string | null;
+  initialSupportPanel?: 'doubts' | 'report' | null;
   onResumeNavigationHandled?: () => void;
   savedTopicIds: string[];
   onToggleSavedTopic: (courseId: string, lessonId: string) => void;
@@ -117,26 +199,16 @@ type CourseFigmaTabProps = {
 
 
 type Screen = 'catalog' | 'course' | 'lesson';
-type CourseTab = 'Lessons';
+type CourseTab = 'Lessons' | 'Editorial';
 type LessonTab = 'Video' | 'CBT Exam' | 'Explanation';
-type LessonSupportPanel = 'notes' | 'doubts' | null;
-type MobileSupportTab = Exclude<LessonSupportPanel, null>;
+type LessonSupportPanel = 'notes' | 'doubts' | 'report' | null;
+type MobileSupportTab = 'notes' | 'doubts';
 type MobileWatchPanel = 'rating' | 'chat' | 'report' | null;
+type PlayerSettingsView = 'closed' | 'root' | 'speed' | 'quality';
+type LessonReportIssueType = 'video_not_playing' | 'audio_issue' | 'video_buffering' | 'wrong_lesson' | 'fullscreen_issue' | 'seek_progress_issue' | 'payment_access_issue' | 'other';
 type LessonStage = 'video' | 'exam' | 'explanation';
 type MobileLessonStage = 'watch' | 'completed' | 'exam' | 'exam-complete' | 'explanation' | 'explanation-complete';
 type CatalogTone = 'blue' | 'teal' | 'orange' | 'purple';
-type WatermarkPosition = {
-  top: string;
-  left: string;
-  rotate: string;
-};
-
-const createRandomWatermarkPosition = (): WatermarkPosition => ({
-  top: `${12 + Math.random() * 64}%`,
-  left: `${14 + Math.random() * 68}%`,
-  rotate: `${-20 + Math.random() * 40}deg`,
-});
-
 type StoredProgress = {
   lessonId: string;
   progressPercent: number;
@@ -152,6 +224,21 @@ type StoredProgress = {
 };
 
 type StoredProgressPatch = Partial<StoredProgress> & Pick<StoredProgress, 'lessonId'>;
+
+type StableProtectedPlaybackBinding = {
+  lessonId: string;
+  videoId: string | null;
+  sourceUrl: string;
+  drmManifestUrl: string | null;
+  drmConfig: ProtectedLessonPlayback['drmConfig'] | null;
+  streamFormat: ProtectedLessonPlayback['streamFormat'] | null;
+  playbackSessionId: string | null;
+  videoType: ProtectedLessonPlayback['videoType'] | null;
+  deliveryProfile: string | null;
+  resumeSeconds: number;
+  watchState: ProtectedLessonPlayback['watchState'] | null;
+  replayState: string | null;
+};
 
 type CourseLessonEntry = {
   lesson: CourseLesson;
@@ -172,7 +259,15 @@ type CourseSection = {
   title: string;
   moduleId: string;
   chapterId: string | null;
+  attachments: CoursePdfAttachment[];
   lessons: CourseLessonEntry[];
+};
+
+type CoursePdfGroup = {
+  key: string;
+  label: string;
+  description: string;
+  items: CoursePdfAttachment[];
 };
 
 type LessonCopy = {
@@ -209,7 +304,7 @@ const MAX_VIDEO_WATCHES = 2;
 const MAX_EXPLANATION_WATCHES = 1;
 const VIDEO_COMPLETION_MIN_WATCH_RATIO = 0.9;
 
-const courseTabs: CourseTab[] = ['Lessons'];
+const courseTabs: CourseTab[] = ['Lessons', 'Editorial'];
 const lessonTabs: LessonTab[] = ['Video'];
 const mobileLessonTabLabels: Record<LessonTab, string> = {
   Video: 'Video',
@@ -380,6 +475,45 @@ const mergeStoredProgress = (
   };
 };
 
+const adoptServerProgress = (
+  optimistic?: StoredProgress | null,
+  serverRecord?: Partial<StoredProgress> | null,
+): StoredProgress | null => {
+  if (!optimistic && !serverRecord) {
+    return null;
+  }
+
+  if (!serverRecord) {
+    return optimistic || null;
+  }
+
+  const fallback = optimistic || {
+    lessonId: String(serverRecord.lessonId || ''),
+    progressPercent: 0,
+    progressSeconds: 0,
+    completed: false,
+    updatedAt: new Date().toISOString(),
+  };
+
+  return {
+    ...fallback,
+    ...serverRecord,
+    lessonId: String(serverRecord.lessonId || fallback.lessonId || ''),
+    progressPercent: Math.max(Number(serverRecord.progressPercent ?? fallback.progressPercent ?? 0), 0),
+    progressSeconds: Math.max(Number(serverRecord.progressSeconds ?? fallback.progressSeconds ?? 0), 0),
+    completed: Boolean(serverRecord.completed ?? fallback.completed ?? false),
+    lessonStage: (serverRecord.lessonStage ?? fallback.lessonStage) as LessonStage | undefined,
+    examSubmitted: Boolean(serverRecord.examSubmitted ?? fallback.examSubmitted ?? false),
+    examSelectedOption: Object.prototype.hasOwnProperty.call(serverRecord, 'examSelectedOption')
+      ? serverRecord.examSelectedOption ?? null
+      : fallback.examSelectedOption ?? null,
+    explanationSeconds: Math.max(Number(serverRecord.explanationSeconds ?? fallback.explanationSeconds ?? 0), 0),
+    videoWatchCount: Math.max(Number(serverRecord.videoWatchCount ?? fallback.videoWatchCount ?? 0), 0),
+    explanationWatchCount: Math.max(Number(serverRecord.explanationWatchCount ?? fallback.explanationWatchCount ?? 0), 0),
+    updatedAt: String(serverRecord.updatedAt || fallback.updatedAt || new Date().toISOString()),
+  };
+};
+
 const readStoredProgress = (courseId: string) => {
   if (typeof window === 'undefined' || !courseId) {
     return {} as Record<string, StoredProgress>;
@@ -476,6 +610,7 @@ const buildCourseSections = (course: CourseCard | null): CourseSection[] => {
         title: module.title,
         moduleId: module.id,
         chapterId: null,
+        attachments: [],
         lessons,
       });
     }
@@ -505,6 +640,7 @@ const buildCourseSections = (course: CourseCard | null): CourseSection[] => {
         title: chapter.title,
         moduleId: module.id,
         chapterId: chapter.id,
+        attachments: chapter.attachments || [],
         lessons,
       });
     });
@@ -572,14 +708,14 @@ const buildUnlockMap = (course: CourseCard | null, progressMap: Map<string, Stor
   const accessMap = new Map<string, { unlocked: boolean; reason: string | null }>();
   const hasCourseAccess = Boolean(
     hasCourseAccessOverride
-    || course?.enrolled,
+    || hasActiveCourseAccess(course),
   );
 
   lessons.forEach((entry) => {
     if (entry.lesson.locked) {
       accessMap.set(entry.lesson.id, {
         unlocked: false,
-        reason: 'This lesson is locked in the current course setup.',
+        reason: entry.lesson.accessBlockReason || 'This lesson is locked in the current course setup.',
       });
       return;
     }
@@ -619,6 +755,25 @@ const hasLessonVideoMilestone = (progress?: StoredProgress | null) =>
       || Number(progress.progressPercent || 0) >= VIDEO_STAGE_PROGRESS
     ),
   );
+
+const hasLessonCbtContent = (lesson?: CourseLesson | null) => {
+  const cbt = lesson?.cbt as (CourseLesson['cbt'] & {
+    published?: boolean | null;
+    enabled?: boolean | null;
+    deleted?: boolean | null;
+    lessonId?: string | null;
+    courseId?: string | null;
+  }) | null | undefined;
+  if (!cbt || !Array.isArray(cbt.questions) || cbt.questions.length === 0) {
+    return false;
+  }
+
+  if (cbt.deleted === true || cbt.enabled === false || cbt.published === false) {
+    return false;
+  }
+
+  return true;
+};
 
 const getVideoWatchCount = (progress?: StoredProgress | null) => {
   if (!progress) {
@@ -874,11 +1029,7 @@ const CatalogCourseCard = ({
   onOpen: () => void;
 }) => {
   const styles = toneStyles[tone];
-  const actionLabel = snapshot.progressPercent > 0
-    ? 'Continue'
-    : course.enrolled
-      ? 'Start Course'
-      : 'Buy Course';
+  const actionLabel = getCoursePrimaryActionLabel(course, snapshot.progressPercent);
   const chipLabel = course.exam || course.category || 'Course';
   const pricing = getCoursePricingMeta(course);
 
@@ -903,7 +1054,7 @@ const CatalogCourseCard = ({
           <p className="mt-[6px] line-clamp-2 text-[15px] leading-[1.18] text-[#32466c]">{course.subject}</p>
         </div>
 
-        {!course.enrolled && (
+        {!hasActiveCourseAccess(course) && shouldShowCoursePaymentButton(course) && (
           <div className="mt-[4px] rounded-[16px] border border-[#ffd9b6] bg-[linear-gradient(135deg,rgba(255,247,237,0.96)_0%,rgba(255,255,255,0.98)_100%)] px-[14px] py-[12px] shadow-[0_12px_26px_rgba(201,106,43,0.10)]">
             <div className="flex items-start justify-between gap-[10px]">
               <div>
@@ -1014,6 +1165,8 @@ export const CourseFigmaTab = ({
   initialCourseId,
   initialLessonId,
   initialDoubtThreadId,
+  initialReportId,
+  initialSupportPanel,
   onResumeNavigationHandled,
   savedTopicIds,
   onToggleSavedTopic,
@@ -1033,7 +1186,7 @@ export const CourseFigmaTab = ({
   const [statusFilter, setStatusFilter] = useState<'all' | 'unlocked' | 'progress' | 'completed' | 'not-started'>('all');
   const [sortBy, setSortBy] = useState<'latest' | 'progress' | 'title'>('latest');
   const [mobileCatalogLayout, setMobileCatalogLayout] = useState<'list' | 'grid'>('list');
-  const [mobileCourseTab, setMobileCourseTab] = useState<'Content' | 'Syllabus' | 'Resources'>('Content');
+  const [mobileCourseTab, setMobileCourseTab] = useState<'Content' | 'Editorial'>('Content');
   const [expandedSectionsByCourse, setExpandedSectionsByCourse] = useState<Record<string, string[]>>({});
   const [autoplayEnabled, setAutoplayEnabled] = useState(true);
   const [autoplayCountdown, setAutoplayCountdown] = useState<number | null>(null);
@@ -1044,10 +1197,10 @@ export const CourseFigmaTab = ({
   const [isVideoReplayMode, setIsVideoReplayMode] = useState(false);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [playerControlsVisible, setPlayerControlsVisible] = useState(true);
+  const [playerSettingsView, setPlayerSettingsView] = useState<PlayerSettingsView>('closed');
+  const [isPlayerBuffering, setIsPlayerBuffering] = useState(false);
   const [completedVideoPlaybackKey, setCompletedVideoPlaybackKey] = useState<string | null>(null);
-  const [isWatermarkVisible, setIsWatermarkVisible] = useState(false);
-  const [watermarkPosition, setWatermarkPosition] = useState<WatermarkPosition>(() => createRandomWatermarkPosition());
-  const [watermarkTimestamp, setWatermarkTimestamp] = useState(() => new Date().toLocaleString('en-IN'));
   const [mobileLessonStageOverride, setMobileLessonStageOverride] = useState<MobileLessonStage | null>(null);
   const [isMobileLayout, setIsMobileLayout] = useState(false);
   const [quizSelections, setQuizSelections] = useState<Record<string, number | null>>({});
@@ -1060,20 +1213,35 @@ export const CourseFigmaTab = ({
   const [loadingLessonDoubts, setLoadingLessonDoubts] = useState(false);
   const [sendingLessonDoubt, setSendingLessonDoubt] = useState(false);
   const [lessonDoubtError, setLessonDoubtError] = useState<string | null>(null);
+  const [lessonDoubtSuccess, setLessonDoubtSuccess] = useState<string | null>(null);
   const [lessonRatings, setLessonRatings] = useState<Record<string, number>>({});
   const [lessonReportDrafts, setLessonReportDrafts] = useState<Record<string, string>>({});
-  const [lessonReportSent, setLessonReportSent] = useState<Record<string, boolean>>({});
+  const [lessonReportIssueTypes, setLessonReportIssueTypes] = useState<Record<string, LessonReportIssueType>>({});
+  const [lessonReportsByLesson, setLessonReportsByLesson] = useState<Record<string, LessonReportRecord[]>>({});
+  const [loadingLessonReports, setLoadingLessonReports] = useState(false);
+  const [sendingLessonReport, setSendingLessonReport] = useState(false);
+  const [activePdfAttachment, setActivePdfAttachment] = useState<CoursePdfAttachment | null>(null);
+  const [activePdfRequest, setActivePdfRequest] = useState<{ url: string; headers: Record<string, string> } | null>(null);
+  const [loadingPdfId, setLoadingPdfId] = useState<string | null>(null);
+  const [pdfViewerError, setPdfViewerError] = useState<string | null>(null);
+  const [lessonReportError, setLessonReportError] = useState<string | null>(null);
+  const [lessonReportSuccess, setLessonReportSuccess] = useState<string | null>(null);
   const [busyCourseId, setBusyCourseId] = useState<string | null>(null);
   const [courseAccessMessage, setCourseAccessMessage] = useState<string | null>(null);
   const [expandedSupportPanel, setExpandedSupportPanel] = useState<LessonSupportPanel>(null);
   const [mobileSupportTab, setMobileSupportTab] = useState<MobileSupportTab>('notes');
   const [mobileWatchPanel, setMobileWatchPanel] = useState<MobileWatchPanel>(null);
   const [protectedLessonPlayback, setProtectedLessonPlayback] = useState<ProtectedLessonPlayback | null>(null);
+  const [activeProtectedPlaybackBinding, setActiveProtectedPlaybackBinding] = useState<StableProtectedPlaybackBinding | null>(null);
   const [loadingProtectedLesson, setLoadingProtectedLesson] = useState(false);
   const [protectedLessonError, setProtectedLessonError] = useState<string | null>(null);
+  const [activeEditorialId, setActiveEditorialId] = useState<string | null>(null);
+  const [editorialPlayback, setEditorialPlayback] = useState<ProtectedLessonPlayback | null>(null);
+  const [loadingEditorialId, setLoadingEditorialId] = useState<string | null>(null);
+  const [editorialError, setEditorialError] = useState<string | null>(null);
   const [useProtectedSourceFallback, setUseProtectedSourceFallback] = useState(false);
   const [privateVideoQualityOptions, setPrivateVideoQualityOptions] = useState<RecordedVideoQualityOption[]>([]);
-  const [selectedPrivateVideoQuality, setSelectedPrivateVideoQuality] = useState<number>(480);
+  const [selectedPrivateVideoQuality, setSelectedPrivateVideoQuality] = useState<number | null>(null);
   const [localProgressByCourse, setLocalProgressByCourse] = useState<Record<string, Record<string, StoredProgress>>>(() =>
     overview.courses.reduce<Record<string, Record<string, StoredProgress>>>((accumulator, course) => {
       accumulator[course._id] = readStoredProgress(course._id);
@@ -1084,8 +1252,48 @@ export const CourseFigmaTab = ({
   const autoplayHandledRef = useRef<string | null>(null);
   const handledResumeNavigationRef = useRef<string | null>(null);
   const pendingLessonDoubtThreadIdRef = useRef<string | null>(initialDoubtThreadId || null);
+  const pendingLessonReportIdRef = useRef<string | null>(initialReportId || null);
   const lessonVideoRef = useRef<HTMLVideoElement | null>(null);
-  const hlsRef = useRef<Hls | null>(null);
+  const protectedLessonVideoRef = useRef<ResilientHlsVideoHandle | null>(null);
+  const protectedPlaybackTimeoutRetryCountRef = useRef(0);
+  const protectedPlaybackRetryTimerRef = useRef<number | null>(null);
+  const playerControlsHideTimerRef = useRef<number | null>(null);
+  const hlsRef = useRef<HlsRuntimeInstance | null>(null);
+
+  const syncCourseWorkspaceUrl = useCallback((nextScreen: Screen, nextCourseId: string | null, nextLessonId: string | null) => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    const nextUrl = new URL(window.location.href);
+    const nextParams = new URLSearchParams(nextUrl.search);
+    nextParams.set('tab', 'courses');
+
+    if (nextScreen === 'catalog') {
+      nextParams.delete('courseId');
+      nextParams.delete('lessonId');
+      nextParams.delete('doubtThreadId');
+      nextParams.delete('reportId');
+      nextParams.delete('supportPanel');
+    } else if (nextCourseId) {
+      nextParams.set('courseId', nextCourseId);
+      if (nextScreen === 'lesson' && nextLessonId) {
+        nextParams.set('lessonId', nextLessonId);
+      } else {
+        nextParams.delete('lessonId');
+        nextParams.delete('doubtThreadId');
+        nextParams.delete('reportId');
+        nextParams.delete('supportPanel');
+      }
+    }
+
+    const currentPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    nextUrl.search = nextParams.toString();
+    const nextPath = `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`;
+    if (currentPath !== nextPath) {
+      window.history.replaceState(null, '', nextPath);
+    }
+  }, []);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -1104,11 +1312,26 @@ export const CourseFigmaTab = ({
     };
   }, []);
 
+  useEffect(() => () => {
+    if (protectedPlaybackRetryTimerRef.current !== null) {
+      window.clearTimeout(protectedPlaybackRetryTimerRef.current);
+      protectedPlaybackRetryTimerRef.current = null;
+    }
+    if (playerControlsHideTimerRef.current !== null) {
+      window.clearTimeout(playerControlsHideTimerRef.current);
+      playerControlsHideTimerRef.current = null;
+    }
+  }, []);
+
   useEffect(() => {
     const nextImmersive = isMobileLayout && screen === 'lesson';
     onImmersiveModeChange?.(nextImmersive);
     return () => onImmersiveModeChange?.(false);
   }, [isMobileLayout, onImmersiveModeChange, screen]);
+
+  useEffect(() => {
+    syncCourseWorkspaceUrl(screen, selectedCourseId, selectedLessonId);
+  }, [screen, selectedCourseId, selectedLessonId, syncCourseWorkspaceUrl]);
 
   useEffect(() => {
     setLocalProgressByCourse((current) => {
@@ -1134,8 +1357,8 @@ export const CourseFigmaTab = ({
   }, [defaultCourseId, overview.courses, selectedCourseId]);
 
   useEffect(() => {
-    const resumeKey = `${initialCourseId || ''}::${initialLessonId || ''}::${initialDoubtThreadId || ''}`;
-    if ((!initialCourseId && !initialLessonId && !initialDoubtThreadId) || handledResumeNavigationRef.current === resumeKey) {
+    const resumeKey = `${initialCourseId || ''}::${initialLessonId || ''}::${initialDoubtThreadId || ''}::${initialReportId || ''}::${initialSupportPanel || ''}`;
+    if ((!initialCourseId && !initialLessonId && !initialDoubtThreadId && !initialReportId && !initialSupportPanel) || handledResumeNavigationRef.current === resumeKey) {
       return;
     }
 
@@ -1156,14 +1379,32 @@ export const CourseFigmaTab = ({
       setExpandedSupportPanel('doubts');
       setMobileSupportTab('doubts');
     }
+    if (initialReportId) {
+      pendingLessonReportIdRef.current = initialReportId;
+      setExpandedSupportPanel('report');
+      setMobileWatchPanel('report');
+    } else if (initialSupportPanel === 'report') {
+      setExpandedSupportPanel('report');
+      setMobileWatchPanel('report');
+    } else if (initialSupportPanel === 'doubts') {
+      setExpandedSupportPanel('doubts');
+      setMobileSupportTab('doubts');
+    }
 
     handledResumeNavigationRef.current = resumeKey;
     onResumeNavigationHandled?.();
-  }, [defaultCourseId, initialCourseId, initialDoubtThreadId, initialLessonId, onResumeNavigationHandled, overview.courses]);
+  }, [defaultCourseId, initialCourseId, initialDoubtThreadId, initialLessonId, initialReportId, initialSupportPanel, onResumeNavigationHandled, overview.courses]);
 
   const selectedCourse = useMemo(
     () => overview.courses.find((course) => course._id === selectedCourseId) || overview.courses[0] || null,
     [overview.courses, selectedCourseId],
+  );
+
+  const selectedCourseEditorials = useMemo(
+    () => [...(selectedCourse?.editorials || [])]
+      .filter((editorial) => editorial.published !== false)
+      .sort((left, right) => String(right.editorialDate || right.uploadedAt || '').localeCompare(String(left.editorialDate || left.uploadedAt || ''))),
+    [selectedCourse?.editorials],
   );
 
   const selectedCourseSections = useMemo(
@@ -1212,14 +1453,35 @@ export const CourseFigmaTab = ({
     [selectedCourseEntries, selectedLessonId],
   );
 
+  const selectedLessonHasCbt = hasLessonCbtContent(selectedLessonEntry?.lesson);
+  const selectedLessonHasExplanation = selectedLessonHasCbt;
   const selectedLessonVideoDurationSeconds = Math.max((selectedLessonEntry?.lesson.durationMinutes || 1) * 60, 60);
   const selectedLessonExplanationDurationSeconds = EXPLANATION_DURATION_SECONDS;
+  const getCurrentLessonDurationSeconds = useCallback(() => {
+    const protectedDuration = protectedLessonVideoRef.current?.getDuration() || 0;
+    const nativeDuration = Number(lessonVideoRef.current?.duration || 0);
+    return Math.max(protectedDuration, nativeDuration, selectedLessonVideoDurationSeconds, 1);
+  }, [selectedLessonVideoDurationSeconds]);
+  const seekCurrentLessonVideo = useCallback((seconds: number) => {
+    const nextTime = Math.max(Number(seconds || 0), 0);
+    if (protectedLessonVideoRef.current) {
+      protectedLessonVideoRef.current.seekTo(nextTime);
+      setVideoPlaybackSeconds(nextTime);
+      return;
+    }
+
+    if (lessonVideoRef.current) {
+      const duration = Math.max(Number(lessonVideoRef.current.duration || 0), 0);
+      lessonVideoRef.current.currentTime = duration > 0 ? Math.min(nextTime, duration) : nextTime;
+      setVideoPlaybackSeconds(lessonVideoRef.current.currentTime || nextTime);
+    }
+  }, []);
   const selectedLessonStoredProgress = selectedLessonEntry ? localProgress[selectedLessonEntry.lesson.id] || null : null;
   const selectedLessonExamSelectedOption = selectedLessonEntry
     ? quizSelections[selectedLessonEntry.lesson.id] ?? selectedLessonStoredProgress?.examSelectedOption ?? null
     : null;
   const selectedLessonExamSubmitted = selectedLessonEntry
-    ? Boolean(quizSubmitted[selectedLessonEntry.lesson.id] ?? selectedLessonStoredProgress?.examSubmitted)
+    ? selectedLessonHasCbt && Boolean(quizSubmitted[selectedLessonEntry.lesson.id] ?? selectedLessonStoredProgress?.examSubmitted)
     : false;
   const selectedLessonVideoWatchLimit = Math.max(
     Number(
@@ -1241,13 +1503,52 @@ export const CourseFigmaTab = ({
     100,
   );
   const selectedLessonCompletionRatio = selectedLessonWatchCompletionPercent / 100;
-  const selectedLessonVideoWatchCount = getVideoWatchCount(selectedLessonStoredProgress);
+  const selectedLessonProtectedWatchState = activeProtectedPlaybackBinding?.watchState || protectedLessonPlayback?.watchState || null;
+  const selectedLessonProtectedReplayState = activeProtectedPlaybackBinding?.replayState
+    || selectedLessonProtectedWatchState?.replayState
+    || null;
+  const selectedLessonGraceRemainingSeconds = Math.max(
+    Number(
+      selectedLessonProtectedWatchState?.graceRemainingSeconds
+      ?? selectedLessonProtectedWatchState?.remainingRevisionBufferSeconds
+      ?? 0,
+    ),
+    0,
+  );
+  const selectedLessonVideoWatchCount = Math.max(
+    Number(selectedLessonProtectedWatchState?.completedFullWatches || 0),
+    getVideoWatchCount(selectedLessonStoredProgress),
+  );
   const selectedLessonExplanationWatchCount = getExplanationWatchCount(selectedLessonStoredProgress);
   const hasCompletedLessonVideo = selectedLessonVideoWatchCount > 0 || hasLessonVideoMilestone(selectedLessonStoredProgress);
-  const canRewatchLessonVideo = selectedLessonVideoWatchCount > 0 && selectedLessonVideoWatchCount < selectedLessonVideoWatchLimit;
-  const hasReachedLessonVideoWatchLimit = selectedLessonVideoWatchCount >= selectedLessonVideoWatchLimit;
+  const hasReachedLessonVideoWatchLimit = selectedLessonProtectedWatchState
+    ? Boolean(selectedLessonProtectedWatchState.locked)
+    : selectedLessonVideoWatchCount >= selectedLessonVideoWatchLimit;
+  const isLessonGraceReplayAvailable = Boolean(
+    selectedLessonProtectedWatchState
+    && !selectedLessonProtectedWatchState.locked
+    && selectedLessonProtectedReplayState === 'grace_cycle'
+    && selectedLessonGraceRemainingSeconds > 0,
+  );
+  const canRewatchLessonVideo = selectedLessonProtectedWatchState
+    ? selectedLessonVideoWatchCount > 0 && !selectedLessonProtectedWatchState.locked
+    : selectedLessonVideoWatchCount > 0 && selectedLessonVideoWatchCount < selectedLessonVideoWatchLimit;
+  const selectedLessonReplayStatusLabel = hasReachedLessonVideoWatchLimit
+    ? 'Video limit reached'
+    : isLessonGraceReplayAvailable
+      ? 'Grace replay available'
+      : canRewatchLessonVideo
+        ? 'Rewatch available'
+        : 'Ready to watch';
+  const selectedLessonReplayHelpText = hasReachedLessonVideoWatchLimit
+    ? 'Video replay is locked after the grace window is exhausted.'
+    : isLessonGraceReplayAvailable
+      ? `${selectedLessonVideoWatchCount}/${selectedLessonVideoWatchLimit} counted watches used. Only near-end completions count, and grace replay is still available before the final lock.`
+      : canRewatchLessonVideo
+        ? `${selectedLessonVideoWatchCount}/${selectedLessonVideoWatchLimit} counted watches used. Replay starts from the beginning of the next cycle after a near-end completion.`
+        : `${selectedLessonVideoWatchCount}/${selectedLessonVideoWatchLimit} counted watches used. A watch counts only when you finish near the end of the lesson.`;
   const hasReachedExplanationWatchLimit = selectedLessonExplanationWatchCount >= MAX_EXPLANATION_WATCHES;
-  const canWatchExplanation = selectedLessonExamSubmitted && !hasReachedExplanationWatchLimit;
+  const canWatchExplanation = selectedLessonHasExplanation && selectedLessonExamSubmitted && !hasReachedExplanationWatchLimit;
   const selectedLessonStage: LessonStage = selectedLessonStoredProgress?.lessonStage
     || (selectedLessonStoredProgress?.completed ? 'explanation' : selectedLessonExamSubmitted ? 'exam' : 'video');
   const lessonProgressTab: LessonTab = activeLessonTab;
@@ -1304,7 +1605,7 @@ export const CourseFigmaTab = ({
   );
   const selectedCourseHasAccess = Boolean(
     user?.role === 'admin'
-    || selectedCourse?.enrolled,
+    || hasActiveCourseAccess(selectedCourse),
   );
   const selectedLesson = selectedLessonEntry?.lesson || null;
   const selectedLessonHasSecurePlayback = Boolean(
@@ -1314,39 +1615,9 @@ export const CourseFigmaTab = ({
   const selectedLessonDirectVideoUrl = selectedLesson?.type === 'video' ? selectedLesson.videoUrl || null : null;
   const currentPlaybackWatermarkText = [
     user?.name,
-    user?.email,
-    user?.mobileNumber,
+    user?.email || user?.mobileNumber,
     user?._id,
-    watermarkTimestamp,
-  ].filter(Boolean).join(' • ');
-
-  useEffect(() => {
-    if (!currentPlaybackWatermarkText) {
-      setIsWatermarkVisible(false);
-      return undefined;
-    }
-
-    const timeoutIds: number[] = [];
-    const showWatermark = () => {
-      setWatermarkPosition(createRandomWatermarkPosition());
-      setWatermarkTimestamp(new Date().toLocaleString('en-IN'));
-      setIsWatermarkVisible(true);
-      const hideId = window.setTimeout(() => {
-        setIsWatermarkVisible(false);
-      }, WATERMARK_VISIBLE_DURATION_MS);
-      timeoutIds.push(hideId);
-    };
-
-    showWatermark();
-    const intervalId = window.setInterval(() => {
-      showWatermark();
-    }, WATERMARK_HIDDEN_INTERVAL_MS + WATERMARK_VISIBLE_DURATION_MS);
-
-    return () => {
-      timeoutIds.forEach((timeoutId) => window.clearTimeout(timeoutId));
-      window.clearInterval(intervalId);
-    };
-  }, [selectedLesson?.id, user?._id]);
+  ].filter(Boolean).join(' | ');
 
   const unlockMap = useMemo(
     () => buildUnlockMap(selectedCourse, selectedCourseProgressMap, selectedCourseHasAccess),
@@ -1356,6 +1627,28 @@ export const CourseFigmaTab = ({
     selectedLesson
     && unlockMap.get(selectedLesson.id)?.unlocked,
   );
+
+  const selectedLessonPdfGroups = useMemo<CoursePdfGroup[]>(() => {
+    if (!selectedLessonEntry) {
+      return [];
+    }
+
+    const lesson = selectedLessonEntry.lesson;
+    const lessonItems = [...(lesson.attachments || [])];
+    const legacyNotes = buildLegacyNotesAttachment(lesson);
+    if (legacyNotes) {
+      lessonItems.unshift(legacyNotes);
+    }
+
+    return [
+      lessonItems.length > 0 ? {
+        key: `${selectedLessonEntry.moduleId}:${selectedLessonEntry.chapterId || 'module'}:${lesson.id}:lesson`,
+        label: 'Lesson PDFs',
+        description: lesson.title,
+        items: lessonItems,
+      } : null,
+    ].filter(Boolean) as CoursePdfGroup[];
+  }, [selectedLessonEntry]);
 
   const selectedCourseSnapshot = useMemo(
     () => selectedCourse
@@ -1367,6 +1660,10 @@ export const CourseFigmaTab = ({
   const selectedCourseExamAttempts = useMemo(
     () => selectedCourseEntries.filter((entry) => Boolean(selectedCourseProgressMap.get(entry.lesson.id)?.examSubmitted)).length,
     [selectedCourseEntries, selectedCourseProgressMap],
+  );
+  const selectedCourseCbtEligibleCount = useMemo(
+    () => selectedCourseEntries.filter((entry) => hasLessonCbtContent(entry.lesson)).length,
+    [selectedCourseEntries],
   );
   const selectedCourseVideoCompletedCount = useMemo(
     () => selectedCourseEntries.filter((entry) => hasLessonVideoMilestone(selectedCourseProgressMap.get(entry.lesson.id))).length,
@@ -1423,6 +1720,28 @@ export const CourseFigmaTab = ({
     )
     : '';
   const activeLessonDoubtDraft = activeLessonDoubtDraftKey ? lessonDoubtDrafts[activeLessonDoubtDraftKey] || '' : '';
+  const activeLessonReports = selectedLessonEntry ? (lessonReportsByLesson[selectedLessonEntry.lesson.id] || []) : [];
+  const shouldLoadLessonDoubts = Boolean(
+    screen === 'lesson'
+    && selectedCourse?._id
+    && selectedLessonEntry?.lesson.id
+    && (
+      expandedSupportPanel === 'doubts'
+      || mobileSupportTab === 'doubts'
+      || pendingLessonDoubtThreadIdRef.current
+    ),
+  );
+  const shouldLoadLessonReports = Boolean(
+    screen === 'lesson'
+    && selectedCourse?._id
+    && selectedLessonEntry?.lesson.id
+    && (
+      expandedSupportPanel === 'report'
+      || mobileWatchPanel === 'report'
+      || pendingLessonReportIdRef.current
+    ),
+  );
+
 
   const loadLessonDoubts = useCallback(async (options: { silent?: boolean } = {}) => {
     if (screen !== 'lesson' || !selectedCourse?._id || !selectedLessonEntry?.lesson.id) {
@@ -1464,6 +1783,33 @@ export const CourseFigmaTab = ({
     }
   }, [screen, selectedCourse?._id, selectedLessonEntry?.lesson.id]);
 
+  const loadLessonReports = useCallback(async (options: { silent?: boolean } = {}) => {
+    if (screen !== 'lesson' || !selectedCourse?._id || !selectedLessonEntry?.lesson.id) {
+      setLessonReportError(null);
+      setLoadingLessonReports(false);
+      return;
+    }
+
+    if (!options.silent) {
+      setLoadingLessonReports(true);
+    }
+
+    try {
+      const response = await EduService.listLessonReports(selectedCourse._id, selectedLessonEntry.lesson.id);
+      setLessonReportsByLesson((current) => ({
+        ...current,
+        [selectedLessonEntry.lesson.id]: response.items || [],
+      }));
+      setLessonReportError(null);
+    } catch (error) {
+      setLessonReportError(error instanceof Error ? error.message : 'Unable to load lesson reports.');
+    } finally {
+      if (!options.silent) {
+        setLoadingLessonReports(false);
+      }
+    }
+  }, [screen, selectedCourse?._id, selectedLessonEntry?.lesson.id]);
+
   useEffect(() => {
     if (!selectedLessonEntry) {
       return;
@@ -1489,17 +1835,102 @@ export const CourseFigmaTab = ({
       setExpandedSupportPanel('doubts');
       return;
     }
+    if (pendingLessonReportIdRef.current || initialSupportPanel === 'report') {
+      setExpandedSupportPanel('report');
+      setMobileWatchPanel('report');
+      return;
+    }
 
     setMobileSupportTab('notes');
     setExpandedSupportPanel(null);
-  }, [selectedLessonEntry?.lesson.id]);
+  }, [initialSupportPanel, selectedLessonEntry?.lesson.id]);
 
   useEffect(() => {
+    const selectedLessonId = String(selectedLesson?.id || '').trim();
+    if (!selectedLessonId) {
+      setActiveProtectedPlaybackBinding(null);
+      return;
+    }
+
+    setActiveProtectedPlaybackBinding((current) => (
+      current && String(current.lessonId || '') === selectedLessonId
+        ? current
+        : null
+    ));
+  }, [selectedLesson?.id]);
+
+  useEffect(() => {
+    if (!shouldLoadLessonDoubts) {
+      return;
+    }
     void loadLessonDoubts();
-  }, [loadLessonDoubts]);
+  }, [loadLessonDoubts, shouldLoadLessonDoubts]);
 
   useEffect(() => {
-    if (screen !== 'lesson' || !selectedCourse?._id || !selectedLessonEntry?.lesson.id) {
+    if (!shouldLoadLessonReports) {
+      return;
+    }
+    void loadLessonReports();
+  }, [loadLessonReports, shouldLoadLessonReports]);
+
+  useEffect(() => {
+    if (!selectedLesson?.id || !protectedLessonPlayback) {
+      return;
+    }
+
+    const sourceUrl = String(
+      protectedLessonPlayback.drmConfig?.manifestUrl
+      || protectedLessonPlayback.streamUrl
+      || '',
+    ).trim();
+    if (!sourceUrl) {
+      return;
+    }
+
+    const nextBinding: StableProtectedPlaybackBinding = {
+      lessonId: String(selectedLesson.id),
+      videoId: String(protectedLessonPlayback.videoId || selectedLesson.id || '').trim() || null,
+      sourceUrl,
+      drmManifestUrl: String(protectedLessonPlayback.drmConfig?.manifestUrl || '').trim() || null,
+      drmConfig: protectedLessonPlayback.drmConfig || null,
+      streamFormat: protectedLessonPlayback.streamFormat || null,
+      playbackSessionId: String(protectedLessonPlayback.playbackSessionId || '').trim() || null,
+      videoType: protectedLessonPlayback.videoType || 'course',
+      deliveryProfile: protectedLessonPlayback.deliveryProfile || null,
+      resumeSeconds: Math.max(Number(protectedLessonPlayback.resumeSeconds || 0), 0),
+      watchState: protectedLessonPlayback.watchState || null,
+      replayState: protectedLessonPlayback.watchState?.replayState || null,
+    };
+
+    setActiveProtectedPlaybackBinding((current) => {
+      if (!current) {
+        return nextBinding;
+      }
+
+      const sameLesson = String(current.lessonId || '') === String(nextBinding.lessonId || '');
+      const sameVideo = String(current.videoId || '') === String(nextBinding.videoId || '');
+      if (!sameLesson || !sameVideo) {
+        return nextBinding;
+      }
+
+      return {
+        ...current,
+        playbackSessionId: nextBinding.playbackSessionId || current.playbackSessionId || null,
+        streamFormat: nextBinding.streamFormat || current.streamFormat || null,
+        videoType: nextBinding.videoType || current.videoType || 'course',
+        deliveryProfile: nextBinding.deliveryProfile || current.deliveryProfile || null,
+        drmConfig: current.drmManifestUrl === nextBinding.drmManifestUrl
+          ? (nextBinding.drmConfig || current.drmConfig || null)
+          : current.drmConfig || null,
+        resumeSeconds: Math.max(Number(nextBinding.resumeSeconds || 0), 0),
+        watchState: nextBinding.watchState || current.watchState || null,
+        replayState: nextBinding.replayState || current.replayState || null,
+      };
+    });
+  }, [protectedLessonPlayback, selectedLesson?.id]);
+
+  useEffect(() => {
+    if (!shouldLoadLessonDoubts) {
       return undefined;
     }
 
@@ -1508,7 +1939,132 @@ export const CourseFigmaTab = ({
     }, LESSON_DOUBT_POLL_INTERVAL_MS);
 
     return () => window.clearInterval(intervalId);
-  }, [loadLessonDoubts, screen, selectedCourse?._id, selectedLessonEntry?.lesson.id]);
+  }, [loadLessonDoubts, shouldLoadLessonDoubts]);
+
+  const reloadProtectedLessonPlayback = useCallback((forceRefresh = true) => {
+    if (!selectedCourse?._id || !selectedLesson?.id) {
+      return () => undefined;
+    }
+
+    if (protectedPlaybackRetryTimerRef.current !== null) {
+      window.clearTimeout(protectedPlaybackRetryTimerRef.current);
+      protectedPlaybackRetryTimerRef.current = null;
+    }
+
+    let settled = false;
+    const timeoutId = window.setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      console.warn('[video-playback] player bootstrap timed out', {
+        courseId: selectedCourse._id,
+        lessonId: selectedLesson.id,
+        userId: user?._id || null,
+        retryAttempt: protectedPlaybackTimeoutRetryCountRef.current + 1,
+      });
+      const nextRetryAttempt = protectedPlaybackTimeoutRetryCountRef.current + 1;
+      if (nextRetryAttempt <= PROTECTED_PLAYBACK_BOOTSTRAP_TIMEOUT_RETRY_LIMIT) {
+        protectedPlaybackTimeoutRetryCountRef.current = nextRetryAttempt;
+        setProtectedLessonError(null);
+        protectedPlaybackRetryTimerRef.current = window.setTimeout(() => {
+          protectedPlaybackRetryTimerRef.current = null;
+          reloadProtectedLessonPlayback(true);
+        }, PROTECTED_PLAYBACK_BOOTSTRAP_RETRY_DELAY_MS);
+        return;
+      }
+
+      protectedPlaybackTimeoutRetryCountRef.current = 0;
+      setLoadingProtectedLesson(false);
+      setProtectedLessonError('Video is taking longer than expected to prepare. Please retry.');
+    }, PROTECTED_PLAYBACK_BOOTSTRAP_TIMEOUT_MS);
+
+    setLoadingProtectedLesson(true);
+    setProtectedLessonError(null);
+    if (forceRefresh) {
+      setProtectedLessonPlayback((current) => (
+        String(current?.videoId || '') === String(selectedLesson.id || '')
+          ? current
+          : null
+      ));
+    }
+
+    void EduService.getProtectedLessonPlayback(selectedCourse._id, selectedLesson.id, { forceRefresh })
+      .then((payload) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        window.clearTimeout(timeoutId);
+        console.info('[video-playback] player payload', {
+          courseId: selectedCourse._id,
+          lessonId: selectedLesson.id,
+          userId: user?._id || null,
+          videoId: payload.videoId || null,
+          playerType: payload.playerType,
+          streamFormat: payload.streamFormat || null,
+          playbackStatus: payload.playbackStatus || null,
+          streamUrl: payload.streamUrl || null,
+          drmManifestUrl: payload.drmConfig?.manifestUrl || null,
+        });
+        protectedPlaybackTimeoutRetryCountRef.current = 0;
+        setProtectedLessonPlayback((current) => {
+          const currentVideoId = String(current?.videoId || '').trim();
+          const payloadVideoId = String(payload?.videoId || selectedLesson.id || '').trim();
+          const sameVideo = Boolean(current && currentVideoId && payloadVideoId && currentVideoId === payloadVideoId);
+          if (!sameVideo) {
+            return payload;
+          }
+
+          return {
+            ...current,
+            ...payload,
+            streamUrl: payload.streamUrl || current.streamUrl || null,
+            drmConfig: payload.drmConfig?.manifestUrl
+              ? payload.drmConfig
+              : payload.drmConfig || current.drmConfig || null,
+            fallbackStreamUrl: payload.fallbackStreamUrl || current.fallbackStreamUrl || null,
+            fallbackStreamFormat: payload.fallbackStreamFormat || current.fallbackStreamFormat || null,
+            deliveryProfile: payload.deliveryProfile || current.deliveryProfile || null,
+            streamFormat: payload.streamFormat || current.streamFormat || null,
+            statusMessage: payload.statusMessage || current.statusMessage || null,
+            resumeSeconds: Math.max(Number(payload.resumeSeconds || current.resumeSeconds || 0), 0),
+            watchState: payload.watchState || current.watchState || null,
+          };
+        });
+      })
+      .catch((error) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        window.clearTimeout(timeoutId);
+        console.warn('[video-playback] player bootstrap failed', {
+          courseId: selectedCourse._id,
+          lessonId: selectedLesson.id,
+          userId: user?._id || null,
+          message: error instanceof Error ? error.message : String(error),
+        });
+        protectedPlaybackTimeoutRetryCountRef.current = 0;
+        setProtectedLessonError(error instanceof Error ? error.message : 'Unable to prepare lesson playback.');
+      })
+      .finally(() => {
+        if (!settled) {
+          settled = true;
+          window.clearTimeout(timeoutId);
+        }
+        if (protectedPlaybackRetryTimerRef.current !== null) {
+          setLoadingProtectedLesson(true);
+          return;
+        }
+        setLoadingProtectedLesson(false);
+      });
+
+    return () => {
+      settled = true;
+      window.clearTimeout(timeoutId);
+    };
+  }, [selectedCourse?._id, selectedLesson?.id, user?._id]);
 
   useEffect(() => {
     const shouldLoadProtectedLesson = Boolean(
@@ -1521,38 +2077,20 @@ export const CourseFigmaTab = ({
     );
 
     if (!shouldLoadProtectedLesson) {
+      protectedPlaybackTimeoutRetryCountRef.current = 0;
+      if (protectedPlaybackRetryTimerRef.current !== null) {
+        window.clearTimeout(protectedPlaybackRetryTimerRef.current);
+        protectedPlaybackRetryTimerRef.current = null;
+      }
       setProtectedLessonPlayback(null);
+      setActiveProtectedPlaybackBinding(null);
       setProtectedLessonError(null);
       setLoadingProtectedLesson(false);
       return;
     }
 
-    let cancelled = false;
-    setLoadingProtectedLesson(true);
-    setProtectedLessonError(null);
-    setProtectedLessonPlayback(null);
-
-    void EduService.getProtectedLessonPlayback(selectedCourse._id, selectedLesson.id)
-      .then((payload) => {
-        if (!cancelled) {
-          setProtectedLessonPlayback(payload);
-        }
-      })
-      .catch((error) => {
-        if (!cancelled) {
-          setProtectedLessonError(error instanceof Error ? error.message : 'Unable to prepare lesson playback.');
-        }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setLoadingProtectedLesson(false);
-        }
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [activeLessonTab, screen, selectedCourse?._id, selectedLesson?.id, selectedLessonHasSecurePlayback, selectedLessonUnlocked]);
+    return reloadProtectedLessonPlayback(true);
+  }, [activeLessonTab, reloadProtectedLessonPlayback, screen, selectedLessonHasSecurePlayback, selectedLessonUnlocked]);
 
   useEffect(() => {
     if (
@@ -1576,24 +2114,14 @@ export const CourseFigmaTab = ({
     }
 
     const timer = window.setTimeout(() => {
-      setLoadingProtectedLesson(true);
-      setProtectedLessonError(null);
-      void EduService.getProtectedLessonPlayback(selectedCourse._id, selectedLesson.id, { forceRefresh: true })
-        .then((payload) => {
-          setProtectedLessonPlayback(payload);
-        })
-        .catch((error) => {
-          setProtectedLessonError(error instanceof Error ? error.message : 'Unable to prepare lesson playback.');
-        })
-        .finally(() => {
-          setLoadingProtectedLesson(false);
-        });
+      reloadProtectedLessonPlayback(true);
     }, 4000);
 
     return () => window.clearTimeout(timer);
   }, [
     activeLessonTab,
     protectedLessonPlayback,
+    reloadProtectedLessonPlayback,
     screen,
     selectedCourse?._id,
     selectedLesson?.id,
@@ -1609,42 +2137,6 @@ export const CourseFigmaTab = ({
   const nextLessonEntry = selectedLessonIndex >= 0 && selectedLessonIndex < selectedCourseEntries.length - 1
     ? selectedCourseEntries[selectedLessonIndex + 1]
     : null;
-
-  useEffect(() => {
-    if (
-      screen !== 'lesson'
-      || activeLessonTab !== 'Video'
-      || !selectedCourse?._id
-      || !selectedLessonUnlocked
-    ) {
-      return;
-    }
-
-    const prefetchTargets = [selectedLessonEntry, nextLessonEntry]
-      .filter((entry): entry is CourseLessonEntry => Boolean(
-        entry?.lesson?.id
-        && unlockMap.get(entry.lesson.id)?.unlocked
-        && (entry.lesson.requiresSecurePlayback || ['youtube', 'private-video'].includes(String(entry.lesson.type || ''))),
-      ));
-
-    const timers = prefetchTargets.map((entry, index) => (
-      window.setTimeout(() => {
-        void EduService.prefetchProtectedLessonPlayback(selectedCourse._id, entry.lesson.id);
-      }, index === 0 ? 0 : 350)
-    ));
-
-    return () => {
-      timers.forEach((timer) => window.clearTimeout(timer));
-    };
-  }, [
-    activeLessonTab,
-    nextLessonEntry,
-    screen,
-    selectedCourse?._id,
-    selectedLessonUnlocked,
-    selectedLessonEntry,
-    unlockMap,
-  ]);
 
   const filteredCourseSections = useMemo(() => {
     const query = normalize(searchQuery);
@@ -1693,7 +2185,7 @@ export const CourseFigmaTab = ({
         ].some((value) => normalize(value).includes(query));
         const matchesCategory = categoryFilter === 'all' || normalize(course.exam || course.category) === normalize(categoryFilter);
         const matchesStatus = statusFilter === 'all'
-          || (statusFilter === 'unlocked' && Boolean(course.enrolled))
+          || (statusFilter === 'unlocked' && hasActiveCourseAccess(course))
           || (statusFilter === 'progress' && snapshot.progressPercent > 0 && snapshot.progressPercent < 100)
           || (statusFilter === 'completed' && snapshot.progressPercent >= 100)
           || (statusFilter === 'not-started' && snapshot.progressPercent === 0);
@@ -1712,7 +2204,7 @@ export const CourseFigmaTab = ({
           return rightSnapshot.progressPercent - leftSnapshot.progressPercent || left.title.localeCompare(right.title);
         }
 
-        return Number(Boolean(right.enrolled)) - Number(Boolean(left.enrolled))
+        return Number(hasActiveCourseAccess(right)) - Number(hasActiveCourseAccess(left))
           || rightSnapshot.progressPercent - leftSnapshot.progressPercent
           || left.title.localeCompare(right.title);
       });
@@ -1775,7 +2267,7 @@ export const CourseFigmaTab = ({
   ]);
 
   const mobileLessonStage = mobileLessonStageOverride || derivedMobileLessonStage;
-  const isLessonReadyForExam = hasCompletedLessonVideo;
+  const isLessonReadyForExam = selectedLessonHasCbt && hasCompletedLessonVideo;
   const isExplanationUnlocked = canWatchExplanation;
   const isLessonFlowComplete = Boolean(selectedLessonStoredProgress?.completed);
 
@@ -1788,6 +2280,14 @@ export const CourseFigmaTab = ({
   useEffect(() => {
     setExpandedSupportPanel(null);
   }, [selectedLessonEntry?.lesson.id, selectedCourse?._id]);
+
+  useEffect(() => {
+    if (!selectedLessonHasCbt && activeLessonTab !== 'Video') {
+      setActiveLessonTab('Video');
+      setMobileLessonStageOverride(null);
+      setIsExplanationPlaying(false);
+    }
+  }, [activeLessonTab, selectedLessonHasCbt]);
 
   useEffect(() => {
     setMobileCourseTab('Content');
@@ -1809,11 +2309,14 @@ export const CourseFigmaTab = ({
 
     autoplayHandledRef.current = null;
     setIsVideoPlaying(false);
+    setIsPlayerBuffering(false);
     setIsExplanationPlaying(false);
     if (!isCompletionState) {
       setAutoplayCountdown(null);
     }
     setPlaybackSpeed(1);
+    setPlayerControlsVisible(true);
+    setPlayerSettingsView('closed');
     setVideoPlaybackSeconds(
       selectedLessonStoredProgress?.lessonStage === 'video' || !selectedLessonStoredProgress?.lessonStage
         ? selectedLessonStoredProgress?.progressSeconds || 0
@@ -1876,7 +2379,12 @@ export const CourseFigmaTab = ({
     selectedLessonExplanationDurationSeconds,
   ]);
 
-  const persistProgress = (courseId: string, lessonId: string, nextRecord: StoredProgressPatch) => {
+  const persistProgress = (
+    courseId: string,
+    lessonId: string,
+    nextRecord: StoredProgressPatch,
+    options: { eventType?: string } = {},
+  ) => {
     const targetCourse = overview.courses.find((course) => course._id === courseId);
     const targetEntry = buildCourseSections(targetCourse).flatMap((section) => section.lessons).find((item) => item.lesson.id === lessonId);
 
@@ -1936,10 +2444,49 @@ export const CourseFigmaTab = ({
         explanationSeconds: mergedRecord.explanationSeconds ?? 0,
         videoWatchCount: mergedRecord.videoWatchCount ?? 0,
         explanationWatchCount: mergedRecord.explanationWatchCount ?? 0,
+        durationSeconds: mergedRecord.lessonStage === 'explanation'
+          ? Math.max(
+            selectedLessonEntry?.lesson.id === lessonId
+              ? selectedLessonExplanationDurationSeconds
+              : EXPLANATION_DURATION_SECONDS,
+            Number(mergedRecord.explanationSeconds || 0),
+            0,
+          )
+          : Math.max(Number(targetEntry.lesson.durationMinutes || 0) * 60, Number(mergedRecord.progressSeconds || 0), 0),
+        eventType: options.eventType
+          || (mergedRecord.completed
+            ? 'completion'
+            : mergedRecord.lessonStage === 'exam'
+              ? 'exam_submit'
+              : mergedRecord.lessonStage === 'explanation'
+                ? 'explanation_progress'
+                : 'video_progress'),
+        deviceId: EduService.getPersistentDeviceId(),
+        playbackTabId: EduService.getPlaybackTabId(),
+        requestTimestamp: nextRecord.updatedAt || new Date().toISOString(),
       },
-    ).catch((error) => {
-      console.error('Failed to sync course figma progress:', error);
-    });
+    )
+      .then((serverRecord) => {
+        const canonicalRecord = adoptServerProgress(mergedRecord, serverRecord as Partial<StoredProgress> | null);
+        if (!canonicalRecord) {
+          return;
+        }
+
+        setLocalProgressByCourse((current) => {
+          const nextCourseProgress = {
+            ...(current[courseId] || {}),
+            [lessonId]: canonicalRecord,
+          };
+          writeStoredProgress(courseId, nextCourseProgress);
+          return {
+            ...current,
+            [courseId]: nextCourseProgress,
+          };
+        });
+      })
+      .catch((error) => {
+        console.error('Failed to sync course figma progress:', error);
+      });
   };
 
   const startLessonVideoReplay = () => {
@@ -1955,6 +2502,14 @@ export const CourseFigmaTab = ({
     setVideoPlaybackSeconds(0);
     setIsVideoPlaying(false);
     setIsExplanationPlaying(false);
+
+    if (selectedLessonHasSecurePlayback) {
+      setLoadingProtectedLesson(true);
+      setProtectedLessonError(null);
+      setProtectedLessonPlayback(null);
+      setActiveProtectedPlaybackBinding(null);
+      void reloadProtectedLessonPlayback(true);
+    }
   };
 
   useEffect(() => {
@@ -2009,7 +2564,12 @@ export const CourseFigmaTab = ({
         videoWatchCount: nextVideoWatchCount,
         explanationWatchCount: selectedLessonExplanationWatchCount,
         updatedAt: new Date().toISOString(),
+      }, {
+        eventType: 'video_completion',
       });
+      if (selectedLessonHasSecurePlayback) {
+        void reloadProtectedLessonPlayback(true);
+      }
 
       if (isMobileLayout) {
         setMobileLessonStageOverride('completed');
@@ -2034,6 +2594,8 @@ export const CourseFigmaTab = ({
         videoWatchCount: selectedLessonVideoWatchCount,
         explanationWatchCount: MAX_EXPLANATION_WATCHES,
         updatedAt: new Date().toISOString(),
+      }, {
+        eventType: 'explanation_completion',
       });
 
       if (isMobileLayout) {
@@ -2059,12 +2621,14 @@ export const CourseFigmaTab = ({
     isVideoReplayMode,
     hasCompletedLessonVideo,
     completedVideoPlaybackKey,
+    reloadProtectedLessonPlayback,
     selectedLessonExplanationWatchCount,
     screen,
     selectedCourse,
     selectedLessonExamSelectedOption,
     selectedLessonExamSubmitted,
     selectedLessonExplanationDurationSeconds,
+    selectedLessonHasSecurePlayback,
     selectedLessonEntry,
     selectedLessonStoredProgress?.completed,
     selectedLessonStoredProgress?.lessonStage,
@@ -2091,7 +2655,7 @@ export const CourseFigmaTab = ({
 
   useEffect(() => {
     setPrivateVideoQualityOptions([]);
-    setSelectedPrivateVideoQuality(480);
+    setSelectedPrivateVideoQuality(null);
   }, [selectedLesson?.id, protectedLessonPlayback?.streamUrl, protectedLessonPlayback?.fallbackStreamUrl]);
 
   useEffect(() => {
@@ -2108,9 +2672,21 @@ export const CourseFigmaTab = ({
     const streamFormat = useProtectedSourceFallback && fallbackStreamUrl
       ? protectedLessonPlayback?.fallbackStreamFormat || 'source'
       : protectedLessonPlayback?.streamFormat || null;
+    const playerDeliveryPath = classifyRecordedVideoDeliveryPath({
+      deliveryProfile: activeProtectedPlaybackBinding?.deliveryProfile || protectedLessonPlayback?.deliveryProfile || null,
+      streamFormat,
+      src: streamUrl,
+      fallbackActive: Boolean(useProtectedSourceFallback && fallbackStreamUrl),
+      drmEnabled: Boolean(activeProtectedPlaybackBinding?.drmConfig?.enabled || protectedLessonPlayback?.drmConfig?.enabled),
+    });
     if (!currentVideo || !streamUrl || streamFormat !== 'hls') {
       return;
     }
+
+    let cancelled = false;
+    let releaseAutoLevel = () => undefined;
+    let cleanupMetrics = () => undefined;
+    let cleanupNativeError = () => undefined;
 
     const trySourceFallback = () => {
       if (!fallbackStreamUrl || useProtectedSourceFallback) {
@@ -2120,66 +2696,90 @@ export const CourseFigmaTab = ({
       return true;
     };
 
-    const canUseHlsJs = Hls.isSupported();
-    if (!canUseHlsJs) {
-      if (currentVideo.canPlayType('application/vnd.apple.mpegurl')) {
-        setPrivateVideoQualityOptions([]);
-        currentVideo.src = streamUrl;
-        const cleanupMetrics = wireHlsPlaybackMetrics({
-          video: currentVideo,
-          src: streamUrl,
-          title: selectedLesson?.title || 'Recorded lesson',
-          trackVideoId: selectedLesson?.id || null,
-        });
-        const handleNativeError = () => {
-          if (trySourceFallback()) {
-            currentVideo.pause();
-            currentVideo.removeAttribute('src');
-            currentVideo.load();
-          }
-        };
-        currentVideo.addEventListener('error', handleNativeError);
-        return () => {
-          currentVideo.removeEventListener('error', handleNativeError);
-          cleanupMetrics();
-        };
+    void (async () => {
+      const hlsRuntime = await loadHlsRuntime();
+      if (cancelled) {
+        return;
       }
 
-      trySourceFallback();
-      return;
-    }
-
-    const hls = new Hls(createProtectedVodHlsConfig());
-    hlsRef.current = hls;
-    let releaseAutoLevel = () => undefined;
-    hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
-      const qualityOptions = getRecordedVideoQualityOptions(data.levels || []);
-      setPrivateVideoQualityOptions(qualityOptions);
-      setSelectedPrivateVideoQuality((current) => getDefaultRecordedVideoQualityHeight(qualityOptions, current));
-      releaseAutoLevel();
-      releaseAutoLevel = scheduleAutoLevelRelease(hls);
-    });
-    hls.on(Hls.Events.ERROR, (_event, data) => {
-      if (shouldFallbackToSourceFromHlsError(data) && trySourceFallback()) {
-        hls.destroy();
-        if (hlsRef.current === hls) {
-          hlsRef.current = null;
+      const Hls = hlsRuntime.default;
+      if (!Hls.isSupported()) {
+        if (currentVideo.canPlayType('application/vnd.apple.mpegurl')) {
+          setPrivateVideoQualityOptions([]);
+          currentVideo.src = streamUrl;
+          cleanupMetrics = wireHlsPlaybackMetrics({
+            video: currentVideo,
+            src: streamUrl,
+            title: selectedLesson?.title || 'Recorded lesson',
+            trackVideoId: selectedLesson?.id || null,
+            streamFormat: 'hls',
+            deliveryProfile: activeProtectedPlaybackBinding?.deliveryProfile || protectedLessonPlayback?.deliveryProfile || null,
+            deliveryPath: playerDeliveryPath,
+          });
+          const handleNativeError = () => {
+            if (trySourceFallback()) {
+              currentVideo.pause();
+              currentVideo.removeAttribute('src');
+              currentVideo.load();
+            }
+          };
+          currentVideo.addEventListener('error', handleNativeError);
+          cleanupNativeError = () => {
+            currentVideo.removeEventListener('error', handleNativeError);
+          };
+          return;
         }
+
+        trySourceFallback();
+        return;
       }
-    });
-    hls.loadSource(streamUrl);
-    hls.attachMedia(currentVideo);
-    const cleanupMetrics = wireHlsPlaybackMetrics({
-      video: currentVideo,
-      hls,
-      src: streamUrl,
-      title: selectedLesson?.title || 'Recorded lesson',
-      trackVideoId: selectedLesson?.id || null,
+
+      const hls = new Hls(createProtectedVodHlsConfig());
+      if (cancelled) {
+        hls.destroy();
+        return;
+      }
+
+      hlsRef.current = hls;
+      hls.on(Hls.Events.MANIFEST_PARSED, (_event, data: { levels?: HlsRuntimeLevel[] }) => {
+        const qualityOptions = getRecordedVideoQualityOptions(data.levels || []);
+        setPrivateVideoQualityOptions(qualityOptions);
+        setSelectedPrivateVideoQuality((current) => (
+          current === null ? null : getDefaultRecordedVideoQualityHeight(qualityOptions, current)
+        ));
+        releaseAutoLevel();
+        releaseAutoLevel = scheduleAutoLevelRelease(hls);
+      });
+      hls.on(Hls.Events.ERROR, (_event, data: { fatal?: boolean; type?: string | null; details?: string | null }) => {
+        if (shouldFallbackToSourceFromHlsError(data) && trySourceFallback()) {
+          hls.destroy();
+          if (hlsRef.current === hls) {
+            hlsRef.current = null;
+          }
+        }
+      });
+      hls.loadSource(streamUrl);
+      hls.attachMedia(currentVideo);
+      cleanupMetrics = wireHlsPlaybackMetrics({
+        video: currentVideo,
+        hls,
+        events: Hls.Events,
+        src: streamUrl,
+        title: selectedLesson?.title || 'Recorded lesson',
+        trackVideoId: selectedLesson?.id || null,
+        streamFormat: 'hls',
+        deliveryProfile: activeProtectedPlaybackBinding?.deliveryProfile || protectedLessonPlayback?.deliveryProfile || null,
+        deliveryPath: playerDeliveryPath,
+      });
+    })().catch(() => {
+      trySourceFallback();
     });
 
     return () => {
+      cancelled = true;
       releaseAutoLevel();
       cleanupMetrics();
+      cleanupNativeError();
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;
@@ -2200,7 +2800,7 @@ export const CourseFigmaTab = ({
 
   useEffect(() => {
     const hls = hlsRef.current;
-    if (!hls) {
+    if (!hls || selectedPrivateVideoQuality === null) {
       return;
     }
 
@@ -2259,6 +2859,82 @@ export const CourseFigmaTab = ({
     await playerViewportRef.current.requestFullscreen?.().catch(() => undefined);
   };
 
+  const clearPlayerControlsHideTimer = useCallback(() => {
+    if (playerControlsHideTimerRef.current !== null) {
+      window.clearTimeout(playerControlsHideTimerRef.current);
+      playerControlsHideTimerRef.current = null;
+    }
+  }, []);
+
+  const showPlayerControls = useCallback((options: { keepSettings?: boolean } = {}) => {
+    clearPlayerControlsHideTimer();
+    setPlayerControlsVisible(true);
+    if (!options.keepSettings) {
+      setPlayerSettingsView('closed');
+    }
+  }, [clearPlayerControlsHideTimer]);
+
+  const schedulePlayerControlsAutoHide = useCallback(() => {
+    clearPlayerControlsHideTimer();
+    if (!isVideoPlaying || isPlayerBuffering || playerSettingsView !== 'closed') {
+      return;
+    }
+    playerControlsHideTimerRef.current = window.setTimeout(() => {
+      setPlayerControlsVisible(false);
+    }, isFullscreen ? 1800 : 2600);
+  }, [clearPlayerControlsHideTimer, isFullscreen, isPlayerBuffering, isVideoPlaying, playerSettingsView]);
+
+  useEffect(() => {
+    if (activeLessonTab !== 'Video') {
+      setPlayerControlsVisible(true);
+      setPlayerSettingsView('closed');
+      clearPlayerControlsHideTimer();
+      return;
+    }
+    if (!isVideoPlaying || isPlayerBuffering || playerSettingsView !== 'closed') {
+      setPlayerControlsVisible(true);
+      clearPlayerControlsHideTimer();
+      return;
+    }
+    schedulePlayerControlsAutoHide();
+    return clearPlayerControlsHideTimer;
+  }, [
+    activeLessonTab,
+    clearPlayerControlsHideTimer,
+    isPlayerBuffering,
+    isVideoPlaying,
+    playerSettingsView,
+    schedulePlayerControlsAutoHide,
+  ]);
+
+  const toggleCurrentLessonPlayback = useCallback(async () => {
+    showPlayerControls({ keepSettings: true });
+    if (protectedLessonVideoRef.current) {
+      if (isVideoPlaying) {
+        protectedLessonVideoRef.current.pause();
+        setIsVideoPlaying(false);
+        setIsPlayerBuffering(false);
+        return;
+      }
+      const started = await protectedLessonVideoRef.current.play();
+      setIsVideoPlaying(started);
+      return;
+    }
+
+    const currentVideo = lessonVideoRef.current;
+    if (!currentVideo) {
+      return;
+    }
+    if (!currentVideo.paused && !currentVideo.ended) {
+      currentVideo.pause();
+      setIsVideoPlaying(false);
+      setIsPlayerBuffering(false);
+      return;
+    }
+    await currentVideo.play().catch(() => undefined);
+    setIsVideoPlaying(!currentVideo.paused);
+  }, [isVideoPlaying, showPlayerControls]);
+
   const submitLessonExam = (advanceToExplanation: boolean) => {
     if (!selectedCourse || !selectedLessonEntry) {
       return;
@@ -2275,6 +2951,8 @@ export const CourseFigmaTab = ({
       examSelectedOption: selectedLessonExamSelectedOption,
       explanationSeconds: explanationPlaybackSeconds,
       updatedAt: new Date().toISOString(),
+    }, {
+      eventType: 'exam_submit',
     });
 
     if (isMobileLayout) {
@@ -2320,7 +2998,7 @@ export const CourseFigmaTab = ({
   };
 
   const startLessonExam = () => {
-    if (!isLessonReadyForExam) {
+    if (!selectedLessonHasCbt || !isLessonReadyForExam) {
       return;
     }
 
@@ -2342,7 +3020,7 @@ export const CourseFigmaTab = ({
   };
 
   const openLessonExplanation = () => {
-    if (!canWatchExplanation) {
+    if (!selectedLessonHasExplanation || !canWatchExplanation) {
       return;
     }
 
@@ -2373,6 +3051,8 @@ export const CourseFigmaTab = ({
         videoWatchCount: selectedLessonVideoWatchCount,
         explanationWatchCount: MAX_EXPLANATION_WATCHES,
         updatedAt: new Date().toISOString(),
+      }, {
+        eventType: 'explanation_completion',
       });
     }
 
@@ -2463,7 +3143,7 @@ export const CourseFigmaTab = ({
   };
 
   const renderCourseAccessActions = (course: CourseCard, variant: 'mobile' | 'desktop') => {
-    if (user?.role === 'admin' || course.enrolled) {
+    if (user?.role === 'admin' || hasActiveCourseAccess(course)) {
       return (
         <span className={cn(
           'inline-flex items-center justify-center font-semibold',
@@ -2472,6 +3152,19 @@ export const CourseFigmaTab = ({
             : 'h-[42px] rounded-[12px] bg-[#e8f7ef] px-[16px] text-[13px] text-[#16824a]',
         )}>
           Access active
+        </span>
+      );
+    }
+
+    if (!shouldShowCoursePaymentButton(course)) {
+      return (
+        <span className={cn(
+          'inline-flex items-center justify-center font-semibold',
+          variant === 'mobile'
+            ? 'h-[30px] rounded-[10px] bg-[#eef2f8] px-[8px] text-[9.5px] text-[#6c7b93]'
+            : 'h-[42px] rounded-[12px] bg-[#eef2f8] px-[16px] text-[13px] text-[#6c7b93]',
+        )}>
+          {getCoursePrimaryActionLabel(course)}
         </span>
       );
     }
@@ -2487,7 +3180,7 @@ export const CourseFigmaTab = ({
         )}
       >
         {busyCourseId === course._id ? <LoaderCircle className="h-[14px] w-[14px] animate-spin" /> : <Wallet className="h-[14px] w-[14px]" />}
-        Pay with Razorpay
+        {getCoursePrimaryActionLabel(course)}
       </button>
     );
   };
@@ -2544,7 +3237,16 @@ export const CourseFigmaTab = ({
     if (activeLessonTab === 'Video') {
       if (!isLessonReadyForExam) {
         setActiveLessonTab('Video');
-        setIsVideoPlaying((current) => !current);
+        if (isVideoPlaying) {
+          protectedLessonVideoRef.current?.pause();
+          setIsVideoPlaying(false);
+          return;
+        }
+        void protectedLessonVideoRef.current?.play().then((started) => {
+          if (started) {
+            setIsVideoPlaying(true);
+          }
+        });
         return;
       }
 
@@ -2594,11 +3296,11 @@ export const CourseFigmaTab = ({
 
   const isLessonTabUnlocked = (tab: LessonTab) => {
     if (tab === 'CBT Exam') {
-      return isLessonReadyForExam;
+      return selectedLessonHasCbt && isLessonReadyForExam;
     }
 
     if (tab === 'Explanation') {
-      return isExplanationUnlocked;
+      return selectedLessonHasExplanation && isExplanationUnlocked;
     }
 
     return true;
@@ -2651,6 +3353,30 @@ export const CourseFigmaTab = ({
   const nextStepDescriptor = useMemo(() => {
     if (!selectedLessonEntry) {
       return null;
+    }
+
+    if (!selectedLessonHasCbt) {
+      if (nextLessonEntry) {
+        return {
+          kind: 'next-lesson' as const,
+          title: nextLessonEntry.lesson.title,
+          subtitle: 'This lesson has no linked CBT or explanation. Continue directly to the next lesson when you are ready.',
+          badge: 'Next lesson',
+          actionLabel: 'Open Next Lesson',
+          onClick: () => openNextLesson(true),
+          disabled: false,
+        };
+      }
+
+      return {
+        kind: 'course-complete' as const,
+        title: selectedLessonEntry.lesson.title,
+        subtitle: 'This lesson has no linked CBT or explanation. Return to the course list and continue with any unlocked lesson.',
+        badge: 'Video only',
+        actionLabel: 'Back to Lessons',
+        onClick: () => setScreen('course'),
+        disabled: false,
+      };
     }
 
     if (!selectedLessonExamSubmitted) {
@@ -2710,6 +3436,7 @@ export const CourseFigmaTab = ({
     openNextLesson,
     openLessonExplanation,
     selectedLessonEntry,
+    selectedLessonHasCbt,
     selectedLessonExamSubmitted,
     startLessonExam,
   ]);
@@ -2820,32 +3547,434 @@ export const CourseFigmaTab = ({
   };
 
   const userName = overview.user?.name || 'Edu Master';
-  const notificationCount = overview.notifications.length;
+  const notificationCount = overview.notificationCount ?? overview.notifications.length;
   const selectedTone = getCatalogTone(selectedCourse || overview.courses[0], 0);
   const selectedToneStyles = toneStyles[selectedTone];
   const breadcrumbLabel = selectedLessonEntry
     ? ['Courses', selectedCourse?.title, selectedLessonEntry.sectionLabel, selectedLessonEntry.lesson.title].filter(Boolean).join(' / ')
     : ['Courses', selectedCourse?.title].filter(Boolean).join(' / ');
 
-  const renderMovingWatermark = (variant: 'mobile' | 'desktop') => {
-    if (!currentPlaybackWatermarkText || !isWatermarkVisible) {
+  const renderLessonMediaControls = (params: {
+    variant: 'mobile' | 'desktop';
+    isPrivateVideo: boolean;
+    isHostedVideo: boolean;
+    playerFormat: string | null;
+    playerDeliveryPath: string | null;
+  }) => {
+    const { variant, isPrivateVideo, isHostedVideo, playerFormat, playerDeliveryPath } = params;
+    if (!isPrivateVideo && !isHostedVideo) {
       return null;
     }
 
+    const protectedHlsStabilityMode = isPrivateVideo
+      && playerFormat === 'hls'
+      && playerDeliveryPath === 'protected_hls_gateway';
+    const qualitySelectionSupported = playerFormat === 'hls'
+      && privateVideoQualityOptions.length > 1
+      && !protectedHlsStabilityMode;
+    const shouldShowQualityControl = qualitySelectionSupported;
+    const durationSeconds = getCurrentLessonDurationSeconds();
+    const clampedProgressSeconds = Math.max(Math.min(videoPlaybackSeconds, durationSeconds), 0);
+    const selectedQualityValue = String(selectedPrivateVideoQuality ?? getDefaultRecordedVideoQualityHeight(privateVideoQualityOptions, 480));
+    const selectedQualityLabel = privateVideoQualityOptions.find((option) => String(option.height) === selectedQualityValue)?.label || 'Auto';
+    const selectedSpeedLabel = PLAYBACK_SPEED_OPTIONS.find((option) => option.value === playbackSpeed)?.label || `${playbackSpeed}x`;
+    const controlsVisible = playerControlsVisible || playerSettingsView !== 'closed';
+    const transportButtonLabel = isPlayerBuffering ? 'Loading' : isVideoPlaying ? 'Pause' : 'Play';
+    const overlayClassName = variant === 'mobile'
+      ? 'absolute inset-0 z-20'
+      : 'absolute inset-0 z-20';
+    const useSheetLayout = variant === 'mobile' || isFullscreen;
+    const qualitySupportReason = qualitySelectionSupported
+      ? `${privateVideoQualityOptions.length} quality levels available`
+      : protectedHlsStabilityMode
+        ? 'Auto quality stays on during protected playback for smoother reconnects.'
+        : playerFormat !== 'hls'
+          ? 'Manual quality appears only on HLS streams.'
+          : privateVideoQualityOptions.length <= 1
+            ? 'Manual quality appears when multiple stream levels are available.'
+            : 'Quality controls are preparing.';
+    const formatOptionTestIdSuffix = (value: string | number) => String(value)
+      .replace(/\./g, '_')
+      .replace(/[^a-zA-Z0-9_-]+/g, '-');
+
+    const renderSettingsPanel = () => {
+      if (playerSettingsView === 'closed') {
+        return null;
+      }
+
+      const panelBaseClassName = cn(
+        'pointer-events-auto overflow-hidden border border-white/10 bg-[#07101f]/96 text-white shadow-[0_28px_60px_rgba(0,0,0,0.42)] backdrop-blur-xl',
+        useSheetLayout
+          ? 'fixed inset-x-0 bottom-0 z-[80] mx-auto w-full max-w-[min(100vw,560px)] rounded-t-[28px] border-b-0'
+          : 'absolute right-[12px] top-[56px] z-[40] w-[min(340px,calc(100%-24px))] rounded-[22px]',
+      );
+      const panelBodyClassName = cn(
+        'overflow-y-auto overscroll-contain px-[12px] py-[12px]',
+        useSheetLayout
+          ? 'max-h-[min(60vh,420px)] pb-[max(18px,env(safe-area-inset-bottom))]'
+          : 'max-h-[320px]',
+      );
+      const panelWrapperClassName = useSheetLayout
+        ? 'fixed inset-0 z-[75] flex items-end justify-center px-[10px] pb-0'
+        : 'absolute inset-0 z-[35]';
+
+      const renderSheetHeader = (title: string, showBack = false) => (
+        <div className="flex items-center justify-between gap-[12px] border-b border-white/8 px-[16px] py-[14px]">
+          <div className="flex items-center gap-[10px]">
+            {showBack ? (
+              <button
+                type="button"
+                data-testid="course-player-settings-back"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setPlayerSettingsView('root');
+                }}
+                onPointerDown={(event) => event.stopPropagation()}
+                className="inline-flex h-[30px] w-[30px] items-center justify-center rounded-full border border-white/10 bg-white/5 text-white/82 transition hover:bg-white/10"
+                aria-label="Back to player settings"
+              >
+                <ChevronLeft className="h-[16px] w-[16px]" />
+              </button>
+            ) : null}
+            <div>
+              <p className="text-[14px] font-semibold text-white">{title}</p>
+              <p className="text-[11px] text-white/54">
+                {title === 'Player settings' ? 'Change playback speed and quality' : 'Choose one option'}
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            data-testid="course-player-settings-close"
+            onClick={(event) => {
+              event.stopPropagation();
+              setPlayerSettingsView('closed');
+              showPlayerControls({ keepSettings: true });
+            }}
+            onPointerDown={(event) => event.stopPropagation()}
+            className="inline-flex h-[30px] w-[30px] items-center justify-center rounded-full border border-white/10 bg-white/5 text-white/82 transition hover:bg-white/10"
+            aria-label="Close player settings"
+          >
+            <X className="h-[15px] w-[15px]" />
+          </button>
+        </div>
+      );
+
+      const renderSpeedView = () => (
+        <>
+          {renderSheetHeader('Playback speed', true)}
+          <div
+            data-testid="course-player-settings-body"
+            data-scrollable="true"
+            data-testid-view="speed-body"
+            className={panelBodyClassName}
+          >
+            <div data-testid="course-player-settings-view-speed" className="space-y-[8px]">
+              {PLAYBACK_SPEED_OPTIONS.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  data-testid={`course-player-speed-option-${formatOptionTestIdSuffix(option.value)}`}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setPlaybackSpeed(option.value);
+                    setPlayerSettingsView('closed');
+                    showPlayerControls({ keepSettings: true });
+                  }}
+                  onPointerDown={(event) => event.stopPropagation()}
+                  className={cn(
+                    'flex min-h-[54px] w-full items-center justify-between rounded-[16px] border px-[14px] text-[15px] transition',
+                    playbackSpeed === option.value
+                      ? 'border-[#3d82ff] bg-[#1a4fb5]/88 text-white shadow-[0_10px_22px_rgba(37,99,235,0.22)]'
+                      : 'border-white/8 bg-white/[0.03] text-white/84 hover:bg-white/[0.06]',
+                  )}
+                >
+                  <span>{option.label}</span>
+                  {playbackSpeed === option.value ? <CheckCircle2 className="h-[16px] w-[16px]" /> : null}
+                </button>
+              ))}
+            </div>
+          </div>
+        </>
+      );
+
+      const renderQualityView = () => (
+        <>
+          {renderSheetHeader('Video quality', true)}
+          <div
+            data-testid="course-player-settings-body"
+            data-scrollable="true"
+            data-testid-view="quality-body"
+            className={panelBodyClassName}
+          >
+            {shouldShowQualityControl ? (
+              <div data-testid="course-player-settings-view-quality" className="space-y-[8px]">
+                {privateVideoQualityOptions.map((option) => (
+                  <button
+                    key={option.height}
+                    type="button"
+                    data-testid={`course-player-quality-option-${formatOptionTestIdSuffix(option.height)}`}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setSelectedPrivateVideoQuality(option.height);
+                      setPlayerSettingsView('closed');
+                      showPlayerControls({ keepSettings: true });
+                    }}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    className={cn(
+                      'flex min-h-[54px] w-full items-center justify-between rounded-[16px] border px-[14px] text-[15px] transition',
+                      selectedQualityValue === String(option.height)
+                        ? 'border-[#3d82ff] bg-[#1a4fb5]/88 text-white shadow-[0_10px_22px_rgba(37,99,235,0.22)]'
+                        : 'border-white/8 bg-white/[0.03] text-white/84 hover:bg-white/[0.06]',
+                    )}
+                  >
+                    <span>{option.label}</span>
+                    {selectedQualityValue === String(option.height) ? <CheckCircle2 className="h-[16px] w-[16px]" /> : null}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div
+                data-testid="course-player-quality-status"
+                className="rounded-[18px] border border-white/10 bg-white/[0.03] px-[14px] py-[14px] text-left"
+              >
+                <div className="flex items-start gap-[10px]">
+                  <AlertTriangle className="mt-[2px] h-[16px] w-[16px] shrink-0 text-[#fbbf24]" />
+                  <div>
+                    <p className="text-[14px] font-semibold text-white">Auto quality only</p>
+                    <p className="mt-[4px] text-[12px] leading-[1.5] text-white/62">{qualitySupportReason}</p>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </>
+      );
+
+      const renderRootView = () => (
+        <>
+          {renderSheetHeader('Player settings')}
+          <div
+            data-testid="course-player-settings-body"
+            data-scrollable="true"
+            className={panelBodyClassName}
+          >
+            <div data-testid="course-player-settings-view-root" className="space-y-[10px]">
+              <button
+                type="button"
+                data-testid="course-player-speed-trigger"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setPlayerSettingsView('speed');
+                }}
+                onPointerDown={(event) => event.stopPropagation()}
+                className="flex min-h-[64px] w-full items-center justify-between rounded-[18px] border border-white/8 bg-white/[0.03] px-[16px] text-left transition hover:bg-white/[0.06]"
+              >
+                <span>
+                  <span className="block text-[11px] font-semibold uppercase tracking-[0.16em] text-white/48">Playback speed</span>
+                  <span className="mt-[4px] block text-[16px] font-semibold text-white">{selectedSpeedLabel}</span>
+                </span>
+                <ChevronRight className="h-[16px] w-[16px] text-white/64" />
+              </button>
+              <button
+                type="button"
+                data-testid="course-player-quality-trigger"
+                aria-disabled={!shouldShowQualityControl}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setPlayerSettingsView('quality');
+                }}
+                onPointerDown={(event) => event.stopPropagation()}
+                className={cn(
+                  'flex min-h-[64px] w-full items-center justify-between rounded-[18px] border px-[16px] text-left transition',
+                  shouldShowQualityControl
+                    ? 'border-white/8 bg-white/[0.03] hover:bg-white/[0.06]'
+                    : 'border-white/8 bg-white/[0.02] text-white/72',
+                )}
+              >
+                <span className="min-w-0">
+                  <span className="block text-[11px] font-semibold uppercase tracking-[0.16em] text-white/48">Quality</span>
+                  <span className="mt-[4px] block text-[16px] font-semibold text-white">{shouldShowQualityControl ? selectedQualityLabel : 'Auto quality'}</span>
+                  <span className="mt-[3px] block text-[12px] leading-[1.45] text-white/58">{qualitySupportReason}</span>
+                </span>
+                <ChevronRight className="h-[16px] w-[16px] shrink-0 text-white/64" />
+              </button>
+            </div>
+          </div>
+        </>
+      );
+
+      return (
+        <div
+          className={panelWrapperClassName}
+          onClick={() => {
+            setPlayerSettingsView('closed');
+            showPlayerControls({ keepSettings: true });
+          }}
+        >
+          {useSheetLayout ? (
+            <div className="absolute inset-0 bg-[rgba(2,6,23,0.55)] backdrop-blur-[1px]" />
+          ) : null}
+          <div
+            data-testid="course-player-settings-panel"
+            data-layout={useSheetLayout ? 'sheet' : 'floating'}
+            className={panelBaseClassName}
+            onClick={(event) => event.stopPropagation()}
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            {playerSettingsView === 'speed'
+              ? renderSpeedView()
+              : playerSettingsView === 'quality'
+                ? renderQualityView()
+                : renderRootView()}
+          </div>
+        </div>
+      );
+    };
+
     return (
       <div
+        data-testid="course-player-controls"
+        data-player-format={playerFormat || 'unknown'}
+        data-player-delivery-path={playerDeliveryPath || 'unknown'}
+        data-player-quality-count={String(privateVideoQualityOptions.length)}
+        data-player-quality-supported={String(qualitySelectionSupported)}
         className={cn(
-          'pointer-events-none absolute z-20 rounded-full bg-black/58 px-4 py-2 font-semibold uppercase tracking-[0.14em] text-white/84 shadow-[0_8px_22px_rgba(0,0,0,0.28)] transition-all duration-500',
-          variant === 'mobile' ? 'text-[9px]' : 'text-xs',
+          overlayClassName,
+          !controlsVisible && 'pointer-events-none',
         )}
-        style={{
-          top: watermarkPosition.top,
-          left: watermarkPosition.left,
-          transform: `translate(-50%, -50%) rotate(${watermarkPosition.rotate})`,
-          maxWidth: variant === 'mobile' ? '78%' : '68%',
+        onMouseMove={() => showPlayerControls({ keepSettings: true })}
+        onMouseLeave={() => {
+          if (variant === 'desktop' && playerSettingsView === 'closed') {
+            schedulePlayerControlsAutoHide();
+          }
+        }}
+        onTouchStart={() => showPlayerControls({ keepSettings: true })}
+        onClick={(event) => {
+          if (event.target === event.currentTarget) {
+            showPlayerControls({ keepSettings: true });
+            setPlayerSettingsView('closed');
+          }
         }}
       >
-        <span className="block truncate">{currentPlaybackWatermarkText}</span>
+        <div
+          className={cn(
+            'absolute inset-0 bg-[linear-gradient(180deg,rgba(3,7,18,0.42)_0%,rgba(3,7,18,0.12)_26%,rgba(3,7,18,0.08)_54%,rgba(3,7,18,0.76)_100%)] transition-opacity duration-200',
+            controlsVisible ? 'opacity-100' : 'opacity-0',
+          )}
+        />
+        <div className={cn('absolute inset-x-[12px] top-[12px] flex items-center justify-end transition-opacity duration-200', controlsVisible ? 'opacity-100' : 'opacity-0')}>
+          <button
+            type="button"
+            data-testid="course-player-settings-trigger"
+            onClick={(event) => {
+              event.stopPropagation();
+              showPlayerControls({ keepSettings: true });
+              setPlayerSettingsView((current) => current === 'closed' ? 'root' : 'closed');
+            }}
+            onPointerDown={(event) => event.stopPropagation()}
+            className="pointer-events-auto inline-flex h-[38px] min-w-[38px] items-center justify-center rounded-full border border-white/14 bg-black/44 px-[10px] text-white shadow-[0_10px_20px_rgba(0,0,0,0.2)] backdrop-blur-sm"
+            aria-label="Player settings"
+          >
+            <MoreVertical className="h-[18px] w-[18px]" />
+          </button>
+        </div>
+        {renderSettingsPanel()}
+        <div className={cn('absolute inset-x-[10px] bottom-[10px] transition-opacity duration-200', controlsVisible ? 'opacity-100' : 'opacity-0')}>
+          <div className="pointer-events-auto rounded-[18px] border border-white/10 bg-[rgba(7,11,19,0.58)] px-[10px] py-[8px] text-white shadow-[0_16px_28px_rgba(0,0,0,0.22)] backdrop-blur-md">
+            <input
+              data-testid="course-player-seek"
+              type="range"
+              min={0}
+              max={Math.max(durationSeconds, 1)}
+              step={1}
+              value={Math.round(clampedProgressSeconds)}
+              onChange={(event) => {
+                showPlayerControls({ keepSettings: true });
+                seekCurrentLessonVideo(Number(event.currentTarget.value));
+              }}
+              onInput={() => showPlayerControls({ keepSettings: true })}
+              className="h-[20px] w-full accent-[#f8fafc]"
+              aria-label="Seek lesson video"
+            />
+            <div className="mt-[4px] flex items-center gap-[10px]">
+              <button
+                type="button"
+                data-testid="course-player-toggle"
+                onClick={() => void toggleCurrentLessonPlayback()}
+                className="inline-flex h-[36px] w-[36px] items-center justify-center rounded-full bg-white text-[#0f1726] shadow-[0_8px_18px_rgba(255,255,255,0.18)]"
+                aria-label={transportButtonLabel}
+              >
+                {isVideoPlaying ? <Pause className="h-[17px] w-[17px]" /> : <Play className="ml-[2px] h-[17px] w-[17px] fill-current" />}
+              </button>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center justify-between gap-[8px]">
+                  <div className="min-w-0">
+                    <p className="truncate text-[12px] font-semibold text-white/94">{selectedLessonEntry?.lesson.title || 'Lesson video'}</p>
+                    <p className="text-[11px] text-white/64">
+                      {formatPlaybackTime(clampedProgressSeconds)} / {formatPlaybackTime(durationSeconds)}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-[8px]">
+                    <select
+                      data-testid="course-player-speed"
+                      value={String(playbackSpeed)}
+                      onChange={(event) => {
+                        setPlaybackSpeed(Number(event.target.value));
+                        showPlayerControls({ keepSettings: true });
+                      }}
+                      className="sr-only"
+                      tabIndex={-1}
+                      aria-hidden="true"
+                    >
+                      {PLAYBACK_SPEED_OPTIONS.map((option) => (
+                        <option key={option.value} value={String(option.value)}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      data-testid="course-player-quality"
+                      value={selectedQualityValue}
+                      onChange={(event) => {
+                        setSelectedPrivateVideoQuality(Number(event.target.value));
+                        showPlayerControls({ keepSettings: true });
+                      }}
+                      className="sr-only"
+                      tabIndex={-1}
+                      aria-hidden="true"
+                    >
+                      {privateVideoQualityOptions.map((option) => (
+                        <option key={option.height} value={String(option.height)}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                    {isPlayerBuffering ? (
+                      <span className="inline-flex items-center gap-[6px] rounded-full bg-white/10 px-[8px] py-[5px] text-[10px] font-semibold text-white/84">
+                        <LoaderCircle className="h-[12px] w-[12px] animate-spin" />
+                        Loading
+                      </span>
+                    ) : null}
+                    <button
+                      type="button"
+                      data-testid="course-player-fullscreen"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void toggleFullscreen();
+                      }}
+                      onPointerDown={(event) => event.stopPropagation()}
+                      className="inline-flex h-[32px] w-[32px] items-center justify-center rounded-full border border-white/14 bg-white/8 text-white/92"
+                      aria-label={isFullscreen ? 'Exit full screen' : 'Open full screen'}
+                    >
+                      {isFullscreen ? <Minimize2 className="h-[16px] w-[16px]" /> : <Maximize2 className="h-[16px] w-[16px]" />}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     );
   };
@@ -2855,21 +3984,45 @@ export const CourseFigmaTab = ({
       return null;
     }
 
-    const playerDrmConfig = selectedLesson?.type === 'private-video' ? protectedLessonPlayback?.drmConfig || null : null;
-    const drmManifestUrl = playerDrmConfig?.enabled ? playerDrmConfig.manifestUrl || null : null;
-    const playerUrl = drmManifestUrl || selectedLessonDirectVideoUrl
-      || (useProtectedSourceFallback && protectedLessonPlayback?.fallbackStreamUrl
-        ? protectedLessonPlayback.fallbackStreamUrl
-        : protectedLessonPlayback?.streamUrl || null);
+    const playerDrmConfig = selectedLesson?.type === 'private-video' && !useProtectedSourceFallback
+      ? activeProtectedPlaybackBinding?.drmConfig || protectedLessonPlayback?.drmConfig || null
+      : null;
+    const drmManifestUrl = useProtectedSourceFallback
+      ? null
+      : activeProtectedPlaybackBinding?.drmManifestUrl
+        || (playerDrmConfig?.enabled ? playerDrmConfig.manifestUrl || null : null);
+    const fallbackPlayerUrl = useProtectedSourceFallback && protectedLessonPlayback?.fallbackStreamUrl
+      ? protectedLessonPlayback.fallbackStreamUrl
+      : null;
+    const playerUrl = drmManifestUrl
+      || selectedLessonDirectVideoUrl
+      || fallbackPlayerUrl
+      || activeProtectedPlaybackBinding?.sourceUrl
+      || protectedLessonPlayback?.streamUrl
+      || null;
     const playerFormat = useProtectedSourceFallback && protectedLessonPlayback?.fallbackStreamUrl
       ? protectedLessonPlayback?.fallbackStreamFormat || 'source'
-      : protectedLessonPlayback?.streamFormat || null;
+      : activeProtectedPlaybackBinding?.streamFormat || protectedLessonPlayback?.streamFormat || null;
     const isYouTube = selectedLesson.type === 'youtube';
     const isPrivateVideo = selectedLesson.type === 'private-video';
     const isHostedVideo = selectedLesson.type === 'video';
     const shouldUseHlsPlayer = Boolean(
       drmManifestUrl
       || (playerUrl && playerFormat === 'hls'),
+    );
+    const playerDeliveryPath = classifyRecordedVideoDeliveryPath({
+      deliveryProfile: activeProtectedPlaybackBinding?.deliveryProfile || protectedLessonPlayback?.deliveryProfile || null,
+      streamFormat: playerDrmConfig?.manifestFormat || playerFormat || null,
+      src: drmManifestUrl || playerUrl || null,
+      fallbackActive: Boolean(useProtectedSourceFallback && fallbackPlayerUrl),
+      drmEnabled: Boolean(playerDrmConfig?.enabled),
+    });
+    const protectedSourceFallbackNotice = selectedLesson.type === 'private-video' && (
+      useProtectedSourceFallback
+        ? protectedLessonPlayback?.fallbackReason || 'Protected source playback is active while adaptive HLS recovers.'
+        : (!shouldUseHlsPlayer && protectedLessonPlayback?.fallbackStreamUrl)
+          ? protectedLessonPlayback?.fallbackReason || protectedLessonPlayback?.statusMessage || null
+          : null
     );
 
     if (loadingProtectedLesson && selectedLessonHasSecurePlayback) {
@@ -2884,11 +4037,20 @@ export const CourseFigmaTab = ({
     if (protectedLessonError) {
       return (
         <div className="flex min-h-[260px] items-center justify-center bg-[#0f1726] px-6 text-center">
-          <div>
-            <p className="text-base font-semibold text-white">Lesson video unavailable</p>
+          <div className="max-w-[460px]">
+            <p className="text-base font-semibold text-white">Video playback issue</p>
             <p className="mt-2 text-sm leading-6 text-white/72">
-              {user?.role === 'admin' ? protectedLessonError : 'This lesson is not available for playback right now.'}
+              {protectedLessonError}
             </p>
+            <button
+              type="button"
+              onClick={() => {
+                void reloadProtectedLessonPlayback(true);
+              }}
+              className="mt-4 rounded-full bg-white px-4 py-2 text-sm font-semibold text-[#0f1726] transition hover:bg-white/90"
+            >
+              Retry video
+            </button>
           </div>
         </div>
       );
@@ -2923,23 +4085,37 @@ export const CourseFigmaTab = ({
     if ((isPrivateVideo || isHostedVideo) && playerUrl) {
       return (
         <div className={cn('relative bg-black', variant === 'mobile' && 'h-full')}>
+          {protectedSourceFallbackNotice ? (
+            <div className="border-b border-white/10 bg-[#0f1726] px-4 py-3 text-[12px] font-medium text-[#d4e2ff]">
+              {protectedSourceFallbackNotice}
+            </div>
+          ) : null}
           {shouldUseHlsPlayer ? (
             <ResilientHlsVideo
-              key={`${selectedLesson.id}:${drmManifestUrl || playerUrl}`}
+              ref={protectedLessonVideoRef}
+              key={`secure-player:${selectedLesson.id}:${activeProtectedPlaybackBinding?.playbackSessionId || protectedLessonPlayback?.playbackSessionId || 'sessionless'}`}
               src={drmManifestUrl || playerUrl || ''}
               drmConfig={playerDrmConfig}
               title={selectedLesson.title}
-              watermarkText={currentPlaybackWatermarkText}
               trackVideoId={selectedLesson.id}
               trackCourseId={selectedCourse._id}
               trackLessonId={selectedLesson.id}
+              trackVideoType={activeProtectedPlaybackBinding?.videoType || protectedLessonPlayback?.videoType || 'course'}
+              playbackSessionId={activeProtectedPlaybackBinding?.playbackSessionId || protectedLessonPlayback?.playbackSessionId || null}
               streamFormat={playerDrmConfig?.manifestFormat || playerFormat || 'hls'}
-              resumeSeconds={protectedLessonPlayback?.resumeSeconds || selectedLessonStoredProgress?.progressSeconds || 0}
+              deliveryProfile={activeProtectedPlaybackBinding?.deliveryProfile || protectedLessonPlayback?.deliveryProfile || null}
+              deliveryPathHint={playerDeliveryPath}
+              resumeSeconds={activeProtectedPlaybackBinding?.resumeSeconds ?? protectedLessonPlayback?.resumeSeconds ?? 0}
+              playbackSpeed={playbackSpeed}
               defaultQualityHeight={480}
-              selectedQualityHeight={selectedPrivateVideoQuality}
+              selectedQualityHeight={selectedPrivateVideoQuality ?? undefined}
+              nativeControls={false}
               onQualityOptionsChange={(options) => {
                 setPrivateVideoQualityOptions(options);
-                setSelectedPrivateVideoQuality((current) => getDefaultRecordedVideoQualityHeight(options, current));
+              }}
+              onPlaybackStateChange={(state) => {
+                setIsVideoPlaying(Boolean(state.playing));
+                setIsPlayerBuffering(Boolean(state.waiting));
               }}
               className={cn(
                 'w-full bg-black',
@@ -2967,12 +4143,11 @@ export const CourseFigmaTab = ({
             />
           ) : (
             <video
-              key={`${selectedLesson.id}:${playerUrl}`}
+              key={`source-player:${selectedLesson.id}:${activeProtectedPlaybackBinding?.playbackSessionId || protectedLessonPlayback?.playbackSessionId || 'sessionless'}`}
               ref={lessonVideoRef}
               data-testid="course-player-video"
               src={playerFormat === 'source' || isHostedVideo ? playerUrl : undefined}
-              controls
-              controlsList="nodownload nofullscreen noremoteplayback"
+              controlsList="nodownload noremoteplayback"
               playsInline
               disablePictureInPicture
               disableRemotePlayback
@@ -2984,17 +4159,28 @@ export const CourseFigmaTab = ({
                   ? 'h-full min-h-0 object-cover'
                   : 'aspect-video min-h-[420px] object-contain',
               )}
-              onPlay={() => setIsVideoPlaying(true)}
-              onPause={() => setIsVideoPlaying(false)}
+              onPlay={() => {
+                setIsVideoPlaying(true);
+                setIsPlayerBuffering(false);
+              }}
+              onPause={() => {
+                setIsVideoPlaying(false);
+                setIsPlayerBuffering(false);
+              }}
+              onWaiting={() => setIsPlayerBuffering(true)}
+              onPlaying={() => {
+                setIsVideoPlaying(true);
+                setIsPlayerBuffering(false);
+              }}
               onLoadedMetadata={(event) => {
-                const resumeSeconds = protectedLessonPlayback?.resumeSeconds || selectedLessonStoredProgress?.progressSeconds || 0;
+                const resumeSeconds = activeProtectedPlaybackBinding?.resumeSeconds ?? protectedLessonPlayback?.resumeSeconds ?? 0;
                 if (resumeSeconds > 0) {
                   event.currentTarget.currentTime = resumeSeconds;
                 }
                 setVideoPlaybackSeconds(event.currentTarget.currentTime || 0);
               }}
               onCanPlay={(event) => {
-                const resumeSeconds = protectedLessonPlayback?.resumeSeconds || selectedLessonStoredProgress?.progressSeconds || 0;
+                const resumeSeconds = activeProtectedPlaybackBinding?.resumeSeconds ?? protectedLessonPlayback?.resumeSeconds ?? 0;
                 if (resumeSeconds > 0 && event.currentTarget.currentTime < 1) {
                   event.currentTarget.currentTime = resumeSeconds;
                 }
@@ -3014,26 +4200,50 @@ export const CourseFigmaTab = ({
                 if (playedSeconds >= minimumWatchedSeconds) {
                   setCompletedVideoPlaybackKey(`${selectedLesson.id}::${Date.now()}`);
                 }
+                setIsPlayerBuffering(false);
               }}
             />
           )}
-          {!drmManifestUrl ? renderMovingWatermark(variant) : null}
-          {isPrivateVideo && playerFormat === 'hls' && privateVideoQualityOptions.length > 0 ? (
-            <div className="flex items-center justify-end gap-3 border-t border-white/10 bg-[#0f1726] px-4 py-3">
-              <span className="text-[11px] font-semibold uppercase tracking-[0.16em] text-white/58">Quality</span>
-              <select
-                value={String(selectedPrivateVideoQuality)}
-                onChange={(event) => setSelectedPrivateVideoQuality(Number(event.target.value))}
-                className="rounded-xl border border-white/12 bg-white/8 px-3 py-2 text-sm text-white outline-none"
-              >
-                {privateVideoQualityOptions.map((option) => (
-                  <option key={option.height} value={String(option.height)}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-          ) : null}
+          {renderLessonMediaControls({
+            variant,
+            isPrivateVideo,
+            isHostedVideo,
+            playerFormat,
+            playerDeliveryPath,
+          })}
+        </div>
+      );
+    }
+
+    const protectedPlaybackStatus = String(protectedLessonPlayback?.playbackStatus || '').toLowerCase();
+    const shouldHoldProtectedPlaybackSurface = Boolean(
+      selectedLessonHasSecurePlayback
+      && (
+        loadingProtectedLesson
+        || Boolean(activeProtectedPlaybackBinding)
+        || ['queued', 'processing', 'ready'].includes(protectedPlaybackStatus)
+      ),
+    );
+
+    if (shouldHoldProtectedPlaybackSurface) {
+      return (
+        <div className={cn('flex items-center justify-center bg-[#0f1726] px-6 text-center text-white', variant === 'mobile' ? 'h-full min-h-[260px]' : 'min-h-[420px]')}>
+          <div className="max-w-[460px]">
+            <LoaderCircle className="mx-auto h-5 w-5 animate-spin text-white/64" />
+            <p className="mt-4 text-base font-semibold text-white">Reconnecting protected video…</p>
+            <p className="mt-2 text-sm leading-6 text-white/72">
+              We are keeping this lesson session active for about 60 seconds while the private HLS stream reconnects on the same device.
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                void reloadProtectedLessonPlayback(true);
+              }}
+              className="mt-4 rounded-full bg-white px-4 py-2 text-sm font-semibold text-[#0f1726] transition hover:bg-white/90"
+            >
+              Retry video
+            </button>
+          </div>
         </div>
       );
     }
@@ -3093,11 +4303,7 @@ export const CourseFigmaTab = ({
               const tone = getMobileCatalogTone(course);
               const styles = toneStyles[tone];
               const snapshot = courseSnapshots[course._id] || { totalLessons: 0, completedLessons: 0, progressPercent: 0 };
-              const actionLabel = snapshot.progressPercent > 0
-                ? 'Continue'
-                : course.enrolled
-                  ? 'Start Course'
-                  : 'Buy Course';
+              const actionLabel = getCoursePrimaryActionLabel(course, snapshot.progressPercent);
               const icon = index % 3 === 0
                 ? <BookOpen className="h-[26px] w-[26px]" />
                 : index % 3 === 1
@@ -3125,7 +4331,7 @@ export const CourseFigmaTab = ({
                           </span>
                           <p className="mt-[6px] text-[13px] font-semibold leading-[1.16] text-[#1f2d4e]">{getMobileCourseTitle(course)}</p>
                           <p className="mt-[2px] text-[11px] text-[#6d7c93]">{course.subject || course.category || 'Competitive Exam'}</p>
-                          {!course.enrolled && (
+                          {!hasActiveCourseAccess(course) && shouldShowCoursePaymentButton(course) && (
                             <p className="mt-[4px] text-[10px] font-semibold text-[#cf7a21]">{getCourseFeeSummary(course)}</p>
                           )}
                         </div>
@@ -3297,20 +4503,23 @@ export const CourseFigmaTab = ({
                     data-testid={`course-figma-chapter-${index + 1}-panel`}
                     className={cn(index === 0 ? 'border-l-[4px] border-l-[#4a8ef5]' : 'border-l-[4px] border-l-transparent')}
                   >
+                    {renderSectionPdfButtons(section, 'desktop')}
                     {section.lessons.map((entry) => {
                       const completed = Boolean(selectedCourseProgressMap.get(entry.lesson.id)?.completed);
                       const unlocked = Boolean(unlockMap.get(entry.lesson.id)?.unlocked);
                       return (
-                        <LessonRow
-                          key={entry.lesson.id}
-                          entry={entry}
-                          active={selectedLessonEntry?.lesson.id === entry.lesson.id}
-                          completed={completed}
-                          unlocked={unlocked}
-                          onOpen={() => openLesson(entry.lesson.id)}
-                          showButton
-                          testId={`course-lesson-open-${entry.lesson.id}`}
-                        />
+                        <div key={entry.lesson.id} className="border-b border-[#e3eaf7] last:border-b-0">
+                          <LessonRow
+                            entry={entry}
+                            active={selectedLessonEntry?.lesson.id === entry.lesson.id}
+                            completed={completed}
+                            unlocked={unlocked}
+                            onOpen={() => openLesson(entry.lesson.id)}
+                            showButton
+                            testId={`course-lesson-open-${entry.lesson.id}`}
+                          />
+                          {renderLessonPdfButtons(entry.lesson, 'desktop')}
+                        </div>
                       );
                     })}
                   </div>
@@ -3321,40 +4530,42 @@ export const CourseFigmaTab = ({
         )}
       </div>
 
-      <div
-        data-testid="course-figma-cbt-card"
-        className={cn(
-          'rounded-[18px] border border-[#dbe4f3] bg-white shadow-[0_12px_24px_rgba(54,78,123,0.05)]',
-          isMobileLayout ? 'px-[16px] py-[16px]' : 'px-[20px] py-[18px]',
-        )}
-      >
-        <div className="flex items-start gap-[12px]">
-          <div className="flex h-[40px] w-[40px] shrink-0 items-center justify-center rounded-[12px] bg-[linear-gradient(180deg,#d9e7fb_0%,#bad2f3_100%)] text-[#3e7fea]">
-            <ClipboardCheck className="h-[20px] w-[20px]" />
+      {selectedLessonHasCbt ? (
+        <div
+          data-testid="course-figma-cbt-card"
+          className={cn(
+            'rounded-[18px] border border-[#dbe4f3] bg-white shadow-[0_12px_24px_rgba(54,78,123,0.05)]',
+            isMobileLayout ? 'px-[16px] py-[16px]' : 'px-[20px] py-[18px]',
+          )}
+        >
+          <div className="flex items-start gap-[12px]">
+            <div className="flex h-[40px] w-[40px] shrink-0 items-center justify-center rounded-[12px] bg-[linear-gradient(180deg,#d9e7fb_0%,#bad2f3_100%)] text-[#3e7fea]">
+              <ClipboardCheck className="h-[20px] w-[20px]" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className={cn(isMobileLayout ? 'text-[17px]' : 'text-[16px]', 'font-semibold leading-[1.1] text-[#1b2d50]')}>Lesson flow</p>
+              <p className={cn(isMobileLayout ? 'text-[14px]' : 'text-[15px]', 'mt-[4px] leading-[1.5] text-[#5d6f8e]')}>
+                Finish the lesson video, take the one-time CBT, then unlock the explanation video to complete this lesson flow.
+              </p>
+            </div>
           </div>
-          <div className="min-w-0 flex-1">
-            <p className={cn(isMobileLayout ? 'text-[17px]' : 'text-[16px]', 'font-semibold leading-[1.1] text-[#1b2d50]')}>Lesson flow</p>
-            <p className={cn(isMobileLayout ? 'text-[14px]' : 'text-[15px]', 'mt-[4px] leading-[1.5] text-[#5d6f8e]')}>
-              Finish the lesson video, take the one-time CBT, then unlock the explanation video to complete this lesson flow.
-            </p>
-          </div>
-        </div>
 
-        <div className="mt-[14px] flex flex-wrap gap-[8px]">
-          <span className="inline-flex items-center gap-[7px] rounded-full bg-[#eef4ff] px-[12px] py-[7px] text-[12px] font-medium text-[#46658f]">
-            <Play className="ml-[1px] h-[12px] w-[12px] fill-current text-[#4a8ef5]" />
-            Lesson video
-          </span>
-          <span className="inline-flex items-center gap-[7px] rounded-full bg-[#eef4ff] px-[12px] py-[7px] text-[12px] font-medium text-[#46658f]">
-            <ClipboardCheck className="h-[12px] w-[12px] text-[#4a8ef5]" />
-            One CBT attempt
-          </span>
-          <span className="inline-flex items-center gap-[7px] rounded-full bg-[#eef4ff] px-[12px] py-[7px] text-[12px] font-medium text-[#46658f]">
-            <Video className="h-[12px] w-[12px] text-[#4a8ef5]" />
-            Explanation once
-          </span>
+          <div className="mt-[14px] flex flex-wrap gap-[8px]">
+            <span className="inline-flex items-center gap-[7px] rounded-full bg-[#eef4ff] px-[12px] py-[7px] text-[12px] font-medium text-[#46658f]">
+              <Play className="ml-[1px] h-[12px] w-[12px] fill-current text-[#4a8ef5]" />
+              Lesson video
+            </span>
+            <span className="inline-flex items-center gap-[7px] rounded-full bg-[#eef4ff] px-[12px] py-[7px] text-[12px] font-medium text-[#46658f]">
+              <ClipboardCheck className="h-[12px] w-[12px] text-[#4a8ef5]" />
+              One CBT attempt
+            </span>
+            <span className="inline-flex items-center gap-[7px] rounded-full bg-[#eef4ff] px-[12px] py-[7px] text-[12px] font-medium text-[#46658f]">
+              <Video className="h-[12px] w-[12px] text-[#4a8ef5]" />
+              Explanation once
+            </span>
+          </div>
         </div>
-      </div>
+      ) : null}
     </div>
   );
 
@@ -3394,8 +4605,8 @@ export const CourseFigmaTab = ({
               </button>
             </div>
 
-            <div data-testid="course-figma-tabs" className="mt-[8px] grid grid-cols-3 border-b border-[#dde5f5] text-center">
-              {(['Content', 'Syllabus', 'Resources'] as const).map((tab) => (
+            <div data-testid="course-figma-tabs" className="mt-[8px] grid grid-cols-2 border-b border-[#dde5f5] text-center">
+              {(['Content', 'Editorial'] as const).map((tab) => (
                 <button
                   key={tab}
                   type="button"
@@ -3422,25 +4633,27 @@ export const CourseFigmaTab = ({
                 <div className="mb-[10px] rounded-[16px] border border-[#ffd9b6] bg-[linear-gradient(135deg,rgba(255,247,237,0.96)_0%,rgba(255,255,255,0.98)_100%)] px-[12px] py-[12px] shadow-[0_12px_26px_rgba(201,106,43,0.10)]">
                   <div className="flex items-start justify-between gap-[10px]">
                     <div>
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#c96a2b]">Offer price</p>
+                      {pricing.hasOffer ? (
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#c96a2b]">Offer price</p>
+                      ) : null}
                       <p className="mt-[4px] text-[26px] font-bold leading-none text-[#17233d]">{currency.format(pricing.finalPrice)}</p>
                     </div>
-                    {pricing.offerPercentage > 0 && (
+                    {pricing.hasOffer && (
                       <span className="rounded-full bg-[#ffedd5] px-[10px] py-[6px] text-[11px] font-bold text-[#c96a2b]">
                         {pricing.offerPercentage}% OFF
                       </span>
                     )}
                   </div>
-                  <div className="mt-[8px] flex flex-wrap items-center gap-[8px] text-[11px]">
-                    <span className="font-semibold text-[#7a8aa7] line-through decoration-[#c96a2b]/55">
-                      {currency.format(pricing.basePrice)}
-                    </span>
-                    {pricing.savings > 0 && (
+                  {pricing.hasOffer ? (
+                    <div className="mt-[8px] flex flex-wrap items-center gap-[8px] text-[11px]">
+                      <span className="font-semibold text-[#7a8aa7] line-through decoration-[#c96a2b]/55">
+                        {currency.format(pricing.basePrice)}
+                      </span>
                       <span className="rounded-full bg-[#fff3e6] px-[8px] py-[3px] font-semibold text-[#c96a2b]">
                         Save {currency.format(pricing.savings)}
                       </span>
-                    )}
-                  </div>
+                    </div>
+                  ) : null}
                 </div>
               );
             })() : null}
@@ -3471,7 +4684,7 @@ export const CourseFigmaTab = ({
                   onClick={() => selectedLessonEntry && openLesson(selectedLessonEntry.lesson.id)}
                   className="inline-flex h-[30px] w-full items-center justify-center rounded-[10px] bg-[#2f6fe4] px-[7px] text-[9.5px] font-semibold whitespace-nowrap text-white shadow-[0_12px_24px_rgba(45,110,229,0.2)]"
                 >
-                  {selectedCourseSnapshot.progressPercent > 0 ? 'Continue Course' : 'Start Course'}
+                  {getCoursePrimaryActionLabel(selectedCourse, selectedCourseSnapshot.progressPercent)}
                 </button>
               ) : (
                 <span className="inline-flex h-[30px] w-full items-center justify-center rounded-[10px] bg-[#eef2f8] px-[7px] text-[9.5px] font-semibold whitespace-nowrap text-[#8a9ab3]">
@@ -3484,21 +4697,23 @@ export const CourseFigmaTab = ({
                 {renderCourseAccessActions(selectedCourse, 'mobile')}
               </div>
             )}
-            {courseAccessMessage && (
+            {(courseAccessMessage || (!selectedCourseHasAccess && selectedCourse?.accessBlockReason)) && (
               <p className="mt-[8px] rounded-[10px] bg-[#f7faff] px-[9px] py-[7px] text-[10px] leading-5 text-[#516786]">
-                {courseAccessMessage}
+                {courseAccessMessage || selectedCourse?.accessBlockReason}
               </p>
             )}
           </section>
 
-          <div className="mt-[7px] flex items-center gap-[5px] overflow-x-auto px-[2px] pb-[2px] text-[9px] whitespace-nowrap text-[#516786] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-            <span className="font-semibold text-[#1f2d4e]">Lesson Flow:</span>
-            <span className="inline-flex items-center gap-[4px]"><Play className="h-[10px] w-[10px] fill-current text-[#2d6ee5]" /> Watch Video</span>
-            <span className="text-[#9aabbe]">→</span>
-            <span className="inline-flex items-center gap-[4px]"><ClipboardCheck className="h-[10px] w-[10px] text-[#2d6ee5]" /> Take CBT (1 Attempt)</span>
-            <span className="text-[#9aabbe]">→</span>
-            <span className="inline-flex items-center gap-[4px]"><Video className="h-[10px] w-[10px] text-[#2d6ee5]" /> View Explanation</span>
-          </div>
+          {selectedLessonHasCbt ? (
+            <div className="mt-[7px] flex items-center gap-[5px] overflow-x-auto px-[2px] pb-[2px] text-[9px] whitespace-nowrap text-[#516786] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+              <span className="font-semibold text-[#1f2d4e]">Lesson Flow:</span>
+              <span className="inline-flex items-center gap-[4px]"><Play className="h-[10px] w-[10px] fill-current text-[#2d6ee5]" /> Watch Video</span>
+              <span className="text-[#9aabbe]">→</span>
+              <span className="inline-flex items-center gap-[4px]"><ClipboardCheck className="h-[10px] w-[10px] text-[#2d6ee5]" /> Take CBT (1 Attempt)</span>
+              <span className="text-[#9aabbe]">→</span>
+              <span className="inline-flex items-center gap-[4px]"><Video className="h-[10px] w-[10px] text-[#2d6ee5]" /> View Explanation</span>
+            </div>
+          ) : null}
 
           {mobileCourseTab === 'Content' && (
             <div data-testid="course-figma-lessons" className="mt-[8px] space-y-[7px]">
@@ -3530,12 +4745,14 @@ export const CourseFigmaTab = ({
 
                     {expanded && (
                       <div className="border-t border-[#edf2f8] px-[7px] py-[1px]">
+                        {renderSectionPdfButtons(section, 'mobile')}
                         {section.lessons.map((entry) => {
                           const progress = selectedCourseProgressMap.get(entry.lesson.id);
                           const unlocked = Boolean(unlockMap.get(entry.lesson.id)?.unlocked);
                           const lessonDone = hasLessonVideoMilestone(progress);
-                          const examDone = Boolean(progress?.examSubmitted);
-                          const explanationDone = Boolean(progress?.completed || getExplanationWatchCount(progress) >= MAX_EXPLANATION_WATCHES);
+                          const lessonHasCbt = hasLessonCbtContent(entry.lesson);
+                          const examDone = lessonHasCbt && Boolean(progress?.examSubmitted);
+                          const explanationDone = lessonHasCbt && Boolean(progress?.completed || getExplanationWatchCount(progress) >= MAX_EXPLANATION_WATCHES);
                           const rows = [
                             {
                               key: `${entry.lesson.id}-lesson`,
@@ -3546,16 +4763,15 @@ export const CourseFigmaTab = ({
                               status: explanationDone || lessonDone ? 'Completed' : unlocked ? 'Ready' : 'Locked',
                               onClick: unlocked ? () => openLesson(entry.lesson.id) : undefined,
                             },
-                            {
+                            ...(lessonHasCbt ? [{
                               key: `${entry.lesson.id}-cbt`,
                               icon: <ClipboardCheck className="h-[16px] w-[16px]" />,
                               iconClass: 'text-[#5b6f98]',
                               title: `CBT - ${section.label} (One Attempt)`,
-                              subtitle: '10 Questions',
+                              subtitle: `${entry.lesson.cbt?.questions?.length || 0} Questions`,
                               status: examDone ? 'Completed' : lessonDone ? 'Ready' : 'Locked',
                               onClick: undefined,
-                            },
-                            {
+                            }, {
                               key: `${entry.lesson.id}-explanation`,
                               icon: <Video className="h-[16px] w-[16px]" />,
                               iconClass: 'text-[#5b6f98]',
@@ -3563,56 +4779,61 @@ export const CourseFigmaTab = ({
                               subtitle: '18 mins',
                               status: explanationDone ? 'Completed' : examDone ? 'Ready' : 'Locked',
                               onClick: undefined,
-                            },
+                            }] : []),
                           ] as const;
 
-                          return rows.map((row, rowIndex) => (
-                            <div key={row.key} className={cn('flex gap-[8px] px-[1px] py-[5px]', !(entry === section.lessons[section.lessons.length - 1] && rowIndex === rows.length - 1) && 'border-b border-[#eef2f8]')}>
-                              <div className="flex w-[12px] flex-col items-center pt-[3px]">
-                                <span
-                                  className={cn(
-                                    'h-[8px] w-[8px] rounded-full',
-                                    row.status === 'Completed'
-                                      ? 'bg-[#25ba74]'
-                                      : row.status === 'Ready'
-                                        ? 'bg-[#2d6ee5]'
-                                        : 'bg-[#d2dceb]',
-                                  )}
-                                />
-                              </div>
+                          return (
+                            <div key={entry.lesson.id}>
+                              {rows.map((row, rowIndex) => (
+                                <div key={row.key} className={cn('flex gap-[8px] px-[1px] py-[5px]', !(entry === section.lessons[section.lessons.length - 1] && rowIndex === rows.length - 1) && 'border-b border-[#eef2f8]')}>
+                                  <div className="flex w-[12px] flex-col items-center pt-[3px]">
+                                    <span
+                                      className={cn(
+                                        'h-[8px] w-[8px] rounded-full',
+                                        row.status === 'Completed'
+                                          ? 'bg-[#25ba74]'
+                                          : row.status === 'Ready'
+                                            ? 'bg-[#2d6ee5]'
+                                            : 'bg-[#d2dceb]',
+                                      )}
+                                    />
+                                  </div>
 
-                              <button
-                                type="button"
-                                data-testid={row.onClick ? `course-lesson-open-${entry.lesson.id}` : undefined}
-                                disabled={!row.onClick}
-                                onClick={row.onClick}
-                                className={cn(
-                                  'flex min-w-0 flex-1 items-center gap-[8px] rounded-[14px] px-[2px] py-[2px] text-left',
-                                  row.onClick ? 'cursor-pointer' : 'cursor-default',
-                                )}
-                              >
-                                <div className={cn('flex h-[28px] w-[28px] shrink-0 items-center justify-center rounded-full border border-[#dbe4f3] bg-[#f5f8fe]', row.iconClass)}>
-                                  {row.icon}
+                                  <button
+                                    type="button"
+                                    data-testid={row.onClick ? `course-lesson-open-${entry.lesson.id}` : undefined}
+                                    disabled={!row.onClick}
+                                    onClick={row.onClick}
+                                    className={cn(
+                                      'flex min-w-0 flex-1 items-center gap-[8px] rounded-[14px] px-[2px] py-[2px] text-left',
+                                      row.onClick ? 'cursor-pointer' : 'cursor-default',
+                                    )}
+                                  >
+                                    <div className={cn('flex h-[28px] w-[28px] shrink-0 items-center justify-center rounded-full border border-[#dbe4f3] bg-[#f5f8fe]', row.iconClass)}>
+                                      {row.icon}
+                                    </div>
+                                    <div className="min-w-0 flex-1">
+                                      <p className="truncate text-[11px] font-medium leading-[1.12] text-[#1f2d4e]">{row.title}</p>
+                                      <p className="mt-[1px] text-[9px] text-[#7b879d]">{row.subtitle}</p>
+                                    </div>
+                                    <span
+                                      className={cn(
+                                        'inline-flex h-[20px] shrink-0 items-center rounded-full px-[6px] text-[8px] font-semibold',
+                                        row.status === 'Completed'
+                                          ? 'bg-[#e9f8ee] text-[#28a45e]'
+                                          : row.status === 'Ready'
+                                            ? 'bg-[#eef4ff] text-[#2d6ee5]'
+                                            : 'bg-[#f1f4f9] text-[#8a9bb6]',
+                                      )}
+                                    >
+                                      {row.status}
+                                    </span>
+                                  </button>
                                 </div>
-                                <div className="min-w-0 flex-1">
-                                  <p className="truncate text-[11px] font-medium leading-[1.12] text-[#1f2d4e]">{row.title}</p>
-                                  <p className="mt-[1px] text-[9px] text-[#7b879d]">{row.subtitle}</p>
-                                </div>
-                                <span
-                                  className={cn(
-                                    'inline-flex h-[20px] shrink-0 items-center rounded-full px-[6px] text-[8px] font-semibold',
-                                    row.status === 'Completed'
-                                      ? 'bg-[#e9f8ee] text-[#28a45e]'
-                                      : row.status === 'Ready'
-                                        ? 'bg-[#eef4ff] text-[#2d6ee5]'
-                                        : 'bg-[#f1f4f9] text-[#8a9bb6]',
-                                  )}
-                                >
-                                  {row.status}
-                                </span>
-                              </button>
+                              ))}
+                              {renderLessonPdfButtons(entry.lesson, 'mobile')}
                             </div>
-                          ));
+                          );
                         })}
                       </div>
                     )}
@@ -3622,32 +4843,9 @@ export const CourseFigmaTab = ({
             </div>
           )}
 
-          {mobileCourseTab === 'Syllabus' && (
-            <div className="mt-[16px] space-y-[12px]">
-              {selectedCourseSections.map((section) => (
-                <section key={section.id} className="rounded-[18px] border border-[#dbe4f3] bg-white px-[16px] py-[16px] shadow-[0_12px_24px_rgba(54,78,123,0.05)]">
-                  <div className="flex items-center justify-between gap-[10px]">
-                    <p className="text-[16px] font-semibold text-[#1f2d4e]">{section.label} {section.title}</p>
-                    <span className="text-[13px] text-[#6f84ab]">{section.lessons.length} lessons</span>
-                  </div>
-                  <div className="mt-[10px] space-y-[8px]">
-                    {section.lessons.map((entry) => (
-                      <p key={entry.lesson.id} className="text-[14px] text-[#516786]">{entry.lesson.title}</p>
-                    ))}
-                  </div>
-                </section>
-              ))}
-            </div>
-          )}
-
-          {mobileCourseTab === 'Resources' && (
-            <div className="mt-[16px] space-y-[12px]">
-              <section className="rounded-[18px] border border-[#dbe4f3] bg-white px-[16px] py-[16px] shadow-[0_12px_24px_rgba(54,78,123,0.05)]">
-                <p className="text-[16px] font-semibold text-[#1f2d4e]">Resources</p>
-                <p className="mt-[8px] text-[14px] leading-[1.6] text-[#5d6f8e]">
-                  Open any lesson in this course whenever you want. Resources stay aligned to the lesson you are viewing.
-                </p>
-              </section>
+          {mobileCourseTab === 'Editorial' && (
+            <div className="mt-[16px]">
+              {renderEditorialTab('mobile')}
             </div>
           )}
 
@@ -3713,25 +4911,27 @@ export const CourseFigmaTab = ({
                     <div className="mt-[16px] max-w-[360px] rounded-[16px] border border-[#ffd9b6] bg-[linear-gradient(135deg,rgba(255,247,237,0.94)_0%,rgba(255,255,255,0.96)_100%)] px-[14px] py-[12px] shadow-[0_12px_26px_rgba(201,106,43,0.10)] xl:mt-[18px]">
                       <div className="flex items-start justify-between gap-[10px]">
                         <div>
-                          <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#c96a2b]">Offer price</p>
+                          {pricing.hasOffer ? (
+                            <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#c96a2b]">Offer price</p>
+                          ) : null}
                           <p className="mt-[4px] text-[28px] font-bold leading-none text-[#17233d]">{currency.format(pricing.finalPrice)}</p>
                         </div>
-                        {pricing.offerPercentage > 0 && (
+                        {pricing.hasOffer && (
                           <span className="rounded-full bg-[#ffedd5] px-[10px] py-[6px] text-[11px] font-bold text-[#c96a2b]">
                             {pricing.offerPercentage}% OFF
                           </span>
                         )}
                       </div>
-                      <div className="mt-[8px] flex flex-wrap items-center gap-[8px] text-[11px]">
-                        <span className="font-semibold text-[#7a8aa7] line-through decoration-[#c96a2b]/55">
-                          {currency.format(pricing.basePrice)}
-                        </span>
-                        {pricing.savings > 0 && (
+                      {pricing.hasOffer ? (
+                        <div className="mt-[8px] flex flex-wrap items-center gap-[8px] text-[11px]">
+                          <span className="font-semibold text-[#7a8aa7] line-through decoration-[#c96a2b]/55">
+                            {currency.format(pricing.basePrice)}
+                          </span>
                           <span className="rounded-full bg-[#fff3e6] px-[8px] py-[3px] font-semibold text-[#c96a2b]">
                             Save {currency.format(pricing.savings)}
                           </span>
-                        )}
-                      </div>
+                        </div>
+                      ) : null}
                       <div className="mt-[12px] flex flex-wrap items-center gap-[10px]">
                         {renderCourseAccessActions(selectedCourse, 'desktop')}
                         <span className="text-[11px] font-medium text-[#6c7f9f]">
@@ -3748,14 +4948,14 @@ export const CourseFigmaTab = ({
                       onClick={() => selectedLessonEntry && openLesson(selectedLessonEntry.lesson.id)}
                       className="inline-flex h-[38px] items-center gap-[8px] rounded-[11px] bg-[linear-gradient(180deg,#4487f4_0%,#2d6ee5_100%)] px-[16px] text-[13px] font-semibold text-white shadow-[0_14px_28px_rgba(45,110,229,0.24)] xl:h-[46px] xl:gap-[10px] xl:rounded-[12px] xl:px-[22px] xl:text-[15px]"
                     >
-                      {selectedCourseSnapshot.progressPercent > 0 ? 'Continue Course' : 'Start Course'}
+                      {getCoursePrimaryActionLabel(selectedCourse, selectedCourseSnapshot.progressPercent)}
                       <ChevronRight className="h-[16px] w-[16px]" />
                     </button>
                   ) : null}
                 </div>
-                {courseAccessMessage && (
+                {(courseAccessMessage || (!selectedCourseHasAccess && selectedCourse?.accessBlockReason)) && (
                   <p className="mt-[10px] inline-flex max-w-[520px] rounded-[12px] bg-white/82 px-[12px] py-[8px] text-[12px] leading-5 text-[#41597d]">
-                    {courseAccessMessage}
+                    {courseAccessMessage || selectedCourse?.accessBlockReason}
                   </p>
                 )}
               </div>
@@ -3779,14 +4979,17 @@ export const CourseFigmaTab = ({
                 ))}
               </div>
 
-              <div className="inline-flex h-[36px] items-center gap-[7px] rounded-[10px] border border-[#dbe4f3] bg-[#f7faff] px-[12px] text-[13px] text-[#5e7397] xl:h-[40px] xl:gap-[8px] xl:px-[14px] xl:text-[15px]">
-                <ClipboardCheck className="h-[15px] w-[15px]" />
-                {selectedCourseExamAttempts}/{selectedCourseEntries.length} CBT attempts
-              </div>
+              {selectedCourseCbtEligibleCount > 0 ? (
+                <div className="inline-flex h-[36px] items-center gap-[7px] rounded-[10px] border border-[#dbe4f3] bg-[#f7faff] px-[12px] text-[13px] text-[#5e7397] xl:h-[40px] xl:gap-[8px] xl:px-[14px] xl:text-[15px]">
+                  <ClipboardCheck className="h-[15px] w-[15px]" />
+                  {selectedCourseExamAttempts}/{selectedCourseCbtEligibleCount} CBT attempts
+                </div>
+              ) : null}
             </div>
 
             <div className="bg-[linear-gradient(180deg,#f6f9ff_0%,#eef4ff_100%)] px-[12px] py-[12px] xl:px-[14px] xl:py-[14px]">
               {activeCourseTab === 'Lessons' && renderLessonsTab()}
+              {activeCourseTab === 'Editorial' && renderEditorialTab('desktop')}
             </div>
           </section>
         </div>
@@ -3799,8 +5002,8 @@ export const CourseFigmaTab = ({
             </div>
             <div className="mt-[14px] grid grid-cols-2 gap-y-[8px] px-[2px] text-[13px] text-[#5d7092] xl:px-[6px] xl:text-[14px]">
               <span data-testid="course-progress-lessons-completed">{selectedCourseVideoCompletedDisplayCount} Lessons</span>
-              <span>{selectedCourseExamAttempts} CBT Done</span>
-              <span>{Math.max(selectedCourseEntries.length - selectedCourseExamAttempts, 0)} CBT Left</span>
+              {selectedCourseCbtEligibleCount > 0 ? <span>{selectedCourseExamAttempts} CBT Done</span> : <span>Video only</span>}
+              {selectedCourseCbtEligibleCount > 0 ? <span>{Math.max(selectedCourseCbtEligibleCount - selectedCourseExamAttempts, 0)} CBT Left</span> : <span>No CBT linked</span>}
               <span className="text-[#7a90b7]">{selectedCourseSnapshot.totalLessons} Total</span>
             </div>
           </section>
@@ -3837,7 +5040,7 @@ export const CourseFigmaTab = ({
             </div>
           </section>
 
-          {!isMobileLayout && (
+          {!isMobileLayout && selectedLessonHasCbt && (
             <section data-testid="course-figma-recommended" className="overflow-hidden rounded-[22px] bg-white shadow-[0_16px_34px_rgba(54,78,123,0.08)]">
             <div className="flex h-[40px] items-center justify-between border-b border-[#edf2fb] px-[18px]">
               <div className="flex items-center gap-[8px] text-[15px] text-[#1c2d4c]">
@@ -3857,7 +5060,7 @@ export const CourseFigmaTab = ({
               <div className="mt-[10px] flex items-center justify-between text-[13px] text-[#677b9e]">
                 <div className="flex items-center gap-[6px]">
                   <Clock3 className="h-[13px] w-[13px]" />
-                  <span>{Math.max(Math.round(selectedLessonVideoDurationSeconds / 60), 1)} mins + CBT</span>
+                  <span>{Math.max(Math.round(selectedLessonVideoDurationSeconds / 60), 1)} mins{selectedLessonHasCbt ? ' + CBT' : ''}</span>
                 </div>
                 <button
                   type="button"
@@ -3899,9 +5102,7 @@ export const CourseFigmaTab = ({
           <div className="rounded-[16px] border border-[#e3ebf6] bg-[#fbfdff] px-[16px] py-[16px]">
             <p className="text-[14px] font-semibold text-[#17305c]">Lesson Replay</p>
             <p className="mt-[6px] text-[13px] leading-[1.45] text-[#5d7092]">
-              {hasReachedLessonVideoWatchLimit
-                ? 'Maximum lesson video rewatch limit reached.'
-                : `${selectedLessonVideoWatchCount}/${selectedLessonVideoWatchLimit} watches used. Replay remains available until the limit is reached.`}
+              {selectedLessonReplayHelpText}
             </p>
             {canRewatchLessonVideo ? (
               <button
@@ -3986,31 +5187,52 @@ export const CourseFigmaTab = ({
             <div className="min-w-0 flex-1">
               <p className="text-[15px] font-semibold text-[#17305c]">What&apos;s Next?</p>
               <p className="mt-[4px] text-[14px] leading-[1.42] text-[#5d7092]">
-                Take a CBT (Chapter Based Test) to test your understanding.
+                {selectedLessonHasCbt
+                  ? 'Take a CBT (Chapter Based Test) to test your understanding.'
+                  : nextLessonEntry
+                    ? `Open ${nextLessonEntry.lesson.title} when you are ready to continue.`
+                    : 'Return to the lesson list and continue with any released lesson.'}
               </p>
             </div>
           </div>
-          <button
-            type="button"
-            data-testid="course-player-start-cbt"
-            onClick={startLessonExam}
-            className="mt-[16px] inline-flex h-[42px] w-full items-center justify-center rounded-[10px] bg-[linear-gradient(180deg,#2f6ef0_0%,#2660e3_100%)] text-[14px] font-semibold text-white shadow-[0_12px_24px_rgba(45,110,229,0.2)]"
-          >
-            Start CBT Exam
-          </button>
-          <div className="mt-[10px] flex items-center justify-center gap-[6px] text-[13px] text-[#6f84ab]">
-            <span>One Attempt Only</span>
-            <Clock3 className="h-[12px] w-[12px]" />
-          </div>
+          {selectedLessonHasCbt ? (
+            <>
+              <button
+                type="button"
+                data-testid="course-player-start-cbt"
+                onClick={startLessonExam}
+                className="mt-[16px] inline-flex h-[42px] w-full items-center justify-center rounded-[10px] bg-[linear-gradient(180deg,#2f6ef0_0%,#2660e3_100%)] text-[14px] font-semibold text-white shadow-[0_12px_24px_rgba(45,110,229,0.2)]"
+              >
+                Start CBT Exam
+              </button>
+              <div className="mt-[10px] flex items-center justify-center gap-[6px] text-[13px] text-[#6f84ab]">
+                <span>One Attempt Only</span>
+                <Clock3 className="h-[12px] w-[12px]" />
+              </div>
+            </>
+          ) : (
+            <button
+              type="button"
+              data-testid="course-player-continue-next-lesson"
+              onClick={() => {
+                if (nextLessonEntry) {
+                  openNextLesson(true);
+                  return;
+                }
+                setScreen('course');
+              }}
+              className="mt-[16px] inline-flex h-[42px] w-full items-center justify-center rounded-[10px] bg-[linear-gradient(180deg,#2f6ef0_0%,#2660e3_100%)] text-[14px] font-semibold text-white shadow-[0_12px_24px_rgba(45,110,229,0.2)]"
+            >
+              {nextLessonEntry ? 'Open Next Lesson' : 'Back to Lessons'}
+            </button>
+          )}
 
           <div className="mt-[14px] border-t border-[#e6edf8] pt-[14px]">
             <div className="flex items-start justify-between gap-[14px]">
               <div className="min-w-0">
                 <p className="text-[14px] font-semibold text-[#17305c]">Lesson Replay</p>
                 <p className="mt-[4px] text-[13px] leading-[1.45] text-[#5d7092]">
-                  {hasReachedLessonVideoWatchLimit
-                    ? 'Maximum lesson video rewatch limit reached.'
-                    : `${selectedLessonVideoWatchCount}/${selectedLessonVideoWatchLimit} watches used. Rewatch is still available before the limit is reached.`}
+                  {selectedLessonReplayHelpText}
                 </p>
               </div>
               {canRewatchLessonVideo ? (
@@ -4067,12 +5289,12 @@ export const CourseFigmaTab = ({
         ref={playerViewportRef}
         data-testid="course-figma-player"
         className={cn(
-          'relative overflow-hidden rounded-[18px] border border-[#dde7f5] bg-[#d8e8ff] shadow-[0_12px_28px_rgba(46,67,111,0.08)]',
+          'relative overflow-visible rounded-[18px] border border-[#dde7f5] bg-[#d8e8ff] shadow-[0_12px_28px_rgba(46,67,111,0.08)]',
           isFullscreen && 'h-screen w-screen rounded-none border-0 bg-black shadow-none',
         )}
       >
         {actualLessonMedia ? (
-          <div className={cn('bg-black', isFullscreen && 'flex h-full w-full items-center justify-center')}>
+          <div className={cn('overflow-hidden rounded-[inherit] bg-black', isFullscreen && 'flex h-full w-full items-center justify-center rounded-none')}>
             {actualLessonMedia}
           </div>
         ) : (
@@ -4080,6 +5302,7 @@ export const CourseFigmaTab = ({
         )}
         <button
           type="button"
+          data-testid="course-player-fullscreen"
           onClick={() => void toggleFullscreen()}
           className="absolute right-[16px] top-[16px] inline-flex items-center gap-[8px] rounded-full border border-white/16 bg-black/52 px-[14px] py-[10px] text-[12px] font-semibold text-white shadow-[0_12px_30px_rgba(0,0,0,0.28)] backdrop-blur-sm transition hover:bg-black/68"
         >
@@ -4089,6 +5312,7 @@ export const CourseFigmaTab = ({
       </section>
 
       {renderLessonSupportSections('desktop')}
+      {renderLessonPdfPanel('desktop')}
 
       <section className="grid gap-[14px] xl:grid-cols-[minmax(0,1.1fr)_260px]">
         <div className="rounded-[18px] border border-[#dbe4f3] bg-white px-[18px] py-[16px] shadow-[0_12px_24px_rgba(54,78,123,0.05)]">
@@ -4123,37 +5347,43 @@ export const CourseFigmaTab = ({
         <div className="rounded-[18px] border border-[#dbe4f3] bg-white px-[18px] py-[16px] shadow-[0_12px_24px_rgba(54,78,123,0.05)]">
           <p className="text-[16px] font-semibold text-[#1b2d50]">Need Help?</p>
           <p className="mt-[10px] text-[15px] leading-[1.55] text-[#516786]">
-            Complete the lesson CBT after the video, then open the explanation to finish the lesson flow.
+            {selectedLessonHasCbt
+              ? 'Complete the lesson CBT after the video, then open the explanation to finish the lesson flow.'
+              : 'This lesson currently has no linked CBT or explanation. Use the lesson video, notes, and doubts for this topic.'}
           </p>
           <div className="mt-[16px] flex flex-wrap gap-[10px]">
-            <button
-              type="button"
-              data-testid="course-player-start-cbt"
-              onClick={startLessonExam}
-              disabled={!isLessonReadyForExam}
-              className={cn(
-                'rounded-[10px] px-[16px] py-[10px] text-[14px] font-semibold transition',
-                isLessonReadyForExam
-                  ? 'bg-[#2d6ee5] text-white'
-                  : 'cursor-not-allowed border border-[#dbe4f3] bg-[#eef3fb] text-[#91a4c2]',
-              )}
-            >
-              Open CBT Exam
-            </button>
-            <button
-              type="button"
-              data-testid="course-player-watch-explanation"
-              onClick={openLessonExplanation}
-              disabled={!isExplanationUnlocked}
-              className={cn(
-                'rounded-[10px] px-[16px] py-[10px] text-[14px] font-semibold transition',
-                isExplanationUnlocked
-                  ? 'bg-[#103b91] text-white'
-                  : 'cursor-not-allowed border border-[#dbe4f3] bg-[#eef3fb] text-[#91a4c2]',
-              )}
-            >
-              Watch Explanation
-            </button>
+            {selectedLessonHasCbt ? (
+              <>
+                <button
+                  type="button"
+                  data-testid="course-player-start-cbt"
+                  onClick={startLessonExam}
+                  disabled={!isLessonReadyForExam}
+                  className={cn(
+                    'rounded-[10px] px-[16px] py-[10px] text-[14px] font-semibold transition',
+                    isLessonReadyForExam
+                      ? 'bg-[#2d6ee5] text-white'
+                      : 'cursor-not-allowed border border-[#dbe4f3] bg-[#eef3fb] text-[#91a4c2]',
+                  )}
+                >
+                  Open CBT Exam
+                </button>
+                <button
+                  type="button"
+                  data-testid="course-player-watch-explanation"
+                  onClick={openLessonExplanation}
+                  disabled={!isExplanationUnlocked}
+                  className={cn(
+                    'rounded-[10px] px-[16px] py-[10px] text-[14px] font-semibold transition',
+                    isExplanationUnlocked
+                      ? 'bg-[#103b91] text-white'
+                      : 'cursor-not-allowed border border-[#dbe4f3] bg-[#eef3fb] text-[#91a4c2]',
+                  )}
+                >
+                  Watch Explanation
+                </button>
+              </>
+            ) : null}
             <button
               type="button"
               onClick={() => scrollToLessonSection('course-lesson-doubts-section')}
@@ -4333,6 +5563,280 @@ export const CourseFigmaTab = ({
     section?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
 
+  const closePdfViewer = useCallback(() => {
+    setActivePdfRequest(null);
+    setActivePdfAttachment(null);
+    setPdfViewerError(null);
+    setLoadingPdfId(null);
+  }, []);
+
+  const openPdfAttachment = useCallback(async (attachment: CoursePdfAttachment) => {
+    if (!selectedCourse) {
+      return;
+    }
+
+    setPdfViewerError(null);
+    setLoadingPdfId(attachment.id);
+    flushSync(() => {
+      setActivePdfAttachment(attachment);
+    });
+    try {
+      if (attachment.id.startsWith('legacy-notes:')) {
+        throw new Error('This legacy PDF must be re-uploaded as a protected course PDF before students can read it.');
+      }
+
+      setActivePdfRequest(EduService.getProtectedCoursePdfRequest(selectedCourse._id, attachment.id));
+    } catch (error) {
+      setPdfViewerError(error instanceof Error ? error.message : 'Unable to open this PDF right now.');
+    } finally {
+      setLoadingPdfId(null);
+    }
+  }, [selectedCourse]);
+
+  const openEditorialVideo = useCallback(async (editorial: CourseEditorialVideo) => {
+    if (!selectedCourse?._id) {
+      return;
+    }
+
+    setEditorialError(null);
+    setLoadingEditorialId(editorial.id);
+    setActiveEditorialId(editorial.id);
+    try {
+      const playback = await EduService.getProtectedEditorialPlayback(selectedCourse._id, editorial.id);
+      setEditorialPlayback(playback);
+    } catch (error) {
+      setEditorialPlayback(null);
+      setEditorialError(error instanceof Error ? error.message : 'Unable to open this editorial video right now.');
+    } finally {
+      setLoadingEditorialId(null);
+    }
+  }, [selectedCourse?._id]);
+
+  const renderSupportAttachmentLinks = (attachments: SupportAttachment[] = []) => {
+    if (!attachments.length) {
+      return null;
+    }
+
+    return (
+      <div className="mt-[8px] space-y-[6px]">
+        {attachments.map((attachment) => (
+          <a
+            key={attachment.id}
+            href={attachment.url}
+            target="_blank"
+            rel="noreferrer"
+            className="flex items-center justify-between gap-[10px] rounded-[10px] border border-[#dbe4f3] bg-white px-[10px] py-[8px] text-[11px] text-[#607394]"
+          >
+            <span className="min-w-0 truncate">{attachment.fileName}</span>
+            <span className="shrink-0 uppercase">{attachment.kind}{formatSupportFileSize(attachment.fileSize) ? ` • ${formatSupportFileSize(attachment.fileSize)}` : ''}</span>
+          </a>
+        ))}
+      </div>
+    );
+  };
+
+  const renderLessonPdfPanel = (layout: 'desktop' | 'mobile') => {
+    const pdfGroups = selectedLessonPdfGroups;
+    const pdfCount = pdfGroups.reduce((count, group) => count + group.items.length, 0);
+    if (pdfCount === 0) {
+      return null;
+    }
+
+    const isDesktop = layout === 'desktop';
+    return (
+      <section className={cn(
+        'rounded-[18px] border border-[#dbe4f3] bg-white shadow-[0_12px_24px_rgba(54,78,123,0.05)]',
+        isDesktop ? 'px-[18px] py-[16px]' : 'px-[14px] py-[14px]',
+      )}>
+        <div className="flex items-center justify-between gap-[10px]">
+          <div>
+            <p className={cn(isDesktop ? 'text-[16px]' : 'text-[14px]', 'font-semibold text-[#1b2d50]')}>Lesson PDFs</p>
+            <p className={cn(isDesktop ? 'text-[13px]' : 'text-[12px]', 'mt-[4px] leading-[1.45] text-[#5d7092]')}>
+              Read PDFs inside the app. Download and share actions are intentionally not shown.
+            </p>
+          </div>
+          <span className="rounded-full bg-[#eef4ff] px-[10px] py-[4px] text-[10px] font-semibold uppercase tracking-[0.08em] text-[#2d6ee5]">
+            {pdfCount}
+          </span>
+        </div>
+        <div data-testid="course-pdf-resource-list" className="mt-[12px] space-y-[12px]">
+          {pdfGroups.map((group) => (
+            <div key={group.key} className="space-y-[8px]">
+              <div>
+                <p className={cn(isDesktop ? 'text-[13px]' : 'text-[12px]', 'font-semibold text-[#516786]')}>{group.label}</p>
+                <p className="mt-[2px] text-[11px] leading-[1.35] text-[#7b8da8]">{group.description}</p>
+              </div>
+              {group.items.map((attachment) => (
+                <button
+                  key={attachment.id}
+                  type="button"
+                  data-testid="course-pdf-open-button"
+                  onClick={() => void openPdfAttachment(attachment)}
+                  disabled={loadingPdfId === attachment.id}
+                  className="flex w-full items-center justify-between gap-[12px] rounded-[14px] border border-[#dbe4f3] bg-[#fbfdff] px-[14px] py-[12px] text-left disabled:opacity-60"
+                >
+                  <div className="min-w-0">
+                    <p className={cn(isDesktop ? 'text-[14px]' : 'text-[13px]', 'font-semibold text-[#17305c] truncate')}>{attachment.title}</p>
+                    <p className="mt-[4px] text-[11px] text-[#6f84ab]">Protected inline viewer</p>
+                  </div>
+                  <span className="shrink-0 rounded-full border border-[#d7e3f5] bg-white px-[10px] py-[6px] text-[11px] font-semibold text-[#2d6ee5]">
+                    {loadingPdfId === attachment.id ? 'Opening...' : 'Open'}
+                  </span>
+                </button>
+              ))}
+            </div>
+          ))}
+        </div>
+      </section>
+    );
+  };
+
+  const renderLessonPdfButtons = (lesson: CourseLesson, layout: 'desktop' | 'mobile') => {
+    const attachments = [...(lesson.attachments || [])];
+    const legacyNotes = buildLegacyNotesAttachment(lesson);
+    if (legacyNotes) {
+      attachments.unshift(legacyNotes);
+    }
+    if (attachments.length === 0) {
+      return null;
+    }
+
+    const isDesktop = layout === 'desktop';
+    return (
+      <div data-testid="lesson-pdf-list" className={cn(isDesktop ? 'px-[18px] pb-[14px]' : 'px-[8px] pb-[8px]', 'space-y-[8px]')}>
+        {attachments.map((attachment) => (
+          <button
+            key={attachment.id}
+            type="button"
+            data-testid="course-pdf-open-button"
+            onClick={() => void openPdfAttachment(attachment)}
+            disabled={loadingPdfId === attachment.id}
+            className="flex w-full items-center justify-between gap-[10px] rounded-[12px] border border-[#dbe4f3] bg-[#fbfdff] px-[12px] py-[10px] text-left disabled:opacity-60"
+          >
+            <div className="min-w-0">
+              <p className={cn(isDesktop ? 'text-[13px]' : 'text-[11px]', 'truncate font-semibold text-[#17305c]')}>{attachment.title}</p>
+              <p className="mt-[2px] text-[10px] text-[#6f84ab]">Lesson PDF • protected inline viewer</p>
+            </div>
+            <span className="shrink-0 rounded-full border border-[#d7e3f5] bg-white px-[9px] py-[5px] text-[10px] font-semibold text-[#2d6ee5]">
+              {loadingPdfId === attachment.id ? 'Opening...' : 'Read'}
+            </span>
+          </button>
+        ))}
+      </div>
+    );
+  };
+
+  const renderSectionPdfButtons = (section: CourseSection, layout: 'desktop' | 'mobile') => {
+    const attachments = [...(section.attachments || [])];
+    if (attachments.length === 0) {
+      return null;
+    }
+
+    const isDesktop = layout === 'desktop';
+    return (
+      <div data-testid="section-pdf-list" className={cn(isDesktop ? 'px-[18px] pb-[14px]' : 'px-[8px] pb-[8px]', 'space-y-[8px]')}>
+        {attachments.map((attachment) => (
+          <button
+            key={attachment.id}
+            type="button"
+            data-testid="course-pdf-open-button"
+            onClick={() => void openPdfAttachment(attachment)}
+            disabled={loadingPdfId === attachment.id}
+            className="flex w-full items-center justify-between gap-[10px] rounded-[12px] border border-[#dbe4f3] bg-[#fbfdff] px-[12px] py-[10px] text-left disabled:opacity-60"
+          >
+            <div className="min-w-0">
+              <p className={cn(isDesktop ? 'text-[13px]' : 'text-[11px]', 'truncate font-semibold text-[#17305c]')}>{attachment.title}</p>
+              <p className="mt-[2px] text-[10px] text-[#6f84ab]">Chapter PDF • protected inline viewer</p>
+            </div>
+            <span className="shrink-0 rounded-full border border-[#d7e3f5] bg-white px-[9px] py-[5px] text-[10px] font-semibold text-[#2d6ee5]">
+              {loadingPdfId === attachment.id ? 'Opening...' : 'Read'}
+            </span>
+          </button>
+        ))}
+      </div>
+    );
+  };
+
+  const renderEditorialTab = (layout: 'desktop' | 'mobile') => {
+    const isDesktop = layout === 'desktop';
+    const activeEditorial = selectedCourseEditorials.find((entry) => entry.id === activeEditorialId) || null;
+    const canPlayActive = Boolean(activeEditorial && editorialPlayback?.streamUrl && editorialPlayback?.playbackSessionId);
+
+    return (
+      <div data-testid="course-editorial-tab" className="space-y-[12px]">
+        <section className={cn(
+          'rounded-[18px] border border-[#dbe4f3] bg-white shadow-[0_12px_24px_rgba(54,78,123,0.05)]',
+          isDesktop ? 'px-[18px] py-[16px]' : 'px-[14px] py-[14px]',
+        )}>
+          <div className="flex items-center justify-between gap-[10px]">
+            <div>
+              <p className={cn(isDesktop ? 'text-[16px]' : 'text-[14px]', 'font-semibold text-[#1b2d50]')}>Editorial Videos</p>
+              <p className="mt-[4px] text-[12px] leading-[1.45] text-[#5d7092]">
+                Weekly course editorials uploaded by the admin. Each editorial counts only after near-end completion and still keeps a grace replay window before it locks.
+              </p>
+            </div>
+            <span className="rounded-full bg-[#eef4ff] px-[10px] py-[4px] text-[10px] font-semibold uppercase tracking-[0.08em] text-[#2d6ee5]">
+              {selectedCourseEditorials.length}
+            </span>
+          </div>
+
+          {editorialError && (
+            <div className="mt-[12px] rounded-[12px] border border-red-200 bg-red-50 px-[12px] py-[10px] text-[12px] text-red-600">
+              {editorialError}
+            </div>
+          )}
+
+          {canPlayActive && activeEditorial ? (
+            <div className="mt-[14px] overflow-hidden rounded-[16px] border border-[#dbe4f3] bg-black">
+              <ResilientHlsVideo
+                key={`editorial:${activeEditorial.id}:${editorialPlayback?.playbackSessionId}`}
+                src={editorialPlayback?.streamUrl || ''}
+                title={activeEditorial.title}
+                trackVideoId={editorialPlayback?.videoId || activeEditorial.id}
+                trackCourseId={selectedCourse?._id || null}
+                trackLessonId={null}
+                trackVideoType="editorial"
+                playbackSessionId={editorialPlayback?.playbackSessionId || null}
+                streamFormat={editorialPlayback?.streamFormat || 'source'}
+                deliveryProfile={editorialPlayback?.deliveryProfile || 'private-source'}
+                resumeSeconds={editorialPlayback?.resumeSeconds ?? 0}
+                playbackSpeed={playbackSpeed}
+                className={isDesktop ? 'aspect-video min-h-[360px]' : 'aspect-video min-h-[220px]'}
+              />
+            </div>
+          ) : null}
+
+          <div className="mt-[14px] space-y-[10px]">
+            {selectedCourseEditorials.length === 0 ? (
+              <div className="rounded-[14px] border border-dashed border-[#dbe4f3] bg-[#fbfdff] px-[14px] py-[18px] text-[13px] text-[#5d7092]">
+                No editorial videos are published for this course yet.
+              </div>
+            ) : selectedCourseEditorials.map((editorial) => (
+              <button
+                key={editorial.id}
+                type="button"
+                data-testid="course-editorial-open-button"
+                onClick={() => void openEditorialVideo(editorial)}
+                disabled={loadingEditorialId === editorial.id || editorial.locked}
+                className="flex w-full items-center justify-between gap-[12px] rounded-[14px] border border-[#dbe4f3] bg-[#fbfdff] px-[14px] py-[12px] text-left disabled:opacity-60"
+              >
+                <div className="min-w-0">
+                  <p className={cn(isDesktop ? 'text-[14px]' : 'text-[13px]', 'truncate font-semibold text-[#17305c]')}>{editorial.title}</p>
+                  <p className="mt-[4px] text-[11px] text-[#6f84ab]">
+                    {[editorial.weekLabel, editorial.editorialDate, `${editorial.durationMinutes || 0} min`, '1 watch only'].filter(Boolean).join(' • ')}
+                  </p>
+                </div>
+                <span className="shrink-0 rounded-full border border-[#d7e3f5] bg-white px-[10px] py-[6px] text-[11px] font-semibold text-[#2d6ee5]">
+                  {loadingEditorialId === editorial.id ? 'Opening...' : activeEditorialId === editorial.id ? 'Selected' : 'Watch'}
+                </span>
+              </button>
+            ))}
+          </div>
+        </section>
+      </div>
+    );
+  };
+
   const submitLessonDoubt = async () => {
     if (!selectedCourse?._id || !selectedLessonEntry) {
       return;
@@ -4345,6 +5849,7 @@ export const CourseFigmaTab = ({
 
     setSendingLessonDoubt(true);
     setLessonDoubtError(null);
+    setLessonDoubtSuccess(null);
 
     try {
       const response = await EduService.postLessonDoubtMessage(selectedCourse._id, selectedLessonEntry.lesson.id, {
@@ -4363,11 +5868,51 @@ export const CourseFigmaTab = ({
         ...current,
         [activeLessonDoubtDraftKey]: '',
       }));
+      setLessonDoubtSuccess(response.message || 'Question sent successfully');
       void onRefresh();
     } catch (error) {
       setLessonDoubtError(error instanceof Error ? error.message : 'Unable to send this message right now.');
     } finally {
       setSendingLessonDoubt(false);
+    }
+  };
+
+  const submitLessonReport = async () => {
+    if (!selectedCourse?._id || !selectedLessonEntry || sendingLessonReport) {
+      return;
+    }
+
+    const lessonId = selectedLessonEntry.lesson.id;
+    const description = String(lessonReportDrafts[lessonId] || '').trim();
+    const issueType = lessonReportIssueTypes[lessonId] || 'other';
+    if (!description) {
+      setLessonReportError('Please describe the issue before sending the report.');
+      setLessonReportSuccess(null);
+      return;
+    }
+
+    setSendingLessonReport(true);
+    setLessonReportError(null);
+    setLessonReportSuccess(null);
+
+    try {
+      const response = await EduService.postLessonReport(selectedCourse._id, lessonId, {
+        issueType,
+        description,
+        pageUrl: typeof window !== 'undefined' ? window.location.href : null,
+      });
+      setLessonReportsByLesson((current) => ({
+        ...current,
+        [lessonId]: [response.report, ...(current[lessonId] || []).filter((item) => item._id !== response.report._id)],
+      }));
+      pendingLessonReportIdRef.current = response.report._id;
+      setLessonReportDrafts((current) => ({ ...current, [lessonId]: '' }));
+      setLessonReportSuccess(`Report submitted successfully. Ticket ${response.report._id}`);
+      void onRefresh();
+    } catch (error) {
+      setLessonReportError(error instanceof Error ? error.message : 'Unable to submit this report right now.');
+    } finally {
+      setSendingLessonReport(false);
     }
   };
 
@@ -4473,6 +6018,7 @@ export const CourseFigmaTab = ({
       >
         <button
           type="button"
+          data-testid="lesson-doubt-open-button"
           onClick={() => toggleSupportPanel('doubts')}
           className="flex w-full items-start justify-between gap-[10px] text-left"
         >
@@ -4499,13 +6045,14 @@ export const CourseFigmaTab = ({
         {isExpanded && (
           <>
             {isAdminViewer && threadList.length > 0 && (
-              <div className={cn('mt-[14px] grid gap-[10px]', isDesktop ? 'grid-cols-2' : 'grid-cols-1')}>
+              <div data-testid="lesson-doubt-thread-list" className={cn('mt-[14px] grid gap-[10px]', isDesktop ? 'grid-cols-2' : 'grid-cols-1')}>
                 {threadList.map((thread) => {
                   const active = thread._id === activeThread?._id;
                   return (
                     <button
                       key={thread._id}
                       type="button"
+                      data-testid="admin-lesson-doubt-row"
                       onClick={() => setSelectedLessonDoubtThreadId(thread._id)}
                       className={cn(
                         'rounded-[14px] border px-[14px] py-[12px] text-left transition',
@@ -4528,16 +6075,16 @@ export const CourseFigmaTab = ({
               </div>
             )}
 
-            <div className={cn('mt-[14px]', isDesktop ? 'space-y-[10px]' : 'space-y-[8px]')}>
+            <div data-testid="lesson-doubt-message-list" className={cn('mt-[14px]', isDesktop ? 'space-y-[10px]' : 'space-y-[8px]')}>
               {loadingLessonDoubts && threadList.length === 0 && (
-                <div className="flex items-center gap-[8px] rounded-[14px] border border-[#dbe4f3] bg-[#f9fbff] px-[14px] py-[12px] text-[13px] text-[#5d7092]">
+                <div data-testid="lesson-doubt-loading" className="flex items-center gap-[8px] rounded-[14px] border border-[#dbe4f3] bg-[#f9fbff] px-[14px] py-[12px] text-[13px] text-[#5d7092]">
                   <LoaderCircle className="h-[16px] w-[16px] animate-spin text-[#2d6ee5]" />
                   Loading lesson conversation...
                 </div>
               )}
 
               {!loadingLessonDoubts && !activeThread && (
-                <div className="rounded-[14px] border border-dashed border-[#dbe4f3] bg-[#fbfdff] px-[14px] py-[12px] text-[13px] leading-[1.55] text-[#607394]">
+                <div data-testid="lesson-doubt-empty-state" className="rounded-[14px] border border-dashed border-[#dbe4f3] bg-[#fbfdff] px-[14px] py-[12px] text-[13px] leading-[1.55] text-[#607394]">
                   {isAdminViewer
                     ? 'No student questions have been posted for this video yet.'
                     : 'Ask your first question and the admin will get notified with this lesson path.'}
@@ -4549,6 +6096,7 @@ export const CourseFigmaTab = ({
                 return (
                   <div
                     key={message._id}
+                    data-testid={message.role === 'admin' ? 'lesson-doubt-admin-reply' : 'lesson-doubt-user-message'}
                     className={cn(
                       'rounded-[14px] px-[14px] py-[12px]',
                       isSelf ? 'ml-auto bg-[#edf7ff]' : 'bg-[#f6f9ff]',
@@ -4565,19 +6113,26 @@ export const CourseFigmaTab = ({
                     <p className={cn(isDesktop ? 'text-[13px]' : 'text-[12px]', 'mt-[6px] leading-[1.55] text-[#5c708d]')}>
                       {message.message}
                     </p>
+                    {renderSupportAttachmentLinks(message.attachments)}
                   </div>
                 );
               })}
             </div>
 
             {lessonDoubtError && (
-              <div className="mt-[12px] rounded-[14px] border border-[#ffd2d2] bg-[#fff6f6] px-[14px] py-[12px] text-[12px] leading-[1.5] text-[#b24141]">
+              <div data-testid="lesson-doubt-error" className="mt-[12px] rounded-[14px] border border-[#ffd2d2] bg-[#fff6f6] px-[14px] py-[12px] text-[12px] leading-[1.5] text-[#b24141]">
                 {lessonDoubtError}
               </div>
             )}
+            {lessonDoubtSuccess && (
+              <div data-testid="lesson-doubt-success-toast" className="mt-[12px] rounded-[14px] border border-[#cdecd8] bg-[#f4fff7] px-[14px] py-[12px] text-[12px] leading-[1.5] text-[#227a42]">
+                {lessonDoubtSuccess}
+              </div>
+            )}
 
-            <div className="mt-[14px] flex items-center gap-[8px] rounded-[14px] border border-[#dbe4f3] bg-[#f9fbff] px-[12px] py-[10px]">
+            <div data-testid="lesson-doubt-panel" className="mt-[14px] flex items-center gap-[8px] rounded-[14px] border border-[#dbe4f3] bg-[#f9fbff] px-[12px] py-[10px]">
               <input
+                data-testid="lesson-doubt-input"
                 type="text"
                 value={draft}
                 onChange={(event) => setLessonDoubtDrafts((current) => ({
@@ -4596,7 +6151,7 @@ export const CourseFigmaTab = ({
               />
               <button
                 type="button"
-                data-testid="course-lesson-doubt-send"
+                data-testid="lesson-doubt-send-button"
                 onClick={() => void submitLessonDoubt()}
                 disabled={!canSend}
                 className="flex h-[34px] w-[34px] items-center justify-center rounded-full bg-[#2d6ee5] text-white disabled:cursor-not-allowed disabled:opacity-50"
@@ -4604,7 +6159,118 @@ export const CourseFigmaTab = ({
                 {sendingLessonDoubt ? <LoaderCircle className="h-[15px] w-[15px] animate-spin" /> : <Send className="h-[15px] w-[15px]" />}
               </button>
             </div>
+            {activeThread?._id && (
+              <div data-testid="lesson-doubt-thread-id" className="sr-only">{activeThread._id}</div>
+            )}
           </>
+        )}
+      </section>
+    );
+  };
+
+  const renderLessonReportSection = (layout: 'desktop' | 'mobile') => {
+    if (!selectedLessonEntry) {
+      return null;
+    }
+
+    const isDesktop = layout === 'desktop';
+    const lessonId = selectedLessonEntry.lesson.id;
+    const draft = lessonReportDrafts[lessonId] || '';
+    const issueType = lessonReportIssueTypes[lessonId] || 'other';
+    const isExpanded = expandedSupportPanel === 'report';
+
+    return (
+      <section
+        data-testid="lesson-report-panel"
+        data-state={isExpanded ? 'expanded' : 'collapsed'}
+        className={cn(
+          'rounded-[18px] border bg-white shadow-[0_12px_24px_rgba(54,78,123,0.05)] transition',
+          isExpanded ? 'border-[#bdd2fb] bg-[#fbfdff]' : 'border-[#dbe4f3]',
+          isDesktop ? 'px-[18px] py-[18px]' : 'px-[14px] py-[14px]',
+        )}
+      >
+        <button
+          type="button"
+          data-testid="lesson-report-open-button"
+          onClick={() => toggleSupportPanel('report')}
+          className="flex w-full items-start justify-between gap-[10px] text-left"
+        >
+          <div className="flex items-start gap-[10px]">
+            <div className="mt-[2px] flex h-[30px] w-[30px] items-center justify-center rounded-[10px] bg-[#fff3ea] text-[#d46b23]">
+              <AlertTriangle className="h-[14px] w-[14px]" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className={cn(isDesktop ? 'text-[16px]' : 'text-[14px]', 'font-semibold text-[#17305c]')}>Report Issue</p>
+              <p className={cn(isDesktop ? 'text-[13px]' : 'text-[12px]', 'mt-[4px] leading-[1.45] text-[#5d7092]')}>
+                Flag playback, audio, lesson, or access issues with a persistent ticket.
+              </p>
+            </div>
+          </div>
+          <span className="rounded-full border border-[#dbe4f3] bg-white px-[12px] py-[6px] text-[11px] font-semibold text-[#d46b23]">
+            {isExpanded ? 'Collapse' : 'Expand'}
+          </span>
+        </button>
+
+        {isExpanded && (
+          <div className="mt-[14px] space-y-[12px]">
+            <select
+              data-testid="lesson-report-issue-type"
+              value={issueType}
+              onChange={(event) => setLessonReportIssueTypes((current) => ({ ...current, [lessonId]: event.target.value as LessonReportIssueType }))}
+              className="h-[44px] w-full rounded-[14px] border border-[#d7e3f2] bg-[#f8fbff] px-[12px] text-[13px] text-[#17233d] outline-none"
+            >
+              {LESSON_REPORT_ISSUE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+            <textarea
+              data-testid="lesson-report-description"
+              value={draft}
+              onChange={(event) => {
+                setLessonReportSuccess(null);
+                setLessonReportDrafts((current) => ({ ...current, [lessonId]: event.target.value }));
+              }}
+              placeholder="Describe the issue in detail..."
+              className="h-[110px] w-full resize-none rounded-[14px] border border-[#d7e3f2] bg-[#f8fbff] px-[12px] py-[10px] text-[13px] leading-5 text-[#17233d] outline-none placeholder:text-[#8ba0bb]"
+            />
+            {lessonReportError && (
+              <div data-testid="lesson-report-error" className="rounded-[14px] border border-[#ffd2d2] bg-[#fff6f6] px-[14px] py-[12px] text-[12px] text-[#b24141]">
+                {lessonReportError}
+              </div>
+            )}
+            {lessonReportSuccess && (
+              <div data-testid="lesson-report-success" className="rounded-[14px] border border-[#cdecd8] bg-[#f4fff7] px-[14px] py-[12px] text-[12px] text-[#227a42]">
+                {lessonReportSuccess}
+              </div>
+            )}
+            <button
+              type="button"
+              data-testid="lesson-report-submit-button"
+              onClick={() => void submitLessonReport()}
+              disabled={!draft.trim() || sendingLessonReport}
+              className="flex h-[42px] w-full items-center justify-center rounded-[14px] bg-[#2f6fe4] text-[13px] font-bold text-white shadow-[0_10px_20px_rgba(47,111,228,0.20)] disabled:cursor-not-allowed disabled:bg-[#b8c6d8]"
+            >
+              {sendingLessonReport ? <LoaderCircle data-testid="lesson-report-loading" className="h-[15px] w-[15px] animate-spin" /> : 'Submit report'}
+            </button>
+            <div data-testid="lesson-report-my-list" className="space-y-[8px]">
+              {activeLessonReports.length === 0 ? (
+                <div className="rounded-[14px] border border-dashed border-[#dbe4f3] bg-[#fbfdff] px-[14px] py-[12px] text-[12px] leading-[1.5] text-[#607394]">
+                  No reports have been submitted for this lesson by this learner yet.
+                </div>
+              ) : activeLessonReports.map((report) => (
+                <div key={report._id} data-testid="lesson-report-row" className="rounded-[14px] border border-[#e7edf7] bg-[#fbfdff] px-[14px] py-[12px]">
+                  <div className="flex items-center justify-between gap-[10px]">
+                    <p data-testid="lesson-report-ticket-id" className="text-[12px] font-semibold text-[#17305c]">{report._id}</p>
+                    <span className="rounded-full bg-white px-[10px] py-[4px] text-[10px] font-semibold uppercase tracking-[0.08em] text-[#d46b23]">{report.status}</span>
+                  </div>
+                <p className="mt-[6px] text-[12px] leading-[1.5] text-[#607394]">{report.description}</p>
+                {report.adminReply && <p className="mt-[6px] text-[12px] font-medium text-[#227a42]">Reply: {report.adminReply}</p>}
+                {renderSupportAttachmentLinks(report.attachments)}
+                {renderSupportAttachmentLinks(report.adminAttachments)}
+              </div>
+            ))}
+          </div>
+          </div>
         )}
       </section>
     );
@@ -4614,11 +6280,12 @@ export const CourseFigmaTab = ({
     <div
       className={cn(
         'grid gap-[14px]',
-        layout === 'desktop' ? 'xl:grid-cols-2' : 'grid-cols-1',
+        layout === 'desktop' ? 'xl:grid-cols-3' : 'grid-cols-1',
       )}
     >
       {renderLessonNotesSection(layout)}
       {renderLessonDoubtsSection(layout)}
+      {renderLessonReportSection(layout)}
     </div>
   );
 
@@ -4694,13 +6361,14 @@ export const CourseFigmaTab = ({
           className={cn('px-[14px] py-[14px]', mobileSupportTab !== 'doubts' && 'hidden')}
         >
           {isAdminViewer && lessonDoubtThreads.length > 0 && (
-            <div className="mb-[12px] space-y-[8px]">
+            <div data-testid="lesson-doubt-thread-list" className="mb-[12px] space-y-[8px]">
               {lessonDoubtThreads.map((threadItem) => {
                 const active = threadItem._id === activeLessonDoubtThread?._id;
                 return (
                   <button
                     key={threadItem._id}
                     type="button"
+                    data-testid="admin-lesson-doubt-row"
                     onClick={() => setSelectedLessonDoubtThreadId(threadItem._id)}
                     className={cn(
                       'w-full rounded-[14px] border px-[12px] py-[10px] text-left',
@@ -4717,15 +6385,15 @@ export const CourseFigmaTab = ({
               })}
             </div>
           )}
-          <div className="max-h-[240px] space-y-[10px] overflow-y-auto pr-[4px]">
+          <div data-testid="lesson-doubt-message-list" className="max-h-[240px] space-y-[10px] overflow-y-auto pr-[4px]">
             {loadingLessonDoubts && !activeLessonDoubtThread && (
-              <div className="flex items-center gap-[8px] rounded-[16px] border border-[#dce7f6] bg-[#f8fbff] px-[12px] py-[12px] text-[13px] leading-6 text-[#607394]">
+              <div data-testid="lesson-doubt-loading" className="flex items-center gap-[8px] rounded-[16px] border border-[#dce7f6] bg-[#f8fbff] px-[12px] py-[12px] text-[13px] leading-6 text-[#607394]">
                 <LoaderCircle className="h-[15px] w-[15px] animate-spin text-[#2f6fe4]" />
                 Loading discussion...
               </div>
             )}
             {!loadingLessonDoubts && thread.length === 0 && (
-              <div className="rounded-[16px] border border-dashed border-[#dce7f6] bg-[#f8fbff] px-[12px] py-[12px] text-[13px] leading-6 text-[#607394]">
+              <div data-testid="lesson-doubt-empty-state" className="rounded-[16px] border border-dashed border-[#dce7f6] bg-[#f8fbff] px-[12px] py-[12px] text-[13px] leading-6 text-[#607394]">
                 {isAdminViewer
                   ? 'No student questions have been posted for this lesson yet.'
                   : 'No doubts have been posted for this lesson yet.'}
@@ -4734,6 +6402,7 @@ export const CourseFigmaTab = ({
             {thread.map((message) => (
               <div
                 key={message._id}
+                data-testid={message.role === 'admin' ? 'lesson-doubt-admin-reply' : 'lesson-doubt-user-message'}
                 className={cn(
                   'rounded-[16px] border px-[12px] py-[12px]',
                   String(message.userId || '') === String(user?._id || '')
@@ -4751,15 +6420,21 @@ export const CourseFigmaTab = ({
           </div>
 
           {lessonDoubtError && (
-            <div className="mt-[12px] rounded-[16px] border border-[#ffd2d2] bg-[#fff6f6] px-[12px] py-[12px] text-[12px] leading-5 text-[#b24141]">
+            <div data-testid="lesson-doubt-error" className="mt-[12px] rounded-[16px] border border-[#ffd2d2] bg-[#fff6f6] px-[12px] py-[12px] text-[12px] leading-5 text-[#b24141]">
               {lessonDoubtError}
             </div>
           )}
+          {lessonDoubtSuccess && (
+            <div data-testid="lesson-doubt-success-toast" className="mt-[12px] rounded-[16px] border border-[#cdecd8] bg-[#f4fff7] px-[12px] py-[12px] text-[12px] leading-5 text-[#227a42]">
+              {lessonDoubtSuccess}
+            </div>
+          )}
 
-          <div className="mt-[12px] rounded-[16px] border border-[#dbe4f3] bg-[#f9fbff] px-[12px] py-[12px]">
+              <div data-testid="lesson-doubt-panel" className="mt-[12px] rounded-[16px] border border-[#dbe4f3] bg-[#f9fbff] px-[12px] py-[12px]">
             <p className="text-[12px] font-semibold text-[#17305c]">{isAdminViewer ? 'Reply in this thread' : 'Ask a quick doubt'}</p>
             <div className="mt-[10px] flex items-center gap-[8px]">
               <input
+                data-testid="lesson-doubt-input"
                 type="text"
                 value={draft}
                 onChange={(event) => setLessonDoubtDrafts((current) => ({
@@ -4778,7 +6453,7 @@ export const CourseFigmaTab = ({
               />
               <button
                 type="button"
-                data-testid="course-lesson-doubt-send"
+                data-testid="lesson-doubt-send-button"
                 onClick={() => void submitLessonDoubt()}
                 disabled={!draft.trim() || sendingLessonDoubt || (isAdminViewer && !activeLessonDoubtThread)}
                 className="flex h-[38px] w-[38px] items-center justify-center rounded-full bg-[#2d6ee5] text-white shadow-[0_8px_18px_rgba(45,110,229,0.24)] disabled:cursor-not-allowed disabled:opacity-50"
@@ -4798,7 +6473,8 @@ export const CourseFigmaTab = ({
         ? mobileLessonStageOverride || 'exam'
         : activeLessonTab === 'Explanation'
           ? mobileLessonStageOverride || 'explanation'
-          : 'watch';
+          : mobileLessonStageOverride
+            || (!isVideoReplayMode && (selectedLessonStoredProgress?.completed || hasCompletedLessonVideo) ? 'completed' : 'watch');
     const actualLessonMedia = renderActualLessonMedia('mobile');
 
     const renderMobileVideoPill = () => (
@@ -4817,38 +6493,43 @@ export const CourseFigmaTab = ({
           Video
         </button>
         <span className="text-[11px] font-medium text-[#6f84ab]">
-          {hasReachedLessonVideoWatchLimit ? 'Video limit reached' : canRewatchLessonVideo ? 'Rewatch available' : 'Ready to watch'}
+          {selectedLessonReplayStatusLabel}
         </span>
       </div>
     );
 
     const renderWatchCard = () => (
-      <section
-        ref={playerViewportRef}
-        data-testid="course-figma-player"
-        className={cn(
-          'relative h-[238px] overflow-hidden rounded-[22px] border border-[#c9d9ee] bg-white shadow-[0_18px_38px_rgba(47,111,228,0.12)]',
-          isFullscreen && 'h-screen w-screen rounded-none border-0 bg-black shadow-none',
-        )}
-      >
-        {actualLessonMedia ? (
-          <div className="h-full w-full bg-black">
-            {actualLessonMedia}
-          </div>
-        ) : (
-          renderLessonMediaUnavailable('mobile')
-        )}
-        <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between px-[18px] pt-[16px]">
-          <div className="max-w-[190px]">
-            <p className="text-[11px] font-extrabold uppercase tracking-[0.16em] text-[#2f6fe4]">Chapter {Math.max(selectedLessonEntry?.sectionIndex || 1, 1)}</p>
-            <p className="!font-sans mt-[8px] line-clamp-2 text-[22px] font-extrabold leading-[1.04] tracking-[-0.025em] text-white drop-shadow-[0_2px_10px_rgba(0,0,0,0.35)]">
-              {selectedLessonEntry?.lesson.title}
-            </p>
-            <p className="mt-[8px] text-[12px] font-medium text-white/78">
-              By <span className="font-bold text-[#7db3ff]">{selectedCourse?.instructor || userName}</span>
-            </p>
-          </div>
-        </div>
+      <div className="space-y-[12px]">
+        <section
+          ref={playerViewportRef}
+          data-testid="course-figma-player"
+          className={cn(
+            'relative h-[238px] overflow-visible rounded-[22px] border border-[#c9d9ee] bg-white shadow-[0_18px_38px_rgba(47,111,228,0.12)]',
+            isFullscreen && 'h-screen w-screen rounded-none border-0 bg-black shadow-none',
+          )}
+        >
+          {actualLessonMedia ? (
+            <div className={cn('h-full w-full overflow-hidden rounded-[inherit] bg-black', isFullscreen && 'rounded-none')}>
+              {actualLessonMedia}
+            </div>
+          ) : (
+            renderLessonMediaUnavailable('mobile')
+          )}
+        </section>
+      </div>
+    );
+
+    const renderMobilePlaybackMeta = () => (
+      <section className="rounded-[16px] border border-[#d7e3f2] bg-white px-[14px] py-[14px] shadow-[0_14px_30px_rgba(47,111,228,0.08)]">
+        <p className="text-[11px] font-bold uppercase tracking-[0.16em] text-[#2f6fe4]">
+          {selectedLessonEntry?.sectionLabel || 'Lesson'}
+        </p>
+        <p className="mt-[6px] text-[18px] font-extrabold leading-[1.18] tracking-[-0.02em] text-[#17233d]">
+          {selectedLessonEntry?.lesson.title || 'Lesson'}
+        </p>
+        <p className="mt-[6px] text-[12px] text-[#53647d]">
+          By {selectedCourse?.instructor || userName}
+        </p>
       </section>
     );
 
@@ -4872,12 +6553,14 @@ export const CourseFigmaTab = ({
         },
         {
           label: 'Chat Replay',
+          testId: 'lesson-doubt-open-button',
           icon: <MessageSquare className="h-[27px] w-[27px]" />,
           tone: 'text-[#5f9cff]',
           onClick: () => openWatchPanel('chat'),
         },
         {
           label: 'Report Issue',
+          testId: 'lesson-report-open-button',
           icon: <AlertTriangle className="h-[28px] w-[28px]" />,
           tone: 'text-[#f47171]',
           onClick: () => openWatchPanel('report'),
@@ -4890,6 +6573,7 @@ export const CourseFigmaTab = ({
             <button
               key={action.label}
               type="button"
+              data-testid={action.testId}
               aria-label={action.label}
               onClick={action.onClick}
               className={cn(
@@ -4916,7 +6600,6 @@ export const CourseFigmaTab = ({
       const isAdminViewer = lessonDoubtViewerRole === 'admin';
       const rating = lessonRatings[lessonId] || 0;
       const reportDraft = lessonReportDrafts[lessonId] || '';
-      const reportSent = Boolean(lessonReportSent[lessonId]);
 
       if (mobileWatchPanel === 'rating') {
         return (
@@ -4950,7 +6633,7 @@ export const CourseFigmaTab = ({
 
       if (mobileWatchPanel === 'chat') {
         return (
-          <section data-testid="course-player-chat-panel" className="rounded-[16px] border border-[#d7e3f2] bg-white px-[14px] py-[14px] shadow-[0_14px_30px_rgba(47,111,228,0.08)]">
+          <section data-testid="lesson-doubt-panel" className="rounded-[16px] border border-[#d7e3f2] bg-white px-[14px] py-[14px] shadow-[0_14px_30px_rgba(47,111,228,0.08)]">
             <div className="flex items-center justify-between gap-[12px]">
               <div>
                 <p className="text-[14px] font-extrabold text-[#17233d]">Chat Replay</p>
@@ -4958,15 +6641,16 @@ export const CourseFigmaTab = ({
               </div>
               <button type="button" onClick={() => setMobileWatchPanel(null)} className="text-[12px] font-semibold text-[#2f6fe4]">Close</button>
             </div>
-            <div className="mt-[12px] max-h-[210px] space-y-[10px] overflow-y-auto pr-[4px]">
+            <div data-testid="lesson-doubt-message-list" className="mt-[12px] max-h-[210px] space-y-[10px] overflow-y-auto pr-[4px]">
               {thread.length === 0 && (
-                <div className="rounded-[14px] border border-dashed border-[#d7e3f2] bg-[#f8fbff] px-[12px] py-[12px] text-[12px] leading-5 text-[#53647d]">
+                <div data-testid="lesson-doubt-empty-state" className="rounded-[14px] border border-dashed border-[#d7e3f2] bg-[#f8fbff] px-[12px] py-[12px] text-[12px] leading-5 text-[#53647d]">
                   No chat replay yet. Ask a lesson question to start this thread.
                 </div>
               )}
               {thread.map((message) => (
                 <div
                   key={message._id}
+                  data-testid={message.role === 'admin' ? 'lesson-doubt-admin-reply' : 'lesson-doubt-user-message'}
                   className={cn(
                     'rounded-[14px] border px-[12px] py-[10px]',
                     String(message.userId || '') === String(user?._id || '')
@@ -4979,11 +6663,13 @@ export const CourseFigmaTab = ({
                     <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[#7b8da6]">{formatLessonDoubtTime(message.createdAt)}</span>
                   </div>
                   <p className="mt-[5px] text-[12px] leading-[1.5] text-[#53647d]">{message.message}</p>
+                  {renderSupportAttachmentLinks(message.attachments)}
                 </div>
               ))}
             </div>
             <div className="mt-[12px] flex items-center gap-[8px] rounded-[14px] border border-[#d7e3f2] bg-[#f8fbff] px-[10px] py-[9px]">
               <input
+                data-testid="lesson-doubt-input"
                 type="text"
                 value={draft}
                 onChange={(event) => setLessonDoubtDrafts((current) => ({ ...current, [activeLessonDoubtDraftKey]: event.target.value }))}
@@ -4999,6 +6685,7 @@ export const CourseFigmaTab = ({
               />
               <button
                 type="button"
+                data-testid="lesson-doubt-send-button"
                 aria-label="Send chat replay message"
                 onClick={() => void submitLessonDoubt()}
                 disabled={!draft.trim() || sendingLessonDoubt || (isAdminViewer && !activeLessonDoubtThread)}
@@ -5012,31 +6699,67 @@ export const CourseFigmaTab = ({
       }
 
       return (
-        <section data-testid="course-player-report-panel" className="rounded-[16px] border border-[#d7e3f2] bg-white px-[14px] py-[14px] shadow-[0_14px_30px_rgba(47,111,228,0.08)]">
+          <section data-testid="lesson-report-panel" className="rounded-[16px] border border-[#d7e3f2] bg-white px-[14px] py-[14px] shadow-[0_14px_30px_rgba(47,111,228,0.08)]">
           <div className="flex items-center justify-between gap-[12px]">
             <div>
               <p className="text-[14px] font-extrabold text-[#17233d]">Report Issue</p>
-              <p className="mt-[3px] text-[12px] text-[#53647d]">{reportSent ? 'Issue noted for review.' : 'Tell us what went wrong.'}</p>
+              <p className="mt-[3px] text-[12px] text-[#53647d]">{lessonReportSuccess ? lessonReportSuccess : 'Tell us what went wrong.'}</p>
             </div>
             <button type="button" onClick={() => setMobileWatchPanel(null)} className="text-[12px] font-semibold text-[#2f6fe4]">Close</button>
           </div>
+          <select
+            data-testid="lesson-report-issue-type"
+            value={lessonReportIssueTypes[lessonId] || 'other'}
+            onChange={(event) => setLessonReportIssueTypes((current) => ({ ...current, [lessonId]: event.target.value as LessonReportIssueType }))}
+            className="mt-[12px] h-[42px] w-full rounded-[14px] border border-[#d7e3f2] bg-[#f8fbff] px-[12px] text-[13px] text-[#17233d] outline-none"
+          >
+            {LESSON_REPORT_ISSUE_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
+            ))}
+          </select>
           <textarea
+            data-testid="lesson-report-description"
             value={reportDraft}
             onChange={(event) => {
-              setLessonReportSent((current) => ({ ...current, [lessonId]: false }));
+              setLessonReportSuccess(null);
               setLessonReportDrafts((current) => ({ ...current, [lessonId]: event.target.value }));
             }}
             placeholder="Video not playing, audio issue, wrong lesson..."
             className="mt-[12px] h-[92px] w-full resize-none rounded-[14px] border border-[#d7e3f2] bg-[#f8fbff] px-[12px] py-[10px] text-[13px] leading-5 text-[#17233d] outline-none placeholder:text-[#8ba0bb] focus:border-[#2f6fe4]"
           />
+          {lessonReportError && (
+            <div data-testid="lesson-report-error" className="mt-[10px] rounded-[12px] border border-[#ffd2d2] bg-[#fff6f6] px-[12px] py-[10px] text-[12px] text-[#b24141]">
+              {lessonReportError}
+            </div>
+          )}
+          {lessonReportSuccess && (
+            <div data-testid="lesson-report-success" className="mt-[10px] rounded-[12px] border border-[#cdecd8] bg-[#f4fff7] px-[12px] py-[10px] text-[12px] text-[#227a42]">
+              {lessonReportSuccess}
+            </div>
+          )}
           <button
             type="button"
-            onClick={() => setLessonReportSent((current) => ({ ...current, [lessonId]: true }))}
+            data-testid="lesson-report-submit-button"
+            onClick={() => void submitLessonReport()}
             disabled={!reportDraft.trim()}
             className="mt-[10px] flex h-[38px] w-full items-center justify-center rounded-[12px] bg-[#2f6fe4] text-[13px] font-bold text-white shadow-[0_10px_20px_rgba(47,111,228,0.20)] disabled:cursor-not-allowed disabled:bg-[#b8c6d8]"
           >
-            {reportSent ? 'Submitted' : 'Submit report'}
+            {sendingLessonReport ? <LoaderCircle data-testid="lesson-report-loading" className="h-[15px] w-[15px] animate-spin" /> : 'Submit report'}
           </button>
+          <div data-testid="lesson-report-my-list" className="mt-[12px] space-y-[8px]">
+            {activeLessonReports.map((report) => (
+              <div key={report._id} data-testid="lesson-report-row" className="rounded-[14px] border border-[#e7edf7] bg-[#fbfdff] px-[12px] py-[10px]">
+                <div className="flex items-center justify-between gap-[10px]">
+                  <p data-testid="lesson-report-ticket-id" className="text-[12px] font-bold text-[#17233d]">{report._id}</p>
+                  <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[#2f6fe4]">{report.status}</span>
+                </div>
+                <p className="mt-[4px] text-[11px] text-[#607394]">{report.description}</p>
+                {report.adminReply && <p className="mt-[4px] text-[11px] font-medium text-[#227a42]">Reply: {report.adminReply}</p>}
+                {renderSupportAttachmentLinks(report.attachments)}
+                {renderSupportAttachmentLinks(report.adminAttachments)}
+              </div>
+            ))}
+          </div>
         </section>
       );
     };
@@ -5149,9 +6872,7 @@ export const CourseFigmaTab = ({
               <div className="rounded-[16px] border border-[#e3ebf6] bg-white px-[14px] py-[14px]">
                 <p className="text-[12px] font-semibold text-[#17305c]">Lesson Replay</p>
                 <p className="mt-[4px] text-[11px] leading-[1.42] text-[#5d7092]">
-                  {hasReachedLessonVideoWatchLimit
-                    ? 'Maximum lesson video rewatch limit reached.'
-                    : `${selectedLessonVideoWatchCount}/${selectedLessonVideoWatchLimit} watches used. Replay remains available until the limit is reached.`}
+                  {selectedLessonReplayHelpText}
                 </p>
                 {canRewatchLessonVideo ? (
                   <button
@@ -5221,31 +6942,52 @@ export const CourseFigmaTab = ({
               <div className="min-w-0 flex-1">
                 <p className="text-[13px] font-semibold text-[#17305c]">What&apos;s Next?</p>
                 <p className="mt-[4px] text-[12px] leading-[1.4] text-[#5d7092]">
-                  Take a CBT (Chapter Based Test) to test your understanding.
+                  {selectedLessonHasCbt
+                    ? 'Take a CBT (Chapter Based Test) to test your understanding.'
+                    : nextLessonEntry
+                      ? `Open ${nextLessonEntry.lesson.title} when you are ready to continue.`
+                      : 'Return to the lesson list and continue with any released lesson.'}
                 </p>
               </div>
             </div>
-            <button
-              type="button"
-              data-testid="course-player-start-cbt"
-              onClick={startLessonExam}
-              className="mt-[14px] inline-flex h-[40px] w-full items-center justify-center rounded-[8px] bg-[linear-gradient(180deg,#2f6ef0_0%,#2660e3_100%)] text-[13px] font-semibold text-white shadow-[0_12px_24px_rgba(45,110,229,0.2)]"
-            >
-              Start CBT Exam
-            </button>
-            <div className="mt-[10px] flex items-center justify-center gap-[6px] text-[11px] text-[#6f84ab]">
-              <span>One Attempt Only</span>
-              <Clock3 className="h-[12px] w-[12px]" />
-            </div>
+            {selectedLessonHasCbt ? (
+              <>
+                <button
+                  type="button"
+                  data-testid="course-player-start-cbt"
+                  onClick={startLessonExam}
+                  className="mt-[14px] inline-flex h-[40px] w-full items-center justify-center rounded-[8px] bg-[linear-gradient(180deg,#2f6ef0_0%,#2660e3_100%)] text-[13px] font-semibold text-white shadow-[0_12px_24px_rgba(45,110,229,0.2)]"
+                >
+                  Start CBT Exam
+                </button>
+                <div className="mt-[10px] flex items-center justify-center gap-[6px] text-[11px] text-[#6f84ab]">
+                  <span>One Attempt Only</span>
+                  <Clock3 className="h-[12px] w-[12px]" />
+                </div>
+              </>
+            ) : (
+              <button
+                type="button"
+                data-testid="course-player-continue-next-lesson"
+                onClick={() => {
+                  if (nextLessonEntry) {
+                    openNextLesson(true);
+                    return;
+                  }
+                  setScreen('course');
+                }}
+                className="mt-[14px] inline-flex h-[40px] w-full items-center justify-center rounded-[8px] bg-[linear-gradient(180deg,#2f6ef0_0%,#2660e3_100%)] text-[13px] font-semibold text-white shadow-[0_12px_24px_rgba(45,110,229,0.2)]"
+              >
+                {nextLessonEntry ? 'Open Next Lesson' : 'Back to Lessons'}
+              </button>
+            )}
 
             <div className="mt-[12px] border-t border-[#e6edf8] pt-[12px]">
               <div className="flex items-start justify-between gap-[10px]">
                 <div className="min-w-0">
                   <p className="text-[12px] font-semibold text-[#17305c]">Lesson Replay</p>
                   <p className="mt-[4px] text-[11px] leading-[1.42] text-[#5d7092]">
-                    {hasReachedLessonVideoWatchLimit
-                      ? 'Maximum lesson video rewatch limit reached.'
-                      : `${selectedLessonVideoWatchCount}/${selectedLessonVideoWatchLimit} watches used. Replay remains available until the limit is reached.`}
+                    {selectedLessonReplayHelpText}
                   </p>
                 </div>
                 {canRewatchLessonVideo ? (
@@ -5550,7 +7292,8 @@ export const CourseFigmaTab = ({
       return (
         <div className="space-y-[24px]">
           {renderWatchCard()}
-
+          {renderMobilePlaybackMeta()}
+          {renderLessonPdfPanel('mobile')}
           {renderWatchActionRow()}
           {renderWatchPanel()}
           {renderWatchUpNext()}
@@ -5649,7 +7392,7 @@ export const CourseFigmaTab = ({
                   {activeLessonTab === 'Video' && <span className="absolute bottom-0 left-[10px] right-[10px] h-[3px] rounded-full bg-[#3c83ef]" />}
                 </button>
                 <span className="text-[13px] text-[#6d7c93]">
-                  {hasReachedLessonVideoWatchLimit ? 'Video limit reached' : canRewatchLessonVideo ? 'Rewatch available' : 'Video lesson'}
+                  {selectedLessonReplayStatusLabel}
                 </span>
               </div>
 
@@ -5704,8 +7447,8 @@ export const CourseFigmaTab = ({
             </div>
             <div className="mt-[14px] grid grid-cols-2 gap-y-[8px] text-[14px] text-[#5d7092]">
               <span data-testid="course-progress-lessons-completed">{selectedCourseVideoCompletedDisplayCount} Lessons Completed</span>
-              <span>{selectedCourseExamAttempts} CBT Done</span>
-              <span>{Math.max(selectedCourseEntries.length - selectedCourseExamAttempts, 0)} CBT Left</span>
+              {selectedCourseCbtEligibleCount > 0 ? <span>{selectedCourseExamAttempts} CBT Done</span> : <span>Video only</span>}
+              {selectedCourseCbtEligibleCount > 0 ? <span>{Math.max(selectedCourseCbtEligibleCount - selectedCourseExamAttempts, 0)} CBT Left</span> : <span>No CBT linked</span>}
               <span className="text-[#7a90b7]">{selectedCourseSnapshot.totalLessons} Total</span>
             </div>
           </section>
@@ -5878,6 +7621,54 @@ export const CourseFigmaTab = ({
         {screen === 'course' && selectedCourse && renderCourseView()}
         {screen === 'lesson' && selectedCourse && selectedLessonEntry && renderLessonView()}
       </div>
+      {(activePdfAttachment || pdfViewerError) && (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-[#06111fcc] px-0 py-0 sm:px-4 sm:py-6">
+          <div className="flex h-[100dvh] max-h-[100dvh] w-full max-w-6xl flex-col overflow-hidden rounded-none bg-white shadow-[0_28px_80px_rgba(0,0,0,0.32)] sm:h-full sm:max-h-[92vh] sm:rounded-[28px]">
+            <div className="flex items-center justify-between gap-4 border-b border-[#e7edf5] px-5 py-4">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-[#8a9ab0]">Protected PDF Viewer</p>
+                <p className="mt-1 text-lg font-semibold text-[#172033]">{activePdfAttachment?.title || 'PDF viewer'}</p>
+              </div>
+              <button
+                type="button"
+                onClick={closePdfViewer}
+                className="inline-flex items-center gap-2 rounded-full border border-[#d7e5f1] px-4 py-2 text-sm font-semibold text-[#172033]"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="flex items-center justify-between gap-3 border-b border-[#eef3f8] bg-[#f8fbff] px-5 py-3 text-sm text-[#607089]">
+              <p>Read inside the app only. No visible download or share actions are shown here.</p>
+              <p className="hidden sm:block">Protected inline viewer</p>
+            </div>
+
+            <div
+              className="relative min-h-0 flex-1 select-none bg-[#dfe8f3]"
+              onContextMenu={(event) => event.preventDefault()}
+            >
+              {pdfViewerError ? (
+                <div className="flex h-full items-center justify-center px-6 text-center">
+                  <div>
+                    <p className="text-lg font-semibold text-[#172033]">PDF could not be opened</p>
+                    <p className="mt-2 text-sm leading-6 text-[#607089]">{pdfViewerError}</p>
+                  </div>
+                </div>
+              ) : activePdfRequest ? (
+                <ProtectedPdfReader
+                  sourceUrl={activePdfRequest.url}
+                  requestHeaders={activePdfRequest.headers}
+                  title={activePdfAttachment?.title || 'Protected PDF'}
+                />
+              ) : (
+                <div className="flex h-full items-center justify-center">
+                  <LoaderCircle className="h-8 w-8 animate-spin text-[#4b76b3]" />
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

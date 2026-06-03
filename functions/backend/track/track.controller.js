@@ -119,8 +119,50 @@ const trackHeartbeat = asyncHandler(async (req, res) => {
   });
 });
 
+const trackSuspiciousActivity = asyncHandler(async (req, res) => {
+  const userId = req.user?.id || null;
+  if (!userId) {
+    throw new ApiError(401, 'Authorization token required', { code: 'AUTH_REQUIRED' });
+  }
+
+  const eventName = requireString(req.body?.eventName || req.body?.reason, 'eventName', { maxLength: 80 });
+  const courseId = optionalString(req.body?.courseId || '', '', { maxLength: 120 }) || null;
+  const lessonId = optionalString(req.body?.lessonId || '', '', { maxLength: 120 }) || null;
+  const videoId = optionalString(req.body?.videoId || '', '', { maxLength: 120 }) || null;
+  const videoType = optionalString(req.body?.videoType || '', '', { maxLength: 64 }) || null;
+  const playbackSessionId = optionalString(req.body?.playbackSessionId || '', '', { maxLength: 160 }) || null;
+  const source = optionalString(req.body?.source || 'browser-content-protection', '', { maxLength: 80 });
+  const timestamp = optionalString(req.body?.timestamp || '', '', { maxLength: 64 }) || null;
+  const requestContext = buildSecurePlaybackClientContext(req);
+
+  console.warn(`[protected-content-suspicious] ${JSON.stringify({
+    request_id: req.requestId || null,
+    user_id: userId,
+    auth_session_id: req.user?.session || null,
+    device_id: requestContext.deviceId || null,
+    browser_tab_id: requestContext.playbackTabId || null,
+    event_name: eventName,
+    source,
+    course_id: courseId,
+    lesson_id: lessonId,
+    video_id: videoId,
+    video_type: videoType,
+    playback_session_id: playbackSessionId,
+    timestamp,
+    platform: requestContext.platform || null,
+    browser: requestContext.browser || null,
+    ip_address: requestContext.ipAddress || null,
+  })}`);
+
+  return ok(res, {
+    message: 'Suspicious protected-content event logged',
+    accepted: true,
+  });
+});
+
 module.exports = {
   trackHeartbeat,
+  trackSuspiciousActivity,
   ACTIVE_TRACK_SET,
   HEARTBEAT_TTL_SECONDS,
 };

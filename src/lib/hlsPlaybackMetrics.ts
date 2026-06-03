@@ -1,11 +1,16 @@
-import Hls from 'hls.js';
+import type { HlsRuntimeEvents, HlsRuntimeInstance, HlsRuntimeLevel } from './hlsRuntime';
+import type { RecordedVideoDeliveryPath } from './recordedVideoDelivery';
 
 type HlsPlaybackMetricOptions = {
   video: HTMLVideoElement;
-  hls?: Hls | null;
+  hls?: HlsRuntimeInstance | null;
+  events?: HlsRuntimeEvents | null;
   src: string;
   title: string;
   trackVideoId?: string | null;
+  streamFormat?: string | null;
+  deliveryProfile?: string | null;
+  deliveryPath?: RecordedVideoDeliveryPath | null;
 };
 
 const getConnectionStrength = () => {
@@ -28,9 +33,13 @@ const getConnectionStrength = () => {
 export const wireHlsPlaybackMetrics = ({
   video,
   hls,
+  events = null,
   src,
   title,
   trackVideoId = null,
+  streamFormat = null,
+  deliveryProfile = null,
+  deliveryPath = null,
 }: HlsPlaybackMetricOptions) => {
   let startupStartedAt = performance.now();
   let startupReported = false;
@@ -53,6 +62,9 @@ export const wireHlsPlaybackMetrics = ({
         durationSeconds: Math.max(Number(video.duration || 0), 0),
         totalBufferMs,
         connectionStrength: getConnectionStrength(),
+        streamFormat,
+        deliveryProfile,
+        deliveryPath,
         usedJSHeapSize: performanceWithMemory.memory?.usedJSHeapSize || null,
         totalJSHeapSize: performanceWithMemory.memory?.totalJSHeapSize || null,
         jsHeapSizeLimit: performanceWithMemory.memory?.jsHeapSizeLimit || null,
@@ -109,7 +121,7 @@ export const wireHlsPlaybackMetrics = ({
   video.addEventListener('ended', handleEnded);
   video.addEventListener('error', handleError);
 
-  const handleManifestParsed = (_event: string, data: { levels?: Array<{ height?: number; bitrate?: number }> }) => {
+  const handleManifestParsed = (_event: string, data: { levels?: HlsRuntimeLevel[] }) => {
     startupStartedAt = performance.now();
     emit('manifest_parsed', {
       levelCount: data.levels?.length || 0,
@@ -129,7 +141,21 @@ export const wireHlsPlaybackMetrics = ({
     });
   };
 
-  const handleFragLoaded = (_event: string, data: any) => {
+  const handleFragLoaded = (_event: string, data: {
+    frag?: {
+      url?: string;
+      level?: number;
+      duration?: number;
+      stats?: {
+        loaded?: number;
+        loading?: { start?: number; end?: number };
+      };
+    };
+    stats?: {
+      loaded?: number;
+      loading?: { start?: number; end?: number };
+    };
+  }) => {
     const stats = data.frag?.stats || data.stats;
     const loading = stats?.loading;
     const start = Number(loading?.start || 0);
@@ -151,10 +177,12 @@ export const wireHlsPlaybackMetrics = ({
     });
   };
 
-  hls?.on(Hls.Events.MANIFEST_PARSED, handleManifestParsed);
-  hls?.on(Hls.Events.LEVEL_SWITCHED, handleLevelSwitched);
-  hls?.on(Hls.Events.FRAG_LOADED, handleFragLoaded);
-  hls?.on(Hls.Events.ERROR, handleHlsError);
+  if (hls && events) {
+    hls.on(events.MANIFEST_PARSED, handleManifestParsed);
+    hls.on(events.LEVEL_SWITCHED, handleLevelSwitched);
+    hls.on(events.FRAG_LOADED, handleFragLoaded);
+    hls.on(events.ERROR, handleHlsError);
+  }
 
   const handleQaLevelChange = (event: Event) => {
     if (!hls) {
@@ -185,10 +213,12 @@ export const wireHlsPlaybackMetrics = ({
     video.removeEventListener('pause', handlePause);
     video.removeEventListener('ended', handleEnded);
     video.removeEventListener('error', handleError);
-    hls?.off(Hls.Events.MANIFEST_PARSED, handleManifestParsed);
-    hls?.off(Hls.Events.LEVEL_SWITCHED, handleLevelSwitched);
-    hls?.off(Hls.Events.FRAG_LOADED, handleFragLoaded);
-    hls?.off(Hls.Events.ERROR, handleHlsError);
+    if (hls && events) {
+      hls.off(events.MANIFEST_PARSED, handleManifestParsed);
+      hls.off(events.LEVEL_SWITCHED, handleLevelSwitched);
+      hls.off(events.FRAG_LOADED, handleFragLoaded);
+      hls.off(events.ERROR, handleHlsError);
+    }
     window.removeEventListener('edumaster:hls-set-level', handleQaLevelChange);
   };
 };

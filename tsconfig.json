@@ -29,6 +29,7 @@
     "dist",
     "build",
     "qa-automation",
+    "tmp",
     "uploads",
     "private_uploads",
     "backend/private_uploads",

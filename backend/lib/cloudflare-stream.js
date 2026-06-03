@@ -97,6 +97,15 @@ const buildCloudflareStreamPlaybackUrls = (uid, playback = {}) => {
   };
 };
 
+const buildCloudflareStreamAssetBaseUrl = (identifier) => {
+  const id = String(identifier || '').trim();
+  const customerCode = String(appConfig.cloudflareStreamCustomerCode || '').trim();
+  if (!id || !customerCode) {
+    return null;
+  }
+  return `https://customer-${customerCode}.cloudflarestream.com/${encodeURIComponent(id)}`;
+};
+
 const normalizeStreamState = (video = {}) => {
   const status = video.status || {};
   const state = String(status.state || video.state || '').toLowerCase();
@@ -234,6 +243,132 @@ const getVideoDetails = async (uid) => {
     },
   });
   return parseCloudflareResponse(response);
+};
+
+const listVideoDownloads = async (uid) => {
+  assertCloudflareStreamConfigured();
+  const response = await fetch(streamApiUrl(`/${encodeURIComponent(uid)}/downloads`), {
+    headers: {
+      Authorization: `Bearer ${appConfig.cloudflareStreamApiToken}`,
+    },
+  });
+  return parseCloudflareResponse(response);
+};
+
+const createVideoDownloads = async (uid) => {
+  assertCloudflareStreamConfigured();
+  const response = await fetch(streamApiUrl(`/${encodeURIComponent(uid)}/downloads`), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${appConfig.cloudflareStreamApiToken}`,
+    },
+  });
+  return parseCloudflareResponse(response);
+};
+
+const createSignedDownloadToken = async (uid, options = {}) => {
+  assertCloudflareStreamConfigured();
+  const exp = Number(options.exp || 0);
+  const nbf = Number(options.nbf || 0);
+  const body = {
+    downloadable: true,
+    ...(exp > 0 ? { exp } : {}),
+    ...(nbf > 0 ? { nbf } : {}),
+    ...(options.original === true ? { flags: { original: true } } : {}),
+  };
+  const response = await fetch(streamApiUrl(`/${encodeURIComponent(uid)}/token`), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${appConfig.cloudflareStreamApiToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  return parseCloudflareResponse(response);
+};
+
+const extractDownloadUrl = (downloadsPayload, type = 'default') => {
+  const desired = String(type || 'default').trim().toLowerCase();
+  if (!downloadsPayload) {
+    return null;
+  }
+
+  const direct = downloadsPayload?.[desired];
+  if (direct && typeof direct === 'object') {
+    return String(direct.url || direct.downloadUrl || '').trim() || null;
+  }
+
+  if (Array.isArray(downloadsPayload?.downloads)) {
+    const match = downloadsPayload.downloads.find((entry) => String(entry?.type || entry?.name || '').trim().toLowerCase() === desired)
+      || downloadsPayload.downloads[0];
+    if (match) {
+      return String(match.url || match.downloadUrl || '').trim() || null;
+    }
+  }
+
+  if (typeof downloadsPayload?.url === 'string') {
+    return String(downloadsPayload.url).trim() || null;
+  }
+
+  return null;
+};
+
+const applySignedTokenToDownloadUrl = (downloadUrl, uid, token) => {
+  const resolvedUrl = String(downloadUrl || '').trim();
+  const resolvedUid = String(uid || '').trim();
+  const resolvedToken = String(token || '').trim();
+  if (!resolvedUrl || !resolvedUid || !resolvedToken) {
+    return resolvedUrl || null;
+  }
+
+  try {
+    const parsed = new URL(resolvedUrl);
+    const segments = parsed.pathname.split('/').filter(Boolean);
+    if (segments.length > 0 && segments[0] === resolvedUid) {
+      segments[0] = resolvedToken;
+      parsed.pathname = `/${segments.join('/')}`;
+      return parsed.toString();
+    }
+  } catch {
+    // Fall through to a string replace fallback.
+  }
+
+  return resolvedUrl.replace(`/${encodeURIComponent(resolvedUid)}/`, `/${encodeURIComponent(resolvedToken)}/`);
+};
+
+const resolveVideoDownloadUrl = async (uid, options = {}) => {
+  const type = String(options.type || 'default').trim().toLowerCase() || 'default';
+  let downloads = await listVideoDownloads(uid).catch(() => null);
+  let downloadUrl = extractDownloadUrl(downloads, type);
+
+  if (!downloadUrl) {
+    downloads = await createVideoDownloads(uid);
+    downloadUrl = extractDownloadUrl(downloads, type);
+  }
+
+  if (!downloadUrl) {
+    const baseUrl = buildCloudflareStreamAssetBaseUrl(uid);
+    if (baseUrl) {
+      downloadUrl = `${baseUrl}/downloads/${encodeURIComponent(type)}.mp4`;
+    }
+  }
+
+  if (!downloadUrl) {
+    throw new Error(`Cloudflare Stream did not return a downloadable ${type} MP4 URL for ${uid}.`);
+  }
+
+  if (appConfig.cloudflareStreamSignedPlaybackRequired) {
+    const tokenResult = await createSignedDownloadToken(uid, {
+      exp: Math.floor(Date.now() / 1000) + Math.max(Number(options.tokenTtlSeconds || 3600), 300),
+    });
+    const token = String(tokenResult?.token || '').trim();
+    if (!token) {
+      throw new Error(`Cloudflare Stream did not return a signed download token for ${uid}.`);
+    }
+    downloadUrl = applySignedTokenToDownloadUrl(downloadUrl, uid, token);
+  }
+
+  return downloadUrl;
 };
 
 const deleteCloudflareStreamVideo = async (uid) => {
@@ -444,6 +579,10 @@ module.exports = {
   isCloudflareStreamEnabled,
   createDirectUpload,
   createTusUpload,
+  listVideoDownloads,
+  createVideoDownloads,
+  createSignedDownloadToken,
+  resolveVideoDownloadUrl,
   normalizeStreamState,
   syncCloudflareStreamVideoStatus,
   scheduleCloudflareStreamStatusPolling,

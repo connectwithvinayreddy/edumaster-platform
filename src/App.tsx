@@ -1,5 +1,7 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
+import { Capacitor } from '@capacitor/core';
 import {
+  Activity,
   AlertTriangle,
   ArrowRight,
   BellRing,
@@ -50,29 +52,11 @@ import {
   X,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
-import {
-  CartesianGrid,
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from 'recharts';
 import { useAuth } from './AuthContext';
 import { appleProvider, auth as firebaseAuth, googleProvider } from './firebase';
 import { BrandLogo } from './components/BrandLogo';
-import { CourseFigmaTab } from './components/CourseFigmaTab';
-import { OverviewFigmaTab } from './components/OverviewFigmaTab';
-import { TestSeriesFigmaTab } from './components/TestSeriesFigmaTab';
-import { LiveClassesFigmaTab } from './components/LiveClassesFigmaTab';
 import { ApiRequestError, EduService } from './EduService';
-import { AdminCourseManager } from './components/AdminCourseManager';
-import { AdminModuleManager } from './components/AdminModuleManager';
-import { AdminVideoUpload } from './components/AdminVideoUpload';
-import { AdminMockTestVideoUpload } from './components/AdminMockTestVideoUpload';
-import Hls from 'hls.js';
-import { signInWithPopup } from 'firebase/auth';
+import { getRedirectResult, signInWithPopup, signInWithRedirect } from 'firebase/auth';
 import {
   AiResponse,
   MockTest,
@@ -85,6 +69,7 @@ import {
   TestAttemptResult,
 } from './types';
 import { cn } from './lib/utils';
+import { LIVE_CLASSES_ENABLED } from './lib/featureFlags';
 
 type TabKey = 'overview' | 'courses' | 'live' | 'tests' | 'revision' | 'analytics' | 'admin';
 
@@ -100,7 +85,50 @@ const tabs: { id: TabKey; label: string; icon: React.ComponentType<{ className?:
   { id: 'admin', label: 'Admin', icon: ShieldCheck },
 ];
 
+const LazyTestSeriesFigmaTab = lazy(() =>
+  import('./components/TestSeriesFigmaTab').then((module) => ({ default: module.TestSeriesFigmaTab })),
+);
+const LazyCourseFigmaTab = lazy(() =>
+  import('./components/CourseFigmaTab').then((module) => ({ default: module.CourseFigmaTab })),
+);
+const LazyOverviewFigmaTab = lazy(() =>
+  import('./components/OverviewFigmaTab').then((module) => ({ default: module.OverviewFigmaTab })),
+);
+const LazyLiveClassesFigmaTab = lazy(() =>
+  import('./components/LiveClassesFigmaTab').then((module) => ({ default: module.LiveClassesFigmaTab })),
+);
+const LazyAdminCourseManager = lazy(() =>
+  import('./components/AdminCourseManager').then((module) => ({ default: module.AdminCourseManager })),
+);
+const LazyAdminModuleManager = lazy(() =>
+  import('./components/AdminModuleManager').then((module) => ({ default: module.AdminModuleManager })),
+);
+const LazyAdminPdfUpload = lazy(() =>
+  import('./components/AdminPdfUpload').then((module) => ({ default: module.AdminPdfUpload })),
+);
+const LazyAdminVideoUpload = lazy(() =>
+  import('./components/AdminVideoUpload').then((module) => ({ default: module.AdminVideoUpload })),
+);
+const LazyAdminEditorialVideoUpload = lazy(() =>
+  import('./components/AdminEditorialVideoUpload').then((module) => ({ default: module.AdminEditorialVideoUpload })),
+);
+const LazyAdminMockTestVideoUpload = lazy(() =>
+  import('./components/AdminMockTestVideoUpload').then((module) => ({ default: module.AdminMockTestVideoUpload })),
+);
+const LazyAdminPaymentControlCenter = lazy(() =>
+  import('./components/AdminPaymentControlCenter').then((module) => ({ default: module.AdminPaymentControlCenter })),
+);
+const LazyAdminSupportCenter = lazy(() =>
+  import('./components/AdminSupportCenter').then((module) => ({ default: module.AdminSupportCenter })),
+);
+const LazyAnalyticsTrendChart = lazy(() =>
+  import('./components/AnalyticsTrendChart').then((module) => ({ default: module.AnalyticsTrendChart })),
+);
+
 const mobilePrimaryTabIds: TabKey[] = ['overview', 'courses', 'live', 'tests'];
+const enabledMobilePrimaryTabIds = LIVE_CLASSES_ENABLED
+  ? mobilePrimaryTabIds
+  : mobilePrimaryTabIds.filter((tabId) => tabId !== 'live');
 
 const shellTabMeta: Record<TabKey, { eyebrow: string; title: string; description: string }> = {
   overview: {
@@ -167,8 +195,141 @@ const formatPlaybackTime = (seconds: number) => {
   return `${String(minutes).padStart(2, '0')}:${String(remainingSeconds).padStart(2, '0')}`;
 };
 
+const formatDeviceLabel = (value: unknown) => {
+  if (value && typeof value === 'object') {
+    const device = value as Record<string, unknown>;
+    const parts = [
+      typeof device.app === 'string' ? device.app : '',
+      typeof device.browser === 'string' ? device.browser : '',
+      typeof device.platform === 'string' ? device.platform : '',
+      typeof device.id === 'string' ? device.id : '',
+    ].filter(Boolean);
+    const objectLabel = parts.join(' • ');
+    if (objectLabel) {
+      return objectLabel;
+    }
+  }
+
+  const label = String(value || '').trim();
+  const normalized = label.toLowerCase();
+  if (!label) {
+    return 'Web Browser';
+  }
+  if (
+    normalized.includes('chrome')
+    || normalized.includes('safari')
+    || normalized.includes('firefox')
+    || normalized.includes('browser')
+  ) {
+    return 'Web Browser';
+  }
+  if (label.length > 22) {
+    return `${label.slice(0, 22)}...`;
+  }
+  return label;
+};
+
+const DeferredPanelFallback = ({
+  label,
+  minHeightClass = 'min-h-[220px]',
+}: {
+  label: string;
+  minHeightClass?: string;
+}) => (
+  <div
+    aria-busy="true"
+    className={cn(
+      'flex items-center justify-center gap-3 rounded-[24px] border border-[var(--line)] bg-white/92 px-5 py-8 text-sm font-medium text-[var(--ink-soft)] shadow-[0_12px_30px_rgba(15,23,42,0.05)]',
+      minHeightClass,
+    )}
+  >
+    <LoaderCircle className="h-5 w-5 animate-spin text-[var(--accent-rust)]" />
+    <span>Loading {label}...</span>
+  </div>
+);
+
 const CBT_BRAND_NAME = 'VaronEnglish';
 const LIVE_FONT_STACK = 'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+const SOCIAL_REDIRECT_PROVIDER_KEY = 'edumaster.social.redirect.provider';
+const ADMIN_SECTION_STORAGE_KEY = 'edumaster.admin.active-section';
+const BROWSER_ALERTS_ENABLED_STORAGE_KEY = 'edumaster.browser-alerts.enabled';
+const NOTIFICATION_SERVICE_WORKER_PATH = '/notification-sw.js';
+type BrowserAlertPermissionState = NotificationPermission | 'unsupported';
+
+const getStoredBooleanPreference = (key: string, fallback = false) => {
+  if (typeof window === 'undefined') {
+    return fallback;
+  }
+
+  const raw = window.localStorage.getItem(key);
+  if (raw === null) {
+    return fallback;
+  }
+
+  return raw === 'true';
+};
+
+const setStoredBooleanPreference = (key: string, value: boolean) => {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  window.localStorage.setItem(key, value ? 'true' : 'false');
+};
+
+const getBrowserAlertPermissionState = (): BrowserAlertPermissionState => {
+  if (typeof window === 'undefined' || !('Notification' in window)) {
+    return 'unsupported';
+  }
+
+  return Notification.permission;
+};
+
+const resolveNotificationTargetUrl = (notification: NotificationItem) => {
+  if (notification.actionUrl) {
+    return notification.actionUrl;
+  }
+
+  if (typeof window === 'undefined') {
+    return null;
+  }
+
+  return `${window.location.origin}/?tab=overview`;
+};
+
+const playNotificationChime = async (audioContextRef: React.MutableRefObject<AudioContext | null>) => {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  const AudioContextCtor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioContextCtor) {
+    return;
+  }
+
+  if (!audioContextRef.current) {
+    audioContextRef.current = new AudioContextCtor();
+  }
+
+  const audioContext = audioContextRef.current;
+  if (audioContext.state === 'suspended') {
+    await audioContext.resume();
+  }
+
+  const oscillator = audioContext.createOscillator();
+  const gainNode = audioContext.createGain();
+  oscillator.type = 'sine';
+  oscillator.frequency.setValueAtTime(880, audioContext.currentTime);
+  oscillator.frequency.exponentialRampToValueAtTime(660, audioContext.currentTime + 0.18);
+  gainNode.gain.setValueAtTime(0.0001, audioContext.currentTime);
+  gainNode.gain.exponentialRampToValueAtTime(0.08, audioContext.currentTime + 0.02);
+  gainNode.gain.exponentialRampToValueAtTime(0.0001, audioContext.currentTime + 0.22);
+  oscillator.connect(gainNode);
+  gainNode.connect(audioContext.destination);
+  oscillator.start();
+  oscillator.stop(audioContext.currentTime + 0.24);
+};
+
 const getInitials = (value: string) =>
   value
     .split(' ')
@@ -336,6 +497,8 @@ type NotificationNavigationTarget = {
   courseId?: string | null;
   lessonId?: string | null;
   doubtThreadId?: string | null;
+  reportId?: string | null;
+  supportPanel?: 'doubts' | 'report' | null;
 };
 
 type RevisionDayPlan = {
@@ -401,6 +564,8 @@ const getNotificationNavigationTarget = (notification: NotificationItem): Notifi
   const courseId = readStringPayload(payload, 'courseId') || null;
   const lessonId = readStringPayload(payload, 'lessonId') || null;
   const doubtThreadId = readStringPayload(payload, 'doubtThreadId') || null;
+  const reportId = readStringPayload(payload, 'reportId') || null;
+  const supportPanel = readStringPayload(payload, 'supportPanel') as 'doubts' | 'report' | null;
 
   if (payloadTab && payloadTab in shellTabMeta) {
     return {
@@ -409,6 +574,8 @@ const getNotificationNavigationTarget = (notification: NotificationItem): Notifi
       courseId,
       lessonId,
       doubtThreadId,
+      reportId,
+      supportPanel,
     };
   }
 
@@ -424,6 +591,8 @@ const getNotificationNavigationTarget = (notification: NotificationItem): Notifi
           courseId: parsedUrl.searchParams.get('courseId') || courseId,
           lessonId: parsedUrl.searchParams.get('lessonId') || lessonId,
           doubtThreadId: parsedUrl.searchParams.get('doubtThreadId') || doubtThreadId,
+          reportId: parsedUrl.searchParams.get('reportId') || reportId,
+          supportPanel: (parsedUrl.searchParams.get('supportPanel') as 'doubts' | 'report' | null) || supportPanel,
         };
       }
     } catch {
@@ -435,7 +604,7 @@ const getNotificationNavigationTarget = (notification: NotificationItem): Notifi
     return { tab: 'live', liveClassId };
   }
   if (courseId || String(notification.type || '').includes('course')) {
-    return { tab: 'courses', courseId, lessonId, doubtThreadId };
+    return { tab: 'courses', courseId, lessonId, doubtThreadId, reportId, supportPanel };
   }
   if (String(notification.type || '').includes('test')) {
     return { tab: 'tests' };
@@ -658,11 +827,27 @@ const MobileNotificationSheet = ({
   notifications,
   onClose,
   onOpen,
+  onMarkAllRead,
+  browserAlertsSupported,
+  browserAlertsEnabled,
+  notificationPermission,
+  notificationPermissionBusy,
+  onEnableBrowserAlerts,
+  onDisableBrowserAlerts,
+  onTestBrowserAlert,
 }: {
   open: boolean;
   notifications: NotificationItem[];
   onClose: () => void;
   onOpen: (notification: NotificationItem) => void;
+  onMarkAllRead: () => void;
+  browserAlertsSupported: boolean;
+  browserAlertsEnabled: boolean;
+  notificationPermission: BrowserAlertPermissionState;
+  notificationPermissionBusy: boolean;
+  onEnableBrowserAlerts: () => void;
+  onDisableBrowserAlerts: () => void;
+  onTestBrowserAlert: () => void;
 }) => (
   <AnimatePresence>
     {open && (
@@ -689,17 +874,74 @@ const MobileNotificationSheet = ({
 	              <p className="text-[16px] font-bold text-[#17233f]">Notifications</p>
 	              <p className="mt-1 text-[12px] text-[#687a99]">{notifications.length ? `${notifications.length} updates` : 'No updates right now'}</p>
 	            </div>
+            <div className="flex items-center gap-2">
+              <button type="button" data-testid="notifications-read-all" onClick={onMarkAllRead} className="rounded-full border border-[#dbe6f6] bg-white px-3 py-2 text-[11px] font-semibold text-[#2f6fe4]">
+                Read all
+              </button>
 	            <button type="button" onClick={onClose} className="flex h-10 w-10 items-center justify-center rounded-full border border-[#dbe6f6] bg-white text-[#53647d]" aria-label="Close notifications">
-              <X className="h-5 w-5" />
-            </button>
+                <X className="h-5 w-5" />
+              </button>
+            </div>
           </div>
           <div className="max-h-[calc(70dvh-74px)] overflow-y-auto p-3">
+            <div className="mb-3 rounded-[18px] border border-[#dbe6f6] bg-[linear-gradient(180deg,#f8fbff_0%,#eef5ff_100%)] px-4 py-4">
+              <p className="text-[13px] font-semibold text-[#17233f]">Browser alerts</p>
+              {!browserAlertsSupported && (
+                <p className="mt-2 text-[12px] leading-5 text-[#607394]">
+                  This browser does not support popup notifications here.
+                </p>
+              )}
+              {browserAlertsSupported && notificationPermission === 'granted' && browserAlertsEnabled && (
+                <>
+                  <p className="mt-2 text-[12px] leading-5 text-[#607394]">
+                    Popup alerts and sound are on. New doubts, reports, and replies will alert you while Chrome is open.
+                  </p>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={onTestBrowserAlert}
+                      className="rounded-full border border-[#dbe6f6] bg-white px-3 py-2 text-[11px] font-semibold text-[#2f6fe4]"
+                    >
+                      Test alert
+                    </button>
+                    <button
+                      type="button"
+                      onClick={onDisableBrowserAlerts}
+                      className="rounded-full border border-[#dbe6f6] bg-white px-3 py-2 text-[11px] font-semibold text-[#53647d]"
+                    >
+                      Turn off
+                    </button>
+                  </div>
+                </>
+              )}
+              {browserAlertsSupported && notificationPermission === 'default' && (
+                <>
+                  <p className="mt-2 text-[12px] leading-5 text-[#607394]">
+                    Allow Chrome alerts so you can hear a sound and see a popup when a student raises a doubt or report.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={onEnableBrowserAlerts}
+                    disabled={notificationPermissionBusy}
+                    className="mt-3 rounded-full border border-[#2f6fe4] bg-[#2f6fe4] px-3 py-2 text-[11px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {notificationPermissionBusy ? 'Enabling…' : 'Enable alerts'}
+                  </button>
+                </>
+              )}
+              {browserAlertsSupported && notificationPermission === 'denied' && (
+                <p className="mt-2 text-[12px] leading-5 text-[#607394]">
+                  Chrome alerts are blocked. Allow notifications for this site in browser settings, then reopen this panel.
+                </p>
+              )}
+            </div>
             {notifications.length > 0 ? notifications.map((notification) => (
               <button
                 key={notification._id}
+                data-testid={`notification-row-${notification.isRead ? 'read' : 'unread'}`}
                 type="button"
                 onClick={() => onOpen(notification)}
-	                className="flex w-full items-start gap-3 rounded-[16px] border border-transparent px-3 py-3 text-left transition hover:border-[#dbe6f6] hover:bg-[#f4f8ff]"
+	                className={`flex w-full items-start gap-3 rounded-[16px] border px-3 py-3 text-left transition hover:border-[#dbe6f6] hover:bg-[#f4f8ff] ${notification.isRead ? 'border-transparent bg-white/80' : 'border-[#dbe6f6] bg-[#eef5ff]'}`}
 	              >
 	                <span className="mt-1 flex h-9 w-9 shrink-0 items-center justify-center rounded-[13px] bg-[#eef4ff] text-[#2f6fe4]">
 	                  <BellRing className="h-4 w-4" />
@@ -780,19 +1022,29 @@ const InAppNotificationToasts = ({
 const ProfileEditorSheet = ({
   open,
   form,
-  saving,
-  error,
-  onChange,
+  passwordForm,
+  profileSaving,
+  passwordSaving,
+  profileError,
+  passwordError,
+  onProfileChange,
+  onPasswordChange,
   onClose,
-  onSave,
+  onSaveProfile,
+  onSavePassword,
 }: {
   open: boolean;
   form: { name: string; email: string; mobileNumber: string };
-  saving: boolean;
-  error: string | null;
-  onChange: (field: 'name' | 'email' | 'mobileNumber', value: string) => void;
+  passwordForm: { currentPassword: string; newPassword: string; confirmPassword: string };
+  profileSaving: boolean;
+  passwordSaving: boolean;
+  profileError: string | null;
+  passwordError: string | null;
+  onProfileChange: (field: 'name' | 'mobileNumber', value: string) => void;
+  onPasswordChange: (field: 'currentPassword' | 'newPassword' | 'confirmPassword', value: string) => void;
   onClose: () => void;
-  onSave: () => void;
+  onSaveProfile: () => void;
+  onSavePassword: () => void;
 }) => (
   <AnimatePresence>
     {open && (
@@ -827,37 +1079,111 @@ const ProfileEditorSheet = ({
           </div>
 
           <div className="space-y-4 px-5 py-5">
-            {[
-              ['name', 'Full name', 'Enter your name', UserCircle2],
-              ['email', 'Email', 'Enter your email', Mail],
-              ['mobileNumber', 'Mobile number', 'Enter mobile number', Phone],
-            ].map(([field, label, placeholder, Icon]) => {
-              const FieldIcon = Icon as React.ComponentType<{ className?: string }>;
-              return (
-                <label key={field as string} className="block">
-                  <span className="text-[12px] font-semibold text-[#53647d]">{label as string}</span>
+            <div className="space-y-4 rounded-[18px] border border-[#e2e8f5] bg-[#fbfdff] p-4">
+              <div>
+                <p className="text-[14px] font-bold text-[#20242d]">Profile details</p>
+                <p className="mt-1 text-[12px] leading-5 text-[#64748b]">Email is locked after registration. You can update your mobile number here.</p>
+              </div>
+
+              <label className="block">
+                <span className="text-[12px] font-semibold text-[#53647d]">Full name</span>
+                <span className="mt-2 flex h-12 items-center gap-3 rounded-[14px] border border-[#d9e3f2] bg-white px-4 text-[#8a98ad] focus-within:border-[#2f6fe4]">
+                  <UserCircle2 className="h-5 w-5 shrink-0" />
+                  <input
+                    value={form.name}
+                    onChange={(event) => onProfileChange('name', event.target.value)}
+                    placeholder="Enter your name"
+                    className="min-w-0 flex-1 bg-transparent text-[16px] text-[#20242d] outline-none placeholder:text-[#9aa7bc]"
+                  />
+                </span>
+              </label>
+
+              <label className="block">
+                <span className="text-[12px] font-semibold text-[#53647d]">Email</span>
+                <span className="mt-2 flex h-12 items-center gap-3 rounded-[14px] border border-[#d9e3f2] bg-[#f8fafc] px-4 text-[#8a98ad]">
+                  <Mail className="h-5 w-5 shrink-0" />
+                  <input
+                    data-testid="profile-email-input"
+                    value={form.email}
+                    readOnly
+                    className="min-w-0 flex-1 bg-transparent text-[16px] text-[#64748b] outline-none"
+                  />
+                  <Lock className="h-4 w-4 shrink-0 text-[#94a3b8]" />
+                </span>
+              </label>
+
+              <label className="block">
+                <span className="text-[12px] font-semibold text-[#53647d]">Mobile number</span>
+                <span className="mt-2 flex h-12 items-center gap-3 rounded-[14px] border border-[#d9e3f2] bg-white px-4 text-[#8a98ad] focus-within:border-[#2f6fe4]">
+                  <Phone className="h-5 w-5 shrink-0" />
+                  <input
+                    data-testid="profile-mobile-input"
+                    value={form.mobileNumber}
+                    onChange={(event) => onProfileChange('mobileNumber', event.target.value)}
+                    placeholder="Enter your mobile number"
+                    inputMode="tel"
+                    autoComplete="tel"
+                    className="min-w-0 flex-1 bg-transparent text-[16px] text-[#20242d] outline-none placeholder:text-[#9aa7bc]"
+                  />
+                </span>
+              </label>
+
+              {profileError && <p className="rounded-[12px] border border-[#fecaca] bg-[#fff1f2] px-3 py-2 text-[13px] text-[#b91c1c]">{profileError}</p>}
+
+              <button
+                type="button"
+                onClick={onSaveProfile}
+                disabled={profileSaving}
+                className="flex h-12 w-full items-center justify-center rounded-[14px] bg-[#2f6fe4] text-[15px] font-bold text-white shadow-[0_14px_24px_rgba(47,111,228,0.22)] disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {profileSaving ? <LoaderCircle className="h-5 w-5 animate-spin" /> : 'Save profile'}
+              </button>
+            </div>
+
+            <div className="space-y-4 rounded-[18px] border border-[#e2e8f5] bg-[#fbfdff] p-4">
+              <div>
+                <p className="text-[14px] font-bold text-[#20242d]">Change password</p>
+                <p className="mt-1 text-[12px] leading-5 text-[#64748b]">You will be signed out after changing your password.</p>
+              </div>
+
+              {[
+                ['currentPassword', 'Current password', 'Enter current password'],
+                ['newPassword', 'New password', 'Enter new password'],
+                ['confirmPassword', 'Confirm password', 'Re-enter new password'],
+              ].map(([field, label, placeholder]) => (
+                <label key={field} className="block">
+                  <span className="text-[12px] font-semibold text-[#53647d]">{label}</span>
                   <span className="mt-2 flex h-12 items-center gap-3 rounded-[14px] border border-[#d9e3f2] bg-white px-4 text-[#8a98ad] focus-within:border-[#2f6fe4]">
-                    <FieldIcon className="h-5 w-5 shrink-0" />
+                    <Lock className="h-5 w-5 shrink-0" />
                     <input
-                      value={form[field as keyof typeof form]}
-                      onChange={(event) => onChange(field as 'name' | 'email' | 'mobileNumber', event.target.value)}
-                      placeholder={placeholder as string}
+                      type="password"
+                      value={passwordForm[field as keyof typeof passwordForm]}
+                      onChange={(event) => onPasswordChange(field as 'currentPassword' | 'newPassword' | 'confirmPassword', event.target.value)}
+                      placeholder={placeholder}
                       className="min-w-0 flex-1 bg-transparent text-[16px] text-[#20242d] outline-none placeholder:text-[#9aa7bc]"
                     />
                   </span>
                 </label>
-              );
-            })}
+              ))}
 
-            {error && <p className="rounded-[12px] border border-[#fecaca] bg-[#fff1f2] px-3 py-2 text-[13px] text-[#b91c1c]">{error}</p>}
+              {passwordError && <p className="rounded-[12px] border border-[#fecaca] bg-[#fff1f2] px-3 py-2 text-[13px] text-[#b91c1c]">{passwordError}</p>}
+
+              <button
+                type="button"
+                onClick={onSavePassword}
+                disabled={passwordSaving}
+                className="flex h-12 w-full items-center justify-center rounded-[14px] border border-[#d9e3f2] bg-white text-[15px] font-bold text-[#20242d] disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {passwordSaving ? <LoaderCircle className="h-5 w-5 animate-spin" /> : 'Change password'}
+              </button>
+            </div>
 
             <button
               type="button"
-              onClick={onSave}
-              disabled={saving}
-              className="flex h-12 w-full items-center justify-center rounded-[14px] bg-[#2f6fe4] text-[15px] font-bold text-white shadow-[0_14px_24px_rgba(47,111,228,0.22)] disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={onClose}
+              className="flex h-12 w-full items-center justify-center rounded-[14px] border border-[#d9e3f2] bg-white text-[15px] font-bold text-[#53647d]"
             >
-              {saving ? <LoaderCircle className="h-5 w-5 animate-spin" /> : 'Save profile'}
+              Close
             </button>
           </div>
         </motion.div>
@@ -1614,6 +1940,31 @@ const buildLocalTestAttemptResult = (
   };
 };
 
+const getSocialAuthProvider = (provider: 'google' | 'apple') =>
+  provider === 'google' ? googleProvider : appleProvider;
+
+const getSocialProviderFromFirebaseProviderId = (providerId?: string | null): 'google' | 'apple' | null => {
+  if (providerId === 'google.com') {
+    return 'google';
+  }
+
+  if (providerId === 'apple.com') {
+    return 'apple';
+  }
+
+  return null;
+};
+
+const getSocialProviderLabel = (provider: 'google' | 'apple') =>
+  provider === 'google' ? 'Google' : 'Apple';
+
+const isPopupBlockedAuthError = (error: unknown) => {
+  const code = typeof (error as { code?: unknown })?.code === 'string'
+    ? String((error as { code?: string }).code)
+    : '';
+  return code === 'auth/popup-blocked';
+};
+
 const AuthScreen = () => {
   const { login, register, refreshSession, requestPasswordReset } = useAuth();
   const [mode, setMode] = useState<'login' | 'register' | 'forgot-password'>('login');
@@ -1681,6 +2032,7 @@ const AuthScreen = () => {
   }, [registerForm.password]);
 
   const takeOverDevice = sessionConflict?.activeSessions[0]?.device || sessionConflict?.activeDevice || 'another device';
+  const isNativePlatform = Capacitor.isNativePlatform();
   const resetFeedback = () => {
     setError(null);
     setResetSentTo(null);
@@ -1689,26 +2041,6 @@ const AuthScreen = () => {
     resetFeedback();
     setMode(nextMode);
   };
-  const formatDeviceLabel = (value: string) => {
-    const label = value.trim();
-    const normalized = label.toLowerCase();
-    if (!label) {
-      return 'Web Browser';
-    }
-    if (
-      normalized.includes('chrome')
-      || normalized.includes('safari')
-      || normalized.includes('firefox')
-      || normalized.includes('browser')
-    ) {
-      return 'Web Browser';
-    }
-    if (label.length > 22) {
-      return `${label.slice(0, 22)}...`;
-    }
-    return label;
-  };
-
   const authPanelClassName = 'min-h-dvh overflow-hidden bg-[#f8fbff] shadow-[0_24px_70px_rgba(37,73,125,0.18)] sm:min-h-0 sm:rounded-[28px] sm:border sm:border-[#d8e5f5]';
   const authInputClassName = 'h-[48px] w-full rounded-[14px] border border-[#d7e3f2] bg-white px-12 text-[16px] font-medium text-[#17233d] outline-none transition placeholder:text-[#8b9bb2] focus:border-[#2f6fe4] focus:bg-white focus:shadow-[0_0_0_4px_rgba(47,111,228,0.10)] sm:h-[46px]';
   const socialButtonClassName = 'flex h-[48px] w-full items-center justify-center gap-3 rounded-[14px] border border-[#d7e3f2] bg-white px-4 text-[15px] font-bold text-[#17233d] shadow-[0_10px_24px_rgba(37,73,125,0.06)] transition hover:border-[#b9cbe3] hover:bg-[#f7fbff]';
@@ -1803,18 +2135,113 @@ const AuthScreen = () => {
     }
   };
 
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return undefined;
+    }
+
+    const storedPendingProvider = window.sessionStorage.getItem(SOCIAL_REDIRECT_PROVIDER_KEY);
+    const pendingProvider = storedPendingProvider === 'google' || storedPendingProvider === 'apple'
+      ? storedPendingProvider
+      : null;
+    if (!pendingProvider) {
+      return undefined;
+    }
+
+    let cancelled = false;
+
+    const completeNativeSocialLogin = async () => {
+      setSubmitting(true);
+      resetFeedback();
+      let socialProvider: 'google' | 'apple' = pendingProvider;
+      let socialIdentifier = pendingProvider;
+      let socialIdToken = '';
+
+      try {
+        const credential = await getRedirectResult(firebaseAuth);
+        if (!credential) {
+          if (!cancelled) {
+            setError(`${getSocialProviderLabel(pendingProvider)} sign-in was cancelled. Please try again.`);
+          }
+          return;
+        }
+
+        socialProvider = getSocialProviderFromFirebaseProviderId(credential.providerId) || pendingProvider;
+        socialIdToken = await credential.user.getIdToken(true);
+        socialIdentifier = credential.user.email || socialProvider;
+        await EduService.socialLogin(socialProvider, socialIdToken);
+        await refreshSession();
+        setSessionConflict(null);
+      } catch (err) {
+        if (cancelled) {
+          return;
+        }
+
+        if (err instanceof ApiRequestError && err.code === 'SESSION_ACTIVE') {
+          const activeDevice = typeof err.details?.activeDevice === 'string' ? err.details.activeDevice : 'another device';
+          const activeSessions = Array.isArray(err.details?.activeSessions)
+            ? err.details.activeSessions
+              .map((session: any, index: number) => ({
+                sessionId: typeof session?.sessionId === 'string' ? session.sessionId : `active-${index}`,
+                device: typeof session?.device === 'string' ? session.device : activeDevice,
+                lastSeenAt: typeof session?.lastSeenAt === 'string' ? session.lastSeenAt : null,
+              }))
+            : [{ sessionId: 'active-0', device: activeDevice, lastSeenAt: null }];
+          setSessionConflict({
+            authMethod: 'social',
+            identifier: socialIdentifier,
+            password: '',
+            socialProvider,
+            socialIdToken,
+            activeDevice,
+            activeSessions,
+            sessionLimit: Number(err.details?.sessionLimit || 1),
+          });
+          return;
+        }
+
+        const message = err instanceof Error ? err.message : `Unable to continue with ${getSocialProviderLabel(pendingProvider)}.`;
+        setError(message);
+      } finally {
+        window.sessionStorage.removeItem(SOCIAL_REDIRECT_PROVIDER_KEY);
+        if (!cancelled) {
+          setSubmitting(false);
+        }
+      }
+    };
+
+    void completeNativeSocialLogin();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshSession]);
+
   const submitSocialLogin = async (provider: 'google' | 'apple') => {
     setSubmitting(true);
     resetFeedback();
     let socialIdToken = '';
     let socialIdentifier: string = provider;
     try {
-      const credential = await signInWithPopup(firebaseAuth, provider === 'google' ? googleProvider : appleProvider);
+      if (isNativePlatform) {
+        if (typeof window !== 'undefined') {
+          window.sessionStorage.setItem(SOCIAL_REDIRECT_PROVIDER_KEY, provider);
+        }
+        await signInWithRedirect(firebaseAuth, getSocialAuthProvider(provider));
+        return;
+      }
+
+      const credential = await signInWithPopup(firebaseAuth, getSocialAuthProvider(provider));
       socialIdToken = await credential.user.getIdToken(true);
       socialIdentifier = credential.user.email || provider;
       await EduService.socialLogin(provider, socialIdToken);
       await refreshSession();
     } catch (err) {
+      if (!isNativePlatform && isPopupBlockedAuthError(err) && typeof window !== 'undefined') {
+        window.sessionStorage.setItem(SOCIAL_REDIRECT_PROVIDER_KEY, provider);
+        await signInWithRedirect(firebaseAuth, getSocialAuthProvider(provider));
+        return;
+      }
       if (err instanceof ApiRequestError && err.code === 'SESSION_ACTIVE') {
         const activeDevice = typeof err.details?.activeDevice === 'string' ? err.details.activeDevice : 'another device';
         const activeSessions = Array.isArray(err.details?.activeSessions)
@@ -2507,15 +2934,15 @@ const Shell = ({
   setActiveTab: (tab: TabKey) => void;
   onLogout: () => Promise<void>;
   onRefresh: () => Promise<void>;
-  resumeTarget: { courseId: string; lessonId?: string | null; doubtThreadId?: string | null } | null;
-  onContinueLearningNavigate: (courseId: string, lessonId?: string | null, doubtThreadId?: string | null) => void;
+  resumeTarget: { courseId: string; lessonId?: string | null; doubtThreadId?: string | null; reportId?: string | null; supportPanel?: 'doubts' | 'report' | null } | null;
+  onContinueLearningNavigate: (courseId: string, lessonId?: string | null, doubtThreadId?: string | null, reportId?: string | null, supportPanel?: 'doubts' | 'report' | null) => void;
   onOpenNotification: (notification: NotificationItem) => void;
   onResumeNavigationHandled: () => void;
   savedTopicIds: string[];
   savedTopics: SavedTopic[];
   onToggleSavedTopic: (courseId: string, lessonId: string) => void;
 }) => {
-  const { user, isAdmin, updateProfile } = useAuth();
+  const { user, isAdmin, updateProfile, changePassword } = useAuth();
   const [searchQuery, setSearchQuery] = useState('');
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [isMobileMoreOpen, setIsMobileMoreOpen] = useState(false);
@@ -2524,26 +2951,39 @@ const Shell = ({
   const [profileError, setProfileError] = useState<string | null>(null);
   const [profileSaving, setProfileSaving] = useState(false);
   const [profileForm, setProfileForm] = useState({ name: '', email: '', mobileNumber: '' });
+  const [passwordForm, setPasswordForm] = useState({ currentPassword: '', newPassword: '', confirmPassword: '' });
+  const [passwordError, setPasswordError] = useState<string | null>(null);
+  const [passwordSaving, setPasswordSaving] = useState(false);
   const [liveMobileMode, setLiveMobileMode] = useState<'list' | 'detail' | 'room'>('list');
   const [isImmersiveCoursePlayer, setIsImmersiveCoursePlayer] = useState(false);
   const [isImmersiveTestsFlow, setIsImmersiveTestsFlow] = useState(false);
   const [pendingLiveClassId, setPendingLiveClassId] = useState<string | null>(null);
   const [activeCourseCbtLaunch, setActiveCourseCbtLaunch] = useState<{ test: MockTest; onSubmitted?: () => void } | null>(null);
   const [toastNotifications, setToastNotifications] = useState<NotificationItem[]>([]);
+  const [notificationPermission, setNotificationPermission] = useState<BrowserAlertPermissionState>(() => getBrowserAlertPermissionState());
+  const [browserAlertsEnabled, setBrowserAlertsEnabled] = useState(() => getStoredBooleanPreference(BROWSER_ALERTS_ENABLED_STORAGE_KEY, false));
+  const [notificationPermissionBusy, setNotificationPermissionBusy] = useState(false);
   const searchContainerRef = useRef<HTMLDivElement | null>(null);
   const seenNotificationIdsRef = useRef<Set<string>>(new Set());
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const serviceWorkerRegistrationRef = useRef<ServiceWorkerRegistration | null>(null);
 
-  const visibleTabs = tabs.filter((tab) => tab.id !== 'admin' || isAdmin);
+  const visibleTabs = tabs.filter((tab) => {
+    if (tab.id === 'live' && !LIVE_CLASSES_ENABLED) {
+      return false;
+    }
+    return tab.id !== 'admin' || isAdmin;
+  });
   const overviewSidebarTabs = useMemo(
-    () => ['overview', 'courses', 'live', 'tests', 'revision', 'analytics', ...(isAdmin ? ['admin'] : [])]
+    () => ['overview', 'courses', ...(LIVE_CLASSES_ENABLED ? ['live'] : []), 'tests', 'revision', 'analytics', ...(isAdmin ? ['admin'] : [])]
       .map((id) => tabs.find((tab) => tab.id === id))
       .filter((tab): tab is (typeof tabs)[number] => Boolean(tab)),
     [isAdmin],
   );
-  const primaryNavTabs = mobilePrimaryTabIds
+  const primaryNavTabs = enabledMobilePrimaryTabIds
     .map((tabId) => visibleTabs.find((tab) => tab.id === tabId))
     .filter((tab): tab is (typeof tabs)[number] => Boolean(tab));
-  const utilityTabs = visibleTabs.filter((tab) => !mobilePrimaryTabIds.includes(tab.id));
+  const utilityTabs = visibleTabs.filter((tab) => !enabledMobilePrimaryTabIds.includes(tab.id));
   const searchTargets = useMemo(() => buildSearchTargets(overview, savedTopics), [overview, savedTopics]);
   const filteredTargets = useMemo(() => {
     const normalized = searchQuery.trim().toLowerCase();
@@ -2633,6 +3073,41 @@ const Shell = ({
   }, [isMobileMoreOpen]);
 
   useEffect(() => {
+    if (typeof window === 'undefined') {
+      return undefined;
+    }
+
+    const syncPermission = () => {
+      setNotificationPermission(getBrowserAlertPermissionState());
+    };
+
+    window.addEventListener('focus', syncPermission);
+    document.addEventListener('visibilitychange', syncPermission);
+    return () => {
+      window.removeEventListener('focus', syncPermission);
+      document.removeEventListener('visibilitychange', syncPermission);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
+      return;
+    }
+
+    void navigator.serviceWorker.register(NOTIFICATION_SERVICE_WORKER_PATH)
+      .then((registration) => {
+        serviceWorkerRegistrationRef.current = registration;
+      })
+      .catch(() => {
+        serviceWorkerRegistrationRef.current = null;
+      });
+  }, []);
+
+  useEffect(() => {
+    setStoredBooleanPreference(BROWSER_ALERTS_ENABLED_STORAGE_KEY, browserAlertsEnabled);
+  }, [browserAlertsEnabled]);
+
+  useEffect(() => {
     if (activeTab !== 'live') {
       setLiveMobileMode('list');
     }
@@ -2693,10 +3168,48 @@ const Shell = ({
         const existing = new Set(current.map((notification) => notification._id));
         return [...freshNotifications.filter((notification) => !existing.has(notification._id)), ...current].slice(0, 4);
       });
+
+      if (browserAlertsEnabled) {
+        void playNotificationChime(audioContextRef).catch(() => undefined);
+      }
+
+      if (browserAlertsEnabled && notificationPermission === 'granted') {
+        freshNotifications.slice(0, 3).forEach((notification) => {
+          const targetUrl = resolveNotificationTargetUrl(notification);
+          const options: NotificationOptions = {
+            body: notification.message,
+            icon: '/icons/icon-192.png',
+            badge: '/icons/icon-192.png',
+            tag: `edumaster-notification-${notification._id}`,
+            requireInteraction: typeof document !== 'undefined' ? document.hidden : false,
+            data: {
+              url: targetUrl,
+              notificationId: notification._id,
+            },
+          };
+
+          if (serviceWorkerRegistrationRef.current) {
+            void serviceWorkerRegistrationRef.current.showNotification(notification.title, options).catch(() => undefined);
+            return;
+          }
+
+          if (typeof window !== 'undefined' && 'Notification' in window) {
+            const browserNotification = new Notification(notification.title, options);
+            browserNotification.onclick = () => {
+              const nextTargetUrl = String(targetUrl || '').trim();
+              window.focus();
+              if (nextTargetUrl) {
+                window.location.href = nextTargetUrl;
+              }
+              browserNotification.close();
+            };
+          }
+        });
+      }
     }
 
     seenNotificationIdsRef.current = incomingIds;
-  }, [overview.notifications]);
+  }, [browserAlertsEnabled, notificationPermission, overview.notifications]);
 
   useEffect(() => {
     if (!toastNotifications.length) {
@@ -2720,7 +3233,7 @@ const Shell = ({
 
     if (target.kind === 'course' || target.kind === 'lesson' || target.kind === 'saved') {
       setActiveTab('courses');
-      onContinueLearningNavigate(target.courseId, target.lessonId || null, null);
+      onContinueLearningNavigate(target.courseId, target.lessonId || null, null, null, null);
       return;
     }
 
@@ -2740,12 +3253,113 @@ const Shell = ({
     setIsNotificationSheetOpen(true);
   };
 
-  const handleNotificationOpen = (notification: NotificationItem) => {
+  const enableBrowserAlerts = async () => {
+    if (typeof window === 'undefined' || !('Notification' in window)) {
+      setNotificationPermission('unsupported');
+      return;
+    }
+
+    setNotificationPermissionBusy(true);
+    try {
+      const nextPermission = Notification.permission === 'granted'
+        ? 'granted'
+        : await Notification.requestPermission();
+      setNotificationPermission(nextPermission);
+      const enabled = nextPermission === 'granted';
+      setBrowserAlertsEnabled(enabled);
+
+      if (!enabled) {
+        return;
+      }
+
+      await playNotificationChime(audioContextRef).catch(() => undefined);
+      const targetUrl = typeof window !== 'undefined' ? `${window.location.origin}/?tab=overview` : '/';
+      const options: NotificationOptions = {
+        body: 'Chrome alerts are enabled. You will hear and see new learner updates here.',
+        icon: '/icons/icon-192.png',
+        badge: '/icons/icon-192.png',
+        tag: 'edumaster-alerts-enabled',
+        data: { url: targetUrl },
+      };
+
+      if (serviceWorkerRegistrationRef.current) {
+        await serviceWorkerRegistrationRef.current.showNotification('Browser alerts enabled', options);
+        return;
+      }
+
+      const browserNotification = new Notification('Browser alerts enabled', options);
+      browserNotification.onclick = () => {
+        window.focus();
+        window.location.href = targetUrl;
+        browserNotification.close();
+      };
+    } finally {
+      setNotificationPermissionBusy(false);
+    }
+  };
+
+  const disableBrowserAlerts = () => {
+    setBrowserAlertsEnabled(false);
+  };
+
+  const testBrowserAlert = async () => {
+    if (notificationPermission !== 'granted' || !browserAlertsEnabled) {
+      return;
+    }
+
+    await playNotificationChime(audioContextRef).catch(() => undefined);
+    const targetUrl = typeof window !== 'undefined' ? `${window.location.origin}/?tab=overview` : '/';
+    const options: NotificationOptions = {
+      body: 'This is how new doubts, reports, and replies will alert you.',
+      icon: '/icons/icon-192.png',
+      badge: '/icons/icon-192.png',
+      tag: 'edumaster-alert-test',
+      data: { url: targetUrl },
+    };
+
+    if (serviceWorkerRegistrationRef.current) {
+      await serviceWorkerRegistrationRef.current.showNotification('Test alert from VaronEnglish', options);
+      return;
+    }
+
+    if (typeof window !== 'undefined' && 'Notification' in window) {
+      const browserNotification = new Notification('Test alert from VaronEnglish', options);
+      browserNotification.onclick = () => {
+        window.focus();
+        window.location.href = targetUrl;
+        browserNotification.close();
+      };
+    }
+  };
+
+  const handleNotificationsReadAll = async () => {
+    try {
+      await EduService.markAllNotificationsRead();
+      await onRefresh();
+    } catch {
+      // Keep sheet usable if read-all fails.
+    }
+  };
+
+  const handleNotificationOpen = async (notification: NotificationItem) => {
     setIsNotificationSheetOpen(false);
+    if (!notification.isRead) {
+      try {
+        await EduService.markNotificationRead(notification._id);
+        await onRefresh();
+      } catch {
+        // Keep navigation best-effort even if mark-read fails.
+      }
+    }
     const target = getNotificationNavigationTarget(notification);
     if (target) {
       setIsSearchOpen(false);
       setIsMobileMoreOpen(false);
+      if (target.tab === 'live' && !LIVE_CLASSES_ENABLED) {
+        onOpenNotification(notification);
+        return;
+      }
+
       setActiveTab(target.tab);
 
       if (target.tab === 'live' && target.liveClassId) {
@@ -2753,7 +3367,13 @@ const Shell = ({
       }
 
       if (target.tab === 'courses' && target.courseId) {
-        onContinueLearningNavigate(target.courseId, target.lessonId || null, target.doubtThreadId || null);
+        onContinueLearningNavigate(
+          target.courseId,
+          target.lessonId || null,
+          target.doubtThreadId || null,
+          target.reportId || null,
+          target.supportPanel || null,
+        );
       }
 
       return;
@@ -2765,6 +3385,8 @@ const Shell = ({
   const openProfileEditor = () => {
     setIsMobileMoreOpen(false);
     setProfileError(null);
+    setPasswordError(null);
+    setPasswordForm({ currentPassword: '', newPassword: '', confirmPassword: '' });
     setIsProfileEditorOpen(true);
   };
 
@@ -2774,7 +3396,6 @@ const Shell = ({
     try {
       await updateProfile({
         name: profileForm.name,
-        email: profileForm.email,
         mobileNumber: profileForm.mobileNumber,
       });
       await onRefresh();
@@ -2786,65 +3407,113 @@ const Shell = ({
     }
   };
 
+  const savePassword = async () => {
+    setPasswordSaving(true);
+    setPasswordError(null);
+    try {
+      if (!passwordForm.currentPassword || !passwordForm.newPassword || !passwordForm.confirmPassword) {
+        throw new Error('Fill in all password fields.');
+      }
+      if (passwordForm.newPassword !== passwordForm.confirmPassword) {
+        throw new Error('New password and confirm password must match.');
+      }
+      await changePassword(passwordForm);
+      setIsProfileEditorOpen(false);
+    } catch (err) {
+      setPasswordError(err instanceof Error ? err.message : 'Unable to change password');
+    } finally {
+      setPasswordSaving(false);
+    }
+  };
+
   const renderActiveTab = () => {
     if (activeTab === 'overview') {
       return (
-        <OverviewFigmaTab
-          overview={overview}
-          onContinueLearning={(courseId, lessonId) => {
-            onContinueLearningNavigate(courseId, lessonId);
-            setActiveTab('courses');
-          }}
-          onOpenLiveTab={() => setActiveTab('live')}
-          onOpenTestsTab={() => setActiveTab('tests')}
-          onOpenRevisionTab={() => setActiveTab('revision')}
-          onOpenCoursesTab={() => setActiveTab('courses')}
-        />
+        <Suspense fallback={<DeferredPanelFallback label="dashboard" minHeightClass="min-h-[320px]" />}>
+          <LazyOverviewFigmaTab
+            overview={overview}
+            onContinueLearning={(courseId, lessonId) => {
+              onContinueLearningNavigate(courseId, lessonId, null, null, null);
+              setActiveTab('courses');
+            }}
+            onOpenNotification={(notification) => { void handleNotificationOpen(notification); }}
+            onOpenLiveTab={LIVE_CLASSES_ENABLED ? () => setActiveTab('live') : undefined}
+            onOpenTestsTab={() => setActiveTab('tests')}
+            onOpenRevisionTab={() => setActiveTab('revision')}
+            onOpenCoursesTab={() => setActiveTab('courses')}
+          />
+        </Suspense>
       );
     }
 
     if (activeTab === 'courses') {
       return (
-        <CourseFigmaTab
-          overview={overview}
-          onRefresh={onRefresh}
-          initialCourseId={resumeTarget?.courseId}
-          initialLessonId={resumeTarget?.lessonId || null}
-          initialDoubtThreadId={resumeTarget?.doubtThreadId || null}
-          onResumeNavigationHandled={onResumeNavigationHandled}
-          savedTopicIds={savedTopicIds}
-          onToggleSavedTopic={onToggleSavedTopic}
-          onImmersiveModeChange={setIsImmersiveCoursePlayer}
-          onOpenCbtExam={(test, onSubmitted) => {
-            setActiveCourseCbtLaunch({ test, onSubmitted });
-          }}
-        />
+        <Suspense fallback={<DeferredPanelFallback label="courses and lessons" minHeightClass="min-h-[360px]" />}>
+          <LazyCourseFigmaTab
+            overview={overview}
+            onRefresh={onRefresh}
+            initialCourseId={resumeTarget?.courseId}
+            initialLessonId={resumeTarget?.lessonId || null}
+            initialDoubtThreadId={resumeTarget?.doubtThreadId || null}
+            initialReportId={resumeTarget?.reportId || null}
+            initialSupportPanel={resumeTarget?.supportPanel || null}
+            onResumeNavigationHandled={onResumeNavigationHandled}
+            savedTopicIds={savedTopicIds}
+            onToggleSavedTopic={onToggleSavedTopic}
+            onImmersiveModeChange={setIsImmersiveCoursePlayer}
+            onOpenCbtExam={(test, onSubmitted) => {
+              setActiveCourseCbtLaunch({ test, onSubmitted });
+            }}
+          />
+        </Suspense>
       );
     }
 
     if (activeTab === 'tests') {
       return (
-        <TestSeriesFigmaTab
-          overview={overview}
-          onRefresh={onRefresh}
-          onImmersiveModeChange={setIsImmersiveTestsFlow}
-          onOpenLiveClass={(liveClassId) => {
-            setPendingLiveClassId(liveClassId);
-            setActiveTab('live');
-          }}
-        />
+        <Suspense fallback={<DeferredPanelFallback label="test series" minHeightClass="min-h-[320px]" />}>
+          <LazyTestSeriesFigmaTab
+            overview={overview}
+            onRefresh={onRefresh}
+            onImmersiveModeChange={setIsImmersiveTestsFlow}
+            onOpenLiveClass={LIVE_CLASSES_ENABLED ? (liveClassId) => {
+              setPendingLiveClassId(liveClassId);
+              setActiveTab('live');
+            } : undefined}
+          />
+        </Suspense>
+      );
+    }
+
+    if (activeTab === 'live' && LIVE_CLASSES_ENABLED) {
+      return (
+        <Suspense fallback={<DeferredPanelFallback label="live classes" minHeightClass="min-h-[320px]" />}>
+          <LazyLiveClassesFigmaTab
+            overview={overview}
+            onRefresh={onRefresh}
+            onMobileModeChange={setLiveMobileMode}
+            initialLiveClassId={pendingLiveClassId}
+            onInitialLiveClassHandled={() => setPendingLiveClassId(null)}
+          />
+        </Suspense>
       );
     }
 
     if (activeTab === 'live') {
       return (
-        <LiveClassesFigmaTab
-          overview={overview}
-          onRefresh={onRefresh}
-          onMobileModeChange={setLiveMobileMode}
-          initialLiveClassId={pendingLiveClassId}
-          onInitialLiveClassHandled={() => setPendingLiveClassId(null)}
-        />
+        <Suspense fallback={<DeferredPanelFallback label="dashboard" minHeightClass="min-h-[320px]" />}>
+          <LazyOverviewFigmaTab
+            overview={overview}
+            onContinueLearning={(courseId, lessonId) => {
+              onContinueLearningNavigate(courseId, lessonId, null, null, null);
+              setActiveTab('courses');
+            }}
+            onOpenNotification={(notification) => { void handleNotificationOpen(notification); }}
+            onOpenTestsTab={() => setActiveTab('tests')}
+            onOpenRevisionTab={() => setActiveTab('revision')}
+            onOpenCoursesTab={() => setActiveTab('courses')}
+          />
+        </Suspense>
       );
     }
 
@@ -2854,7 +3523,7 @@ const Shell = ({
           overview={overview}
           savedTopics={savedTopics}
           onContinueLearning={(courseId, lessonId) => {
-            onContinueLearningNavigate(courseId, lessonId);
+            onContinueLearningNavigate(courseId, lessonId, null, null, null);
             setActiveTab('courses');
           }}
         />
@@ -2914,7 +3583,7 @@ const Shell = ({
                     <span className="min-w-0">
                       <span className="block text-[10px] uppercase tracking-[0.18em] text-[#8b9ab3]">Alerts</span>
                       <span className="block truncate text-[12px] font-semibold">
-                        {overview.notifications.length > 0 ? `${overview.notifications.length} new` : 'All clear'}
+                        {(overview.notificationCount ?? overview.notifications.length) > 0 ? `${overview.notificationCount ?? overview.notifications.length} new` : 'All clear'}
                       </span>
                     </span>
                   </button>
@@ -3015,7 +3684,7 @@ const Shell = ({
                   type="button"
                   onClick={() => {
                     if (continueCourse) {
-                      onContinueLearningNavigate(continueCourse._id, continueCourse.continueLesson?.id || null);
+                      onContinueLearningNavigate(continueCourse._id, continueCourse.continueLesson?.id || null, null, null, null);
                       setActiveTab('courses');
                       return;
                     }
@@ -3106,9 +3775,9 @@ const Shell = ({
                   aria-label="Open notifications"
                 >
                   <BellRing className="h-7 w-7" />
-                  {overview.notifications.length > 0 && (
+                  {(overview.notificationCount ?? overview.notifications.length) > 0 && (
 	                    <span className="absolute right-1 top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-[#35d07f] px-1 text-[9px] font-bold text-[#092214]">
-                      {overview.notifications.length}
+                      {overview.notificationCount ?? overview.notifications.length}
                     </span>
                   )}
                 </button>
@@ -3264,22 +3933,35 @@ const Shell = ({
                 open={isNotificationSheetOpen}
                 notifications={overview.notifications}
                 onClose={() => setIsNotificationSheetOpen(false)}
-                onOpen={handleNotificationOpen}
+                onOpen={(notification) => { void handleNotificationOpen(notification); }}
+                onMarkAllRead={() => { void handleNotificationsReadAll(); }}
+                browserAlertsSupported={notificationPermission !== 'unsupported'}
+                browserAlertsEnabled={browserAlertsEnabled}
+                notificationPermission={notificationPermission}
+                notificationPermissionBusy={notificationPermissionBusy}
+                onEnableBrowserAlerts={() => { void enableBrowserAlerts(); }}
+                onDisableBrowserAlerts={disableBrowserAlerts}
+                onTestBrowserAlert={() => { void testBrowserAlert(); }}
               />
               <ProfileEditorSheet
                 open={isProfileEditorOpen}
                 form={profileForm}
-                saving={profileSaving}
-                error={profileError}
-                onChange={(field, value) => setProfileForm((current) => ({ ...current, [field]: value }))}
+                passwordForm={passwordForm}
+                profileSaving={profileSaving}
+                passwordSaving={passwordSaving}
+                profileError={profileError}
+                passwordError={passwordError}
+                onProfileChange={(field, value) => setProfileForm((current) => ({ ...current, [field]: value }))}
+                onPasswordChange={(field, value) => setPasswordForm((current) => ({ ...current, [field]: value }))}
                 onClose={() => setIsProfileEditorOpen(false)}
-                onSave={() => void saveProfile()}
+                onSaveProfile={() => void saveProfile()}
+                onSavePassword={() => void savePassword()}
               />
               <InAppNotificationToasts
                 notifications={toastNotifications}
                 onOpen={(notification) => {
                   setToastNotifications((current) => current.filter((item) => item._id !== notification._id));
-                  handleNotificationOpen(notification);
+                  void handleNotificationOpen(notification);
                 }}
                 onDismiss={(notificationId) => {
                   setToastNotifications((current) => current.filter((item) => item._id !== notificationId));
@@ -3340,10 +4022,12 @@ const OverviewTab = ({
   const activeCourses = [continueCourse, secondaryCourse].filter(
     (course, index, items): course is NonNullable<typeof course> => Boolean(course) && items.findIndex((item) => item?._id === course?._id) === index,
   );
-  const nextLiveClass = overview.liveClasses.find((liveClass) => {
-    const state = `${liveClass.status || ''} ${liveClass.mode || ''}`.toLowerCase();
-    return state.includes('live') || state.includes('scheduled') || state.includes('upcoming');
-  }) || overview.liveClasses[0] || null;
+  const nextLiveClass = LIVE_CLASSES_ENABLED
+    ? overview.liveClasses.find((liveClass) => {
+      const state = `${liveClass.status || ''} ${liveClass.mode || ''}`.toLowerCase();
+      return state.includes('live') || state.includes('scheduled') || state.includes('upcoming');
+    }) || overview.liveClasses[0] || null
+    : null;
   const nextTest = overview.dashboard.latestMockTest || overview.testSeries[0] || null;
   const scoreValue = overview.dashboard.latestMockTest?.score ?? Math.round(overview.analytics.accuracy || overview.dashboard.accuracy || 0);
   const rankValue = overview.dashboard.latestMockTest?.rank ?? null;
@@ -3699,61 +4383,65 @@ const OverviewTab = ({
                 action={<div className="rounded-full bg-[var(--accent-cream)] p-2 text-[var(--accent-rust)]"><ChevronRight className="h-4 w-4 rotate-[-90deg]" /></div>}
               />
               <div className="mt-5 space-y-4">
-                <div className="rounded-[26px] border border-[rgba(103,151,234,0.18)] bg-[linear-gradient(180deg,#ffffff_0%,#f1f7ff_100%)] p-4 shadow-[0_14px_28px_rgba(15,23,42,0.05)]">
-                  <span className="inline-flex rounded-full bg-[#f7a6aa] px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-white">
-                    Live
-                  </span>
-                  <p className="mt-3 text-lg font-semibold text-[var(--ink)]">
-                    {nextLiveClass ? 'Next live session is in progress.' : 'No live class running right now.'}
-                  </p>
-                  <p className="mt-2 text-sm text-[var(--ink-soft)]">
-                    {nextLiveClass
-                      ? nextLiveClass.title
-                      : 'Your next live class will appear here once it is scheduled.'}
-                  </p>
-                  <div className="mt-4 flex items-center justify-between gap-3 text-sm text-[var(--ink-soft)]">
-                    <span>{nextLiveClass?.instructor || overview.highlights.modules[0] || 'VaronEnglish'}</span>
-                    <span>{nextLiveClass ? formatDateTime(nextLiveClass.startTime) : 'Upcoming'}</span>
-                  </div>
-                  <button
-                    type="button"
-                    className="mt-4 inline-flex w-full items-center justify-center rounded-[18px] bg-[linear-gradient(135deg,#2f6fe4_0%,#3f82f7_100%)] px-4 py-3 text-sm font-semibold text-white shadow-[0_14px_28px_rgba(47,111,228,0.22)]"
-                  >
-                    Join now
-                  </button>
-                </div>
+                {LIVE_CLASSES_ENABLED ? (
+                  <>
+                    <div className="rounded-[26px] border border-[rgba(103,151,234,0.18)] bg-[linear-gradient(180deg,#ffffff_0%,#f1f7ff_100%)] p-4 shadow-[0_14px_28px_rgba(15,23,42,0.05)]">
+                      <span className="inline-flex rounded-full bg-[#f7a6aa] px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-white">
+                        Live
+                      </span>
+                      <p className="mt-3 text-lg font-semibold text-[var(--ink)]">
+                        {nextLiveClass ? 'Next live session is in progress.' : 'No live class running right now.'}
+                      </p>
+                      <p className="mt-2 text-sm text-[var(--ink-soft)]">
+                        {nextLiveClass
+                          ? nextLiveClass.title
+                          : 'Your next live class will appear here once it is scheduled.'}
+                      </p>
+                      <div className="mt-4 flex items-center justify-between gap-3 text-sm text-[var(--ink-soft)]">
+                        <span>{nextLiveClass?.instructor || overview.highlights.modules[0] || 'VaronEnglish'}</span>
+                        <span>{nextLiveClass ? formatDateTime(nextLiveClass.startTime) : 'Upcoming'}</span>
+                      </div>
+                      <button
+                        type="button"
+                        className="mt-4 inline-flex w-full items-center justify-center rounded-[18px] bg-[linear-gradient(135deg,#2f6fe4_0%,#3f82f7_100%)] px-4 py-3 text-sm font-semibold text-white shadow-[0_14px_28px_rgba(47,111,228,0.22)]"
+                      >
+                        Join now
+                      </button>
+                    </div>
 
-                <div className="rounded-[26px] border border-[rgba(103,151,234,0.16)] bg-white/86 p-4">
-                  <p className="text-xl font-semibold tracking-[-0.03em] text-[var(--ink)]">Upcoming Classes</p>
-                  <div className="mt-4 rounded-[22px] border border-[var(--line)] bg-white p-4">
-                    <div className="grid grid-cols-6 gap-2 text-center text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--ink-soft)]">
-                      {['M', 'T', 'W', 'T', 'F', 'S'].map((day, index) => (
-                        <span key={`${day}-${index}`}>{day}</span>
-                      ))}
-                    </div>
-                    <div className="mt-4 space-y-3">
-                      {(overview.liveClasses.slice(0, 2).length > 0 ? overview.liveClasses.slice(0, 2) : [null]).map((liveClass, index) => (
-                        <div key={liveClass?._id || `live-placeholder-${index}`} className="flex items-center justify-between gap-4">
-                          <div>
-                            <p className="text-sm font-semibold text-[var(--ink)]">
-                              {liveClass ? new Intl.DateTimeFormat('en-IN', { hour: 'numeric', minute: '2-digit' }).format(new Date(liveClass.startTime)) : '3:00 PM'}
-                            </p>
-                            <p className="mt-1 text-sm text-[var(--ink-soft)]">{liveClass?.title || 'General Awareness'}</p>
-                          </div>
-                          <span className="rounded-full bg-[var(--accent-cream)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-rust)]">
-                            {liveClass?.status || 'scheduled'}
-                          </span>
+                    <div className="rounded-[26px] border border-[rgba(103,151,234,0.16)] bg-white/86 p-4">
+                      <p className="text-xl font-semibold tracking-[-0.03em] text-[var(--ink)]">Upcoming Classes</p>
+                      <div className="mt-4 rounded-[22px] border border-[var(--line)] bg-white p-4">
+                        <div className="grid grid-cols-6 gap-2 text-center text-[11px] font-semibold uppercase tracking-[0.18em] text-[var(--ink-soft)]">
+                          {['M', 'T', 'W', 'T', 'F', 'S'].map((day, index) => (
+                            <span key={`${day}-${index}`}>{day}</span>
+                          ))}
                         </div>
-                      ))}
+                        <div className="mt-4 space-y-3">
+                          {(overview.liveClasses.slice(0, 2).length > 0 ? overview.liveClasses.slice(0, 2) : [null]).map((liveClass, index) => (
+                            <div key={liveClass?._id || `live-placeholder-${index}`} className="flex items-center justify-between gap-4">
+                              <div>
+                                <p className="text-sm font-semibold text-[var(--ink)]">
+                                  {liveClass ? new Intl.DateTimeFormat('en-IN', { hour: 'numeric', minute: '2-digit' }).format(new Date(liveClass.startTime)) : '3:00 PM'}
+                                </p>
+                                <p className="mt-1 text-sm text-[var(--ink-soft)]">{liveClass?.title || 'General Awareness'}</p>
+                              </div>
+                              <span className="rounded-full bg-[var(--accent-cream)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-rust)]">
+                                {liveClass?.status || 'scheduled'}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        className="mt-4 inline-flex w-full items-center justify-center rounded-[18px] bg-[linear-gradient(135deg,#2f6fe4_0%,#3f82f7_100%)] px-4 py-3 text-sm font-semibold text-white shadow-[0_14px_28px_rgba(47,111,228,0.22)]"
+                      >
+                        View timetable
+                      </button>
                     </div>
-                  </div>
-                  <button
-                    type="button"
-                    className="mt-4 inline-flex w-full items-center justify-center rounded-[18px] bg-[linear-gradient(135deg,#2f6fe4_0%,#3f82f7_100%)] px-4 py-3 text-sm font-semibold text-white shadow-[0_14px_28px_rgba(47,111,228,0.22)]"
-                  >
-                    View timetable
-                  </button>
-                </div>
+                  </>
+                ) : null}
               </div>
             </div>
 
@@ -7141,16 +7829,9 @@ const AnalyticsTab = ({ overview }: { overview: PlatformOverview }) => {
         <div className="mt-6 rounded-[24px] bg-[var(--accent-cream)] p-4">
           <p className="text-sm font-semibold text-[var(--ink)]">Performance trend</p>
           <div className="mt-4 h-64">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={overview.analytics.trend}>
-                <CartesianGrid strokeDasharray="3 3" stroke="rgba(148, 163, 184, 0.25)" />
-                <XAxis dataKey="label" stroke="#6b7280" tickLine={false} axisLine={false} />
-                <YAxis stroke="#6b7280" tickLine={false} axisLine={false} width={42} />
-                <Tooltip />
-                <Line type="monotone" dataKey="accuracy" stroke="#c25b2d" strokeWidth={3} dot={{ r: 4 }} name="Accuracy %" />
-                <Line type="monotone" dataKey="score" stroke="#0f172a" strokeWidth={3} dot={{ r: 4 }} name="Score" />
-              </LineChart>
-            </ResponsiveContainer>
+            <Suspense fallback={<DeferredPanelFallback label="analytics trend" minHeightClass="h-full min-h-0" />}>
+              <LazyAnalyticsTrendChart data={overview.analytics.trend} />
+            </Suspense>
           </div>
         </div>
         <div className="mt-6 flex flex-wrap gap-2">
@@ -7204,7 +7885,39 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
     const discountedPrice = safePrice * (1 - (safeOffer / 100));
     return Math.max(Number(discountedPrice.toFixed(2)), 0);
   };
-  const [activeAdminSection, setActiveAdminSection] = useState<'overview' | 'courses' | 'curriculum' | 'assessments' | 'security'>('overview');
+  const renderLazyAdminPanel = (content: React.ReactNode, label: string, minHeightClass = 'min-h-[260px]') => (
+    <Suspense fallback={<DeferredPanelFallback label={label} minHeightClass={minHeightClass} />}>
+      {content}
+    </Suspense>
+  );
+  const [activeAdminSection, setActiveAdminSection] = useState<'overview' | 'students' | 'login-sessions' | 'payments' | 'course-access' | 'manual-review' | 'lesson-doubts' | 'reports' | 'system-health' | 'audit-logs' | 'courses' | 'curriculum' | 'assessments' | 'security'>(() => {
+    if (typeof window === 'undefined') {
+      return 'overview';
+    }
+    const saved = window.sessionStorage.getItem(ADMIN_SECTION_STORAGE_KEY);
+    if (
+      saved === 'overview'
+      || saved === 'students'
+      || saved === 'login-sessions'
+      || saved === 'payments'
+      || saved === 'course-access'
+      || saved === 'manual-review'
+      || saved === 'system-health'
+      || saved === 'audit-logs'
+      || saved === 'courses'
+      || saved === 'curriculum'
+      || saved === 'assessments'
+      || saved === 'security'
+    ) {
+      return saved;
+    }
+    return 'overview';
+  });
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      window.sessionStorage.setItem(ADMIN_SECTION_STORAGE_KEY, activeAdminSection);
+    }
+  }, [activeAdminSection]);
   const [courseForm, setCourseForm] = useState({
     title: '',
     description: '',
@@ -8028,16 +8741,25 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
   };
 
   const adminSections: Array<{
-    id: 'overview' | 'courses' | 'curriculum' | 'assessments' | 'security';
+    id: 'overview' | 'students' | 'login-sessions' | 'payments' | 'course-access' | 'manual-review' | 'lesson-doubts' | 'reports' | 'system-health' | 'audit-logs' | 'courses' | 'curriculum' | 'assessments' | 'security';
     label: string;
     caption: string;
     icon: React.ComponentType<{ className?: string }>;
   }> = [
-    { id: 'overview', label: 'Overview', caption: 'Health and readiness', icon: LayoutDashboard },
-    { id: 'courses', label: 'Courses', caption: 'Catalog and pricing', icon: BookOpen },
-    { id: 'curriculum', label: 'Curriculum', caption: 'Subjects and video assets', icon: GraduationCap },
-    { id: 'assessments', label: 'Assessments', caption: 'CBT and mock tests', icon: ClipboardCheck },
-    { id: 'security', label: 'Security', caption: 'Sessions and devices', icon: ShieldCheck },
+    { id: 'overview', label: 'Overview', caption: 'Health, students, and payment readiness', icon: LayoutDashboard },
+    { id: 'courses', label: 'Courses', caption: 'Create courses and manage catalog', icon: BookOpen },
+    { id: 'curriculum', label: 'Curriculum', caption: 'Subjects, lectures, and video uploads', icon: GraduationCap },
+    { id: 'assessments', label: 'Assessments', caption: 'CBT, mock tests, and mock-test video upload', icon: ClipboardCheck },
+    { id: 'students', label: 'Students', caption: 'Profiles and admin account controls', icon: UserCircle2 },
+    { id: 'login-sessions', label: 'Login Sessions', caption: 'Logged-in students and device activity', icon: ShieldCheck },
+    { id: 'payments', label: 'Payments', caption: 'Razorpay sync and transaction status', icon: Wallet },
+    { id: 'course-access', label: 'Course Access', caption: 'Enrollment and validity controls', icon: BookOpen },
+    { id: 'manual-review', label: 'Manual Review', caption: 'Unsafe payment mismatches', icon: AlertTriangle },
+    { id: 'lesson-doubts', label: 'Lesson Doubts', caption: 'Student questions from lessons', icon: MessageSquare },
+    { id: 'reports', label: 'Video Reports', caption: 'Learner issue reports from the player', icon: AlertTriangle },
+    { id: 'security', label: 'Security', caption: 'Recent device activity and security events', icon: Activity },
+    { id: 'system-health', label: 'System Health', caption: 'Backend and DB visibility', icon: Activity },
+    { id: 'audit-logs', label: 'Audit Logs', caption: 'Admin action history', icon: ClipboardCheck },
   ];
 
   return (
@@ -8103,115 +8825,11 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
       )}
 
       {activeAdminSection === 'overview' && (
-        <div className="space-y-6">
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
-            <MetricCard title="Active users" value={`${overview.adminOverview?.activeUsers || 0}`} hint="Current registered learners" icon={UserCircle2} />
-            <MetricCard title="Active sessions" value={`${overview.adminOverview?.activeSessions || 0}`} hint="Single-session protection" icon={ShieldCheck} />
-            <MetricCard title="Revenue" value={currency.format(overview.adminOverview?.revenue || 0)} hint="Paid backend totals" icon={Wallet} />
-            <MetricCard title="Participation" value={`${overview.adminOverview?.testParticipation || 0}`} hint="CBT and mock test submissions" icon={ClipboardCheck} />
-            <MetricCard title="Capacity target" value={overview.adminOverview?.concurrentCapacityTarget || '10K'} hint="Target concurrency" icon={Gauge} />
-          </div>
-
-          <section className="rounded-[30px] border border-white/70 bg-white/92 p-6 shadow-[0_20px_60px_rgba(15,23,42,0.07)]">
-            <div className="flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
-              <div className="max-w-xl">
-                <SectionHeader title="Major announcement" caption="Send important updates to learners with a clear in-app destination" />
-              </div>
-              <button
-                type="button"
-                onClick={() => void sendMajorAnnouncement()}
-                disabled={busy}
-                className="inline-flex h-12 items-center justify-center gap-2 rounded-[16px] bg-[#1b5fe3] px-5 text-sm font-semibold text-white shadow-[0_14px_28px_rgba(37,99,235,0.18)] transition hover:bg-[#164fc2] disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                {busy ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-                Send announcement
-              </button>
-            </div>
-            <div className="mt-5 grid gap-3 lg:grid-cols-[0.9fr_1.3fr_0.7fr]">
-              <input
-                value={announcementForm.title}
-                onChange={(event) => setAnnouncementForm((current) => ({ ...current, title: event.target.value }))}
-                placeholder="Title"
-                className="h-12 rounded-[16px] border border-[#dfe8f6] bg-[#f8fbff] px-4 text-sm font-medium text-[#20335c] outline-none placeholder:text-[#8b9ab3] focus:border-[#2f6fe4]/45"
-              />
-              <input
-                value={announcementForm.message}
-                onChange={(event) => setAnnouncementForm((current) => ({ ...current, message: event.target.value }))}
-                placeholder="Message"
-                className="h-12 rounded-[16px] border border-[#dfe8f6] bg-[#f8fbff] px-4 text-sm font-medium text-[#20335c] outline-none placeholder:text-[#8b9ab3] focus:border-[#2f6fe4]/45"
-              />
-              <select
-                value={announcementForm.targetTab}
-                onChange={(event) => setAnnouncementForm((current) => ({ ...current, targetTab: event.target.value as TabKey }))}
-                className="h-12 rounded-[16px] border border-[#dfe8f6] bg-[#f8fbff] px-4 text-sm font-semibold text-[#20335c] outline-none focus:border-[#2f6fe4]/45"
-              >
-                <option value="overview">Home</option>
-                <option value="courses">Courses</option>
-                <option value="live">Live</option>
-                <option value="tests">Tests</option>
-                <option value="revision">Revision</option>
-              </select>
-            </div>
-          </section>
-
-          <div className="grid gap-6 xl:grid-cols-[0.95fr_1.05fr]">
-            <section className="rounded-[30px] border border-white/70 bg-white/92 p-6 shadow-[0_20px_60px_rgba(15,23,42,0.07)]">
-              <SectionHeader title="Operational posture" caption="What this admin system is optimized for" />
-              <div className="mt-6 space-y-4">
-                <div className="rounded-[24px] bg-[var(--accent-cream)] p-5 text-sm leading-7 text-[var(--ink-soft)]">
-                  This admin panel now separates strategy from execution. Use overview for readiness, then move into focused tabs for course catalog changes, curriculum work, assessments, and security checks.
-                </div>
-                <div className="rounded-[24px] border border-[var(--line)] bg-white p-5">
-                  <p className="text-sm font-semibold text-[var(--ink)]">AI provider status</p>
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    {aiProviderOptions.map((provider) => (
-                      <span
-                        key={provider.id}
-                        className={cn(
-                          'rounded-full px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em]',
-                          provider.available
-                            ? provider.mode === 'fallback'
-                              ? 'bg-[var(--accent-cream)] text-[var(--accent-rust)]'
-                              : 'bg-[var(--success-soft)] text-[var(--success)]'
-                            : 'bg-slate-100 text-slate-500',
-                        )}
-                      >
-                        {provider.label} • {provider.available ? provider.mode : 'off'}
-                      </span>
-                    ))}
-                  </div>
-                  <p className="mt-3 text-sm text-[var(--ink-soft)]">
-                    For low-cost production use, set `GEMINI_API_KEY`. For any other model vendor, configure `AI_API_KEY`, `AI_BASE_URL`, and `AI_MODEL`.
-                  </p>
-                </div>
-              </div>
-            </section>
-
-            <section className="rounded-[30px] border border-white/70 bg-white/92 p-6 shadow-[0_20px_60px_rgba(15,23,42,0.07)]">
-              <SectionHeader title="Recent device activity" caption="Latest security and session events" />
-              <div className="mt-6 grid gap-3">
-                {(overview.adminOverview?.recentDeviceActivity || []).slice(0, 6).map((activity) => (
-                  <div key={activity._id} className="rounded-[22px] bg-[var(--accent-cream)] p-4">
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <p className="text-sm font-semibold text-[var(--ink)]">{formatEventLabel(activity.eventType)}</p>
-                        <p className="mt-1 text-xs uppercase tracking-[0.16em] text-[var(--ink-soft)]">{activity.device || 'unknown device'}</p>
-                      </div>
-                      <span className="rounded-full bg-white px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-[var(--ink-soft)]">
-                        {formatDateTime(activity.createdAt)}
-                      </span>
-                    </div>
-                    <p className="mt-3 text-sm text-[var(--ink-soft)]">User: {activity.userId}</p>
-                  </div>
-                ))}
-                {(overview.adminOverview?.recentDeviceActivity || []).length === 0 && (
-                  <div className="rounded-[22px] border border-dashed border-[var(--line)] p-5 text-sm text-[var(--ink-soft)]">
-                    No recent device activity is available yet.
-                  </div>
-                )}
-              </div>
-            </section>
-          </div>
+        <div data-testid="admin-overview-loaded">
+          {renderLazyAdminPanel(
+            <LazyAdminPaymentControlCenter section="overview" courses={overview.courses || []} />,
+            'admin overview',
+          )}
         </div>
       )}
 
@@ -8276,7 +8894,92 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
             </div>
           </section>
 
-          <AdminCourseManager courses={overview.courses || []} onCoursesChanged={onRefresh} />
+          {renderLazyAdminPanel(
+            <LazyAdminCourseManager courses={overview.courses || []} onCoursesChanged={onRefresh} />,
+            'course manager',
+            'min-h-[320px]',
+          )}
+        </div>
+      )}
+
+      {activeAdminSection === 'students' && (
+        <div data-testid="admin-students-loaded">
+          {renderLazyAdminPanel(
+            <LazyAdminPaymentControlCenter section="students" courses={overview.courses || []} />,
+            'student operations',
+          )}
+        </div>
+      )}
+
+      {activeAdminSection === 'login-sessions' && (
+        <div data-testid="admin-login-sessions-loaded">
+          {renderLazyAdminPanel(
+            <LazyAdminPaymentControlCenter section="login-sessions" courses={overview.courses || []} />,
+            'login sessions',
+          )}
+        </div>
+      )}
+
+      {activeAdminSection === 'payments' && (
+        <div data-testid="admin-payments-loaded">
+          {renderLazyAdminPanel(
+            <LazyAdminPaymentControlCenter section="payments" courses={overview.courses || []} />,
+            'payments',
+          )}
+        </div>
+      )}
+
+      {activeAdminSection === 'course-access' && (
+        <div data-testid="admin-course-access-loaded">
+          {renderLazyAdminPanel(
+            <LazyAdminPaymentControlCenter section="course-access" courses={overview.courses || []} />,
+            'course access',
+          )}
+        </div>
+      )}
+
+      {activeAdminSection === 'manual-review' && (
+        <div data-testid="admin-manual-review-loaded">
+          {renderLazyAdminPanel(
+            <LazyAdminPaymentControlCenter section="manual-review" courses={overview.courses || []} />,
+            'manual review',
+          )}
+        </div>
+      )}
+
+      {activeAdminSection === 'lesson-doubts' && (
+        <div data-testid="admin-lesson-doubts-loaded">
+          {renderLazyAdminPanel(
+            <LazyAdminSupportCenter section="lesson-doubts" />,
+            'lesson doubts',
+          )}
+        </div>
+      )}
+
+      {activeAdminSection === 'reports' && (
+        <div data-testid="admin-reports-loaded">
+          {renderLazyAdminPanel(
+            <LazyAdminSupportCenter section="reports" />,
+            'lesson reports',
+          )}
+        </div>
+      )}
+
+      {activeAdminSection === 'system-health' && (
+        <div data-testid="admin-system-health-loaded">
+          {renderLazyAdminPanel(
+            <LazyAdminPaymentControlCenter section="system-health" courses={overview.courses || []} />,
+            'system health',
+          )}
+        </div>
+      )}
+
+      {activeAdminSection === 'audit-logs' && (
+        <div data-testid="admin-audit-logs-loaded">
+          {renderLazyAdminPanel(
+            <LazyAdminPaymentControlCenter section="audit-logs" courses={overview.courses || []} />,
+            'audit logs',
+          )}
         </div>
       )}
 
@@ -8310,8 +9013,26 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
             </section>
           </div>
 
-          <AdminModuleManager courses={overview.courses || []} onModulesChanged={onRefresh} />
-          <AdminVideoUpload courses={overview.courses || []} onVideoUploaded={onRefresh} />
+          {renderLazyAdminPanel(
+            <LazyAdminModuleManager courses={overview.courses || []} onModulesChanged={onRefresh} />,
+            'curriculum manager',
+            'min-h-[320px]',
+          )}
+          {renderLazyAdminPanel(
+            <LazyAdminPdfUpload courses={overview.courses || []} onPdfUploaded={onRefresh} />,
+            'pdf uploads',
+            'min-h-[280px]',
+          )}
+          {renderLazyAdminPanel(
+            <LazyAdminVideoUpload courses={overview.courses || []} onVideoUploaded={onRefresh} />,
+            'video uploads',
+            'min-h-[280px]',
+          )}
+          {renderLazyAdminPanel(
+            <LazyAdminEditorialVideoUpload courses={overview.courses || []} onVideoUploaded={onRefresh} />,
+            'editorial video uploads',
+            'min-h-[280px]',
+          )}
         </div>
       )}
 
@@ -8489,7 +9210,11 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
             </section>
           </div>
 
-          <AdminMockTestVideoUpload tests={existingFullMockTests} onVideoUploaded={onRefresh} />
+          {renderLazyAdminPanel(
+            <LazyAdminMockTestVideoUpload tests={existingFullMockTests} onVideoUploaded={onRefresh} />,
+            'mock test video uploads',
+            'min-h-[280px]',
+          )}
         </div>
       )}
 
@@ -8500,7 +9225,7 @@ const AdminTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
             {(overview.adminOverview?.recentDeviceActivity || []).map((activity) => (
               <div key={activity._id} className="rounded-[22px] bg-[var(--accent-cream)] p-4">
                 <p className="text-sm font-semibold text-[var(--ink)]">{formatEventLabel(activity.eventType)}</p>
-                <p className="mt-1 text-xs uppercase tracking-[0.16em] text-[var(--ink-soft)]">{activity.device || 'unknown device'}</p>
+                <p className="mt-1 text-xs uppercase tracking-[0.16em] text-[var(--ink-soft)]">{formatDeviceLabel(activity.device)}</p>
                 <p className="mt-3 text-sm text-[var(--ink-soft)]">User: {activity.userId}</p>
                 <p className="mt-1 text-sm text-[var(--ink-soft)]">{formatDateTime(activity.createdAt)}</p>
               </div>
@@ -8522,7 +9247,7 @@ const AppContent = () => {
   const [overview, setOverview] = useState<PlatformOverview | null>(null);
   const [activeTab, setActiveTab] = useState<TabKey>('overview');
   const [loadingOverview, setLoadingOverview] = useState(true);
-  const [resumeTarget, setResumeTarget] = useState<{ courseId: string; lessonId?: string | null; doubtThreadId?: string | null } | null>(null);
+  const [resumeTarget, setResumeTarget] = useState<{ courseId: string; lessonId?: string | null; doubtThreadId?: string | null; reportId?: string | null; supportPanel?: 'doubts' | 'report' | null } | null>(null);
   const [savedTopicIds, setSavedTopicIds] = useState<string[]>([]);
   const overviewRequestRef = useRef<Promise<PlatformOverview | null> | null>(null);
 
@@ -8591,12 +9316,14 @@ const AppContent = () => {
     const lessonId = params.get('lessonId');
     const doubtThreadId = params.get('doubtThreadId');
 
-    if (tab && tab in shellTabMeta) {
+    if (tab === 'live' && !LIVE_CLASSES_ENABLED) {
+      setActiveTab('overview');
+    } else if (tab && tab in shellTabMeta) {
       setActiveTab(tab as TabKey);
     }
 
     if (tab === 'courses' && courseId) {
-      setResumeTarget({ courseId, lessonId: lessonId || null, doubtThreadId: doubtThreadId || null });
+      setResumeTarget({ courseId, lessonId: lessonId || null, doubtThreadId: doubtThreadId || null, reportId: params.get('reportId') || null, supportPanel: (params.get('supportPanel') as 'doubts' | 'report' | null) || null });
     }
   }, []);
 
@@ -8700,7 +9427,7 @@ const AppContent = () => {
         await refreshOverview(true);
       }}
       resumeTarget={resumeTarget}
-      onContinueLearningNavigate={(courseId, lessonId, doubtThreadId) => setResumeTarget({ courseId, lessonId, doubtThreadId })}
+      onContinueLearningNavigate={(courseId, lessonId, doubtThreadId, reportId, supportPanel) => setResumeTarget({ courseId, lessonId, doubtThreadId, reportId, supportPanel })}
       onOpenNotification={openNotification}
       onResumeNavigationHandled={() => setResumeTarget(null)}
       savedTopicIds={savedTopicIds}

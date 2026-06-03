@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
+  BellRing,
   BookOpen,
   CalendarClock,
   ChevronRight,
@@ -9,11 +10,13 @@ import {
   Radio,
   Target,
 } from 'lucide-react';
-import { CourseCard, LiveClass, MockTest, PlatformOverview } from '../types';
+import { CourseCard, LiveClass, MockTest, NotificationItem, PlatformOverview } from '../types';
+import { LIVE_CLASSES_ENABLED } from '../lib/featureFlags';
 
 type OverviewFigmaTabProps = {
   overview: PlatformOverview;
   onContinueLearning: (courseId: string, lessonId?: string | null) => void;
+  onOpenNotification?: (notification: NotificationItem) => void;
   onOpenLiveTab?: () => void;
   onOpenTestsTab?: () => void;
   onOpenRevisionTab?: () => void;
@@ -40,6 +43,15 @@ const isSameLocalDay = (value: string | null | undefined, date: Date) => {
 const formatClassTime = (value: string) =>
   new Intl.DateTimeFormat('en-IN', { hour: 'numeric', minute: '2-digit', hour12: true }).format(new Date(value));
 
+const formatAnnouncementTime = (value: string) =>
+  new Intl.DateTimeFormat('en-IN', {
+    day: '2-digit',
+    month: 'short',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  }).format(new Date(value));
+
 const currency = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 });
 
 const getCourseSubtitle = (course: CourseCard) =>
@@ -57,12 +69,14 @@ const getOverviewCoursePricing = (course: CourseCard) => {
   const finalPrice = getDiscountedCoursePrice(course);
   const offerPercentage = Number(course.offerPercentage || 0);
   const savings = Math.max(basePrice - finalPrice, 0);
+  const hasOffer = offerPercentage > 0 && savings > 0 && finalPrice < basePrice;
 
   return {
     basePrice,
     finalPrice,
     offerPercentage,
     savings,
+    hasOffer,
   };
 };
 
@@ -274,6 +288,7 @@ const ClassItem = ({ item, onOpenLiveTab }: { item: LiveClass; onOpenLiveTab?: (
 export const OverviewFigmaTab = ({
   overview,
   onContinueLearning,
+  onOpenNotification,
   onOpenLiveTab,
   onOpenTestsTab,
   onOpenRevisionTab,
@@ -354,6 +369,21 @@ export const OverviewFigmaTab = ({
   const recommendation = overview.analytics.attempts > 0
     ? overview.analytics.suggestions[0] || overview.analytics.adaptivePlan.reason
     : null;
+  const announcementItems = useMemo(
+    () => (overview.notifications || [])
+      .filter((notification) => {
+        const type = String(notification.type || '').toLowerCase();
+        return type === 'announcement' || type.includes('announcement') || type.includes('news');
+      })
+      .sort((left, right) => {
+        if (Boolean(left.isRead) !== Boolean(right.isRead)) {
+          return left.isRead ? 1 : -1;
+        }
+        return new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime();
+      })
+      .slice(0, 3),
+    [overview.notifications],
+  );
 
   const openCourse = (course: CourseCard | null) => {
     if (!course) {
@@ -504,18 +534,20 @@ export const OverviewFigmaTab = ({
                   </p>
                   {!course.enrolled && (
                     <div className="relative z-10 mt-[10px] inline-flex max-w-[138px] flex-col rounded-[10px] bg-white/18 px-[8px] py-[7px] backdrop-blur-[6px]">
-                      <p className="text-[9px] font-semibold uppercase tracking-[0.08em] text-white/74">Offer price</p>
+                      {getOverviewCoursePricing(course).hasOffer && (
+                        <p className="text-[9px] font-semibold uppercase tracking-[0.08em] text-white/74">Offer price</p>
+                      )}
                       <p className="mt-[2px] text-[13px] font-extrabold text-white">
                         {currency.format(getOverviewCoursePricing(course).finalPrice)}
                       </p>
-                      <div className="mt-[3px] flex items-center gap-[5px] text-[9px] font-semibold text-white/84">
-                        <span className="line-through decoration-white/65">{currency.format(getOverviewCoursePricing(course).basePrice)}</span>
-                        {getOverviewCoursePricing(course).offerPercentage > 0 && (
+                      {getOverviewCoursePricing(course).hasOffer && (
+                        <div className="mt-[3px] flex items-center gap-[5px] text-[9px] font-semibold text-white/84">
+                          <span className="line-through decoration-white/65">{currency.format(getOverviewCoursePricing(course).basePrice)}</span>
                           <span className="rounded-full bg-[#ffd36f] px-[5px] py-[1px] text-[#6a3b00]">
                             {getOverviewCoursePricing(course).offerPercentage}% OFF
                           </span>
-                        )}
-                      </div>
+                        </div>
+                      )}
                     </div>
                   )}
                   {renderMobileCourseArt(tone, index)}
@@ -583,7 +615,7 @@ export const OverviewFigmaTab = ({
               ? `Next lesson: ${heroCourse.continueLesson.title}`
               : heroCourse
                 ? getCourseSubtitle(heroCourse)
-                : 'Enroll in a course to start tracking lessons, progress, tests, and live classes here.'}
+                : 'Enroll in a course to start tracking lessons, progress, and tests here.'}
           </p>
 
           {heroCourse && (
@@ -650,7 +682,7 @@ export const OverviewFigmaTab = ({
                 </div>
                 <div className="flex items-center gap-[10px] text-[13px] text-[#53647d]">
                   <CalendarClock className="h-4 w-4 text-[#f0b557]" />
-                  <span>{todayClasses.length > 0 ? `${todayClasses.length} class${todayClasses.length > 1 ? 'es' : ''} today` : 'No live classes scheduled today'}</span>
+                  <span>{todayClasses.length > 0 ? `${todayClasses.length} class${todayClasses.length > 1 ? 'es' : ''} today` : 'No classes scheduled today'}</span>
                 </div>
               </div>
             </div>
@@ -731,6 +763,55 @@ export const OverviewFigmaTab = ({
     </section>
   );
 
+  const renderAnnouncements = () => (
+    <section data-testid="overview-announcements" className="space-y-[10px]">
+      <div className="flex items-center justify-between gap-3">
+        <SectionTitle>Major Announcements</SectionTitle>
+        <div className="flex h-[34px] w-[34px] items-center justify-center rounded-[10px] bg-[#eef4ff] text-[#2f6fe4]">
+          <BellRing className="h-4 w-4" />
+        </div>
+      </div>
+      {announcementItems.length === 0 ? (
+        <EmptyState
+          title="No announcements right now"
+          body="Major news from admin will appear here when it is sent."
+        />
+      ) : (
+        <div className="space-y-[12px]">
+          {announcementItems.map((notification) => (
+            <button
+              key={notification._id}
+              type="button"
+              onClick={() => onOpenNotification?.(notification)}
+              className={`w-full rounded-[18px] border px-[16px] py-[14px] text-left shadow-[0_8px_22px_rgba(28,41,61,0.05)] transition hover:border-[#c6d9f7] hover:bg-[#f8fbff] ${
+                notification.isRead ? 'border-[#dbe5f2] bg-white' : 'border-[#d6e6ff] bg-[#eef5ff]'
+              }`}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-[14px] font-semibold text-[#17233d]">{notification.title}</p>
+                  <p className="mt-[6px] text-[13px] leading-6 text-[#53647d]">{notification.message}</p>
+                </div>
+                {!notification.isRead && (
+                  <span className="shrink-0 rounded-full bg-[#2f6fe4] px-[8px] py-[3px] text-[10px] font-semibold uppercase tracking-[0.08em] text-white">
+                    New
+                  </span>
+                )}
+              </div>
+              <div className="mt-[10px] flex items-center justify-between gap-3">
+                <span className="text-[12px] text-[#6b7c95]">{formatAnnouncementTime(notification.createdAt)}</span>
+                <span className="inline-flex items-center gap-1 text-[12px] font-semibold text-[#2f6fe4]">
+                  {notification.actionLabel || 'Open update'}
+                  <ChevronRight className="h-4 w-4" />
+                </span>
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+
   const renderRevision = () => (
     <section className="space-y-[10px]">
       <SectionTitle>Quick Revision</SectionTitle>
@@ -771,7 +852,7 @@ export const OverviewFigmaTab = ({
       <p className="text-[15px] font-semibold text-[#17233d]">Today&apos;s Schedule</p>
       {todayClasses.length === 0 ? (
         <div className="mt-[16px]">
-          <EmptyState title="No classes today" body="Published live classes for today will appear here automatically." />
+          <EmptyState title="No classes today" body="Scheduled classes for today will appear here automatically." />
         </div>
       ) : (
         <div className="relative mt-[18px] pl-[18px]">
@@ -888,11 +969,12 @@ export const OverviewFigmaTab = ({
         <div className="mobile-safe-content mx-auto space-y-[14px] pb-[18px] pt-[12px]">
           {renderHeader()}
           {renderMobileCourseCarousel()}
+          {renderAnnouncements()}
           {renderPerformance()}
           {renderRecommendation()}
           {renderRevision()}
           <div data-testid="overview-action-queue" className="grid grid-cols-1 gap-[12px]">
-            {renderLiveSchedule()}
+            {LIVE_CLASSES_ENABLED && (onOpenLiveTab || todayClasses.length > 0) ? renderLiveSchedule() : null}
             {renderTests()}
             {renderProgress()}
             {renderSession()}
@@ -913,6 +995,7 @@ export const OverviewFigmaTab = ({
         <div className="mt-[18px] grid min-h-0 flex-1 grid-cols-1 gap-[16px] lg:grid-cols-[minmax(0,1fr)_292px]">
           <div className="min-w-0 space-y-[14px]">
             {renderHero()}
+            {renderAnnouncements()}
             {renderCourses()}
             {renderPerformance()}
             {renderRecommendation()}
@@ -920,7 +1003,7 @@ export const OverviewFigmaTab = ({
           </div>
 
           <aside data-testid="overview-action-queue" className="space-y-[14px]">
-            {renderLiveSchedule()}
+            {LIVE_CLASSES_ENABLED && (onOpenLiveTab || todayClasses.length > 0) ? renderLiveSchedule() : null}
             {renderTests()}
             {renderProgress()}
             {renderSession()}

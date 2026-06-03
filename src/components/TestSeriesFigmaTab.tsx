@@ -26,6 +26,7 @@ import {
   X,
 } from 'lucide-react';
 import { EduService } from '../EduService';
+import { LIVE_CLASSES_ENABLED } from '../lib/featureFlags';
 import { LiveClass, MockQuestion, MockTest, PlatformOverview, ProtectedLessonPlayback, TestAttemptResult } from '../types';
 import { cn } from '../lib/utils';
 import { BrandLogo } from './BrandLogo';
@@ -985,13 +986,15 @@ export const TestSeriesFigmaTab = ({
           usersLabel: test.category || 'Mock Test',
           button: index === 0 ? 'Resume Now' : 'Start Now',
           companionAction: 'Watch Video',
-          companionMeta: 'Create or join an explanation class',
+          companionMeta: 'Explanation support for this test',
           companionTone: 'amber',
         }))
         : [];
 
       return sourceTests.map((card) => {
-      const linkedLiveClass = findLinkedLiveClassForTest(overview.liveClasses || [], card.title, card.mockTestId);
+      const linkedLiveClass = LIVE_CLASSES_ENABLED
+        ? findLinkedLiveClassForTest(overview.liveClasses || [], card.title, card.mockTestId)
+        : null;
       const defaultMeta = splitCompanionMeta(card.companionMeta);
       const linkedTest = fullMockTests.find((entry) => entry._id === card.mockTestId) || null;
 
@@ -3549,6 +3552,11 @@ export const TestSeriesFigmaTab = ({
                     watermarkText={activeCompanionVideoPlayback.watermarkText}
                     streamFormat={activeCompanionVideoPlayback.drmConfig?.manifestFormat || activeCompanionVideoPlayback.streamFormat}
                     trackVideoId={activeCompanionVideoTest.companionVideo?.id || activeCompanionVideoTest._id}
+                    trackCourseId={activeCompanionVideoPlayback.courseId || activeCompanionVideoTest.course || activeCompanionVideoTest._id}
+                    trackLessonId={activeCompanionVideoPlayback.videoId || activeCompanionVideoTest.companionVideo?.id || activeCompanionVideoTest._id}
+                    trackVideoType={activeCompanionVideoPlayback.videoType || 'explanation'}
+                    playbackSessionId={activeCompanionVideoPlayback.playbackSessionId || null}
+                    resumeSeconds={activeCompanionVideoPlayback.resumeSeconds ?? 0}
                     autoPlay
                     className="aspect-video w-full"
                   />

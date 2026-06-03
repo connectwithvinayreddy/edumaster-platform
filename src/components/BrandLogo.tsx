@@ -11,29 +11,11 @@ type BrandLogoProps = {
   hideText?: boolean;
 };
 
-const titleSizeMap: Record<BrandLogoSize, string> = {
-  sm: 'text-[22px] leading-none',
-  md: 'text-[28px] leading-none',
-  lg: 'text-[34px] leading-none',
-  xl: 'text-[46px] leading-none',
-};
-
-const taglineSizeMap: Record<BrandLogoSize, string> = {
-  sm: 'text-[9px] tracking-[0.28em]',
-  md: 'text-[10px] tracking-[0.3em]',
-  lg: 'text-[11px] tracking-[0.32em]',
-  xl: 'text-[13px] tracking-[0.34em]',
-};
-
-const toneMap: Record<BrandLogoTone, { title: string; tagline: string }> = {
-  light: {
-    title: 'text-[#16345a]',
-    tagline: 'text-[#c79212]',
-  },
-  dark: {
-    title: 'text-white',
-    tagline: 'text-[#f7cd53]',
-  },
+const sizeMap: Record<BrandLogoSize, string> = {
+  sm: 'h-10 w-10 sm:h-11 sm:w-11',
+  md: 'h-12 w-12 sm:h-14 sm:w-14',
+  lg: 'h-16 w-16 sm:h-20 sm:w-20',
+  xl: 'h-24 w-24 sm:h-28 sm:w-28',
 };
 
 export const BrandLogo = ({
@@ -49,31 +31,17 @@ export const BrandLogo = ({
 
   return (
     <div
-      className={cn('flex flex-col items-start gap-1', className)}
+      className={cn('flex items-center', className)}
       aria-label="VaronEnglish"
       data-tone={tone}
       data-show-tagline={showTagline}
     >
-      <span
-        className={cn(
-          'font-black tracking-[-0.05em]',
-          titleSizeMap[size],
-          toneMap[tone].title,
-        )}
-      >
-        VaronEnglish
-      </span>
-      {showTagline ? (
-        <span
-          className={cn(
-            'font-semibold uppercase leading-none',
-            taglineSizeMap[size],
-            toneMap[tone].tagline,
-          )}
-        >
-          For Competitive Exams
-        </span>
-      ) : null}
+      <img
+        src="/varonenglish-logo.png"
+        alt="VaronEnglish for Competitive Exams"
+        className={cn('max-w-full shrink-0 object-contain', sizeMap[size])}
+        loading="eager"
+      />
     </div>
   );
 };

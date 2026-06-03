@@ -56,7 +56,6 @@ app.use(express.json({
 }));
 app.use(express.urlencoded({ extended: false, limit: '64kb' }));
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
-app.use('/private_uploads', express.static(path.join(process.cwd(), 'private_uploads')));
 app.use(securityHeaders);
 app.use(basicRateLimit);
 

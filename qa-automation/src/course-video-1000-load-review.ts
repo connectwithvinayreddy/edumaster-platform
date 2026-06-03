@@ -5,6 +5,12 @@ import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import dotenv from 'dotenv';
 import { config } from './config.js';
+import {
+  assertMutationAllowed,
+  certificationModeSummary,
+  isProdSafeExistingDataMode,
+  requireValueInProdSafeMode,
+} from './certification-mode.js';
 import { qaFetch } from './network.js';
 
 type Json = Record<string, unknown>;
@@ -187,7 +193,17 @@ type FailureAttribution = {
 
 const runId = new Date().toISOString().replace(/[:.]/g, '-');
 const rootDir = path.resolve(process.cwd());
-dotenv.config({ path: path.resolve(rootDir, '../.env') });
+const resolveRootEnvPath = () => {
+  const workspaceRoot = path.resolve(rootDir, path.basename(rootDir) === 'qa-automation' ? '..' : '.');
+  const requestedEnvFile = String(process.env.ENV_FILE || '').trim();
+  if (requestedEnvFile) {
+    return path.isAbsolute(requestedEnvFile)
+      ? requestedEnvFile
+      : path.resolve(workspaceRoot, requestedEnvFile);
+  }
+  return path.join(workspaceRoot, '.env');
+};
+dotenv.config({ path: resolveRootEnvPath() });
 const require = createRequire(import.meta.url);
 const REPORT_PREFIX = (process.env.COURSE_LOAD_REPORT_PREFIX || 'course-video-1000').trim() || 'course-video-1000';
 const reportDir = path.join(rootDir, 'reports', `${REPORT_PREFIX}-${runId}`);
@@ -242,6 +258,8 @@ const HOT_COURSE_PERCENT = Math.max(0, Math.min(100, Number(process.env.COURSE_L
 const RESOURCE_TELEMETRY_COMMAND = String(process.env.COURSE_LOAD_RESOURCE_COMMAND || '').trim();
 const RESOURCE_TELEMETRY_INTERVAL_SECONDS = Math.max(10, Number(process.env.COURSE_LOAD_RESOURCE_INTERVAL_SECONDS || 60));
 const FAILURE_INJECTIONS_JSON = String(process.env.COURSE_LOAD_FAILURE_INJECTIONS_JSON || '').trim();
+const loadLabel = `${VUS}-user course/video`;
+const PROD_SAFE_MODE = isProdSafeExistingDataMode();
 
 const metrics: Metric[] = [];
 const issues: Issue[] = [];
@@ -352,7 +370,7 @@ const enrollUserLocally = async (userId: string, courseId: string) => {
   await platformRepository.enroll({
     userId,
     courseId,
-    source: 'course-video-1000-load-review',
+    source: 'course-video-load-review',
     accessType: 'course',
   });
 };
@@ -1445,12 +1463,21 @@ const login = async (email: string, password: string, device: string, context: R
 };
 
 const prepareUsers = async (): Promise<LoadUser[]> => {
+  if (PROD_SAFE_MODE) {
+    requireValueInProdSafeMode('COURSE_LOAD_USERS_FILE', EXISTING_USERS_FILE);
+    requireValueInProdSafeMode('COURSE_LOAD_COURSE_ID', COURSE_ID);
+    requireValueInProdSafeMode('COURSE_LOAD_LESSON_ID', LESSON_ID);
+  }
   if (EXISTING_USERS_FILE) {
     const raw = await fs.readFile(EXISTING_USERS_FILE, 'utf8');
     const loaded = JSON.parse(raw) as LoadUser[];
     const selectedUsers = loaded.slice(0, VUS);
     if (selectedUsers.length < VUS) {
-      throw new Error(`Prepared user manifest only contains ${selectedUsers.length} users, but COURSE_LOAD_USERS=${VUS}.`);
+      throw new Error(
+        PROD_SAFE_MODE
+          ? `Prepared user manifest only contains ${selectedUsers.length} users, but COURSE_LOAD_USERS=${VUS}. Prod-safe mode will not create or top up users.`
+          : `Prepared user manifest only contains ${selectedUsers.length} users, but COURSE_LOAD_USERS=${VUS}.`,
+      );
     }
 
     if (!REFRESH_EXISTING_USER_TOKENS) {
@@ -1482,10 +1509,15 @@ const prepareUsers = async (): Promise<LoadUser[]> => {
     return refreshedUsers;
   }
 
+  if (PROD_SAFE_MODE) {
+    throw new Error('COURSE_LOAD_USERS_FILE is required in prod-safe mode because synthetic user creation is disabled.');
+  }
+
   const suffix = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   const indexes = Array.from({ length: VUS }, (_, index) => index);
   const preparedUsers: Array<LoadUser | undefined> = new Array(VUS);
   const users = await runPool(indexes, SETUP_CONCURRENCY, async (index) => {
+    assertMutationAllowed('Creating synthetic course/video load users');
     const email = `course_load_${suffix}_${index}@edumaster.local`;
     const mobileNumber = `9${String(Date.now()).slice(-4)}${String(index).padStart(5, '0')}`;
     try {
@@ -2144,6 +2176,9 @@ ${issueRows}
 
 const main = async () => {
   const runStarted = performance.now();
+  if (PROD_SAFE_MODE && ENROLL_ON_START) {
+    throw new Error('COURSE_LOAD_ENROLL_ON_START is not allowed when QA_CERT_MODE=prod_safe_existing_data_only.');
+  }
   const memorySamples: NodeJS.MemoryUsage[] = [];
   const sampler = setInterval(() => memorySamples.push(process.memoryUsage()), 1000);
   const resourceSampler = RESOURCE_TELEMETRY_COMMAND
@@ -2182,6 +2217,7 @@ const main = async () => {
       const finalMemory = process.memoryUsage();
       const summary = {
         runId,
+        ...certificationModeSummary(),
         baseUrl: apiOrigin,
         apiBase,
         usersRequested: VUS,
@@ -2242,6 +2278,7 @@ const main = async () => {
     const peakHeapUsedMb = Math.round(Math.max(finalMemory.heapUsed, ...memorySamples.map((sample) => sample.heapUsed)) / 1024 / 1024);
     const summary = {
       runId,
+      ...certificationModeSummary(),
       baseUrl: apiOrigin,
       apiBase,
       usersRequested: VUS,
@@ -2274,8 +2311,8 @@ const main = async () => {
       courseAssignments,
       watchMode: WATCH_MODE,
       note: WATCH_MODE
-        ? 'This run validates sustained API-driven course/video watch continuity, periodic manifest refresh, segment continuity, and watch-progress persistence. It does not represent 1000 simultaneous local browsers.'
-        : 'This run validates the 1000-user course/video API path and HLS startup fetches, not 1000 simultaneous local browsers.',
+        ? `This run validates sustained ${loadLabel} watch continuity, periodic manifest refresh, segment continuity, and watch-progress persistence. It does not represent ${VUS} simultaneous local browsers.`
+        : `This run validates the ${loadLabel} API path and HLS startup fetches, not ${VUS} simultaneous local browsers.`,
     };
     await writeReports(summary);
     console.log(JSON.stringify({
@@ -2298,6 +2335,7 @@ const main = async () => {
     const finalMemory = process.memoryUsage();
     const summary = {
       runId,
+      ...certificationModeSummary(),
       baseUrl: apiOrigin,
       usersRequested: VUS,
       totalRequests: metrics.length,

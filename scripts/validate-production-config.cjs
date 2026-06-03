@@ -3,16 +3,18 @@ const path = require('path');
 const dotenv = require('dotenv');
 
 const repoRoot = path.resolve(__dirname, '..');
+const requestedEnvFile = process.env.ENV_FILE ? path.resolve(repoRoot, process.env.ENV_FILE) : null;
 const candidateEnvFiles = [
   path.join(repoRoot, 'functions', '.env'),
-  path.join(repoRoot, '.env.production'),
+  requestedEnvFile || path.join(repoRoot, '.env.production'),
 ];
+const explicitEnvRequested = Boolean(process.env.ENV_FILE);
 
 candidateEnvFiles.forEach((filePath) => {
   if (fs.existsSync(filePath)) {
     dotenv.config({
       path: filePath,
-      override: path.basename(filePath) === '.env.production',
+      override: explicitEnvRequested ? filePath === requestedEnvFile : path.basename(filePath) === '.env.production',
     });
   }
 });

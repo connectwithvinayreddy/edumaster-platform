@@ -1,6 +1,5 @@
 import dotenv from 'dotenv';
 import fs from 'node:fs/promises';
-import { createRequire } from 'node:module';
 import path from 'node:path';
 import { chromium, type Page } from 'playwright';
 
@@ -17,13 +16,20 @@ const uploadCount = Math.max(1, Number(process.env.QA_UPLOAD_COUNT || 2));
 const hlsWaitMs = Math.max(60_000, Number(process.env.QA_HLS_WAIT_MS || 12 * 60_000));
 const browserWaitMs = Math.max(10_000, Number(process.env.QA_BROWSER_WAIT_MS || 30_000));
 const edgeUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0';
-const requireFromHere = createRequire(import.meta.url);
-
+const adminForceLogoutOtherSessions = ['1', 'true', 'yes', 'on'].includes(String(process.env.ADMIN_FORCE_LOGOUT_OTHER_SESSIONS || 'false').toLowerCase());
+const adminTakeoverOnSessionActive = !['0', 'false', 'no', 'off'].includes(String(process.env.ADMIN_TAKEOVER_ON_SESSION_ACTIVE || 'true').toLowerCase());
 type JsonRecord = Record<string, any>;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const iso = () => new Date().toISOString();
 const safe = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+const uniqueDigits = (length: number) => {
+  let value = '';
+  while (value.length < length) {
+    value += `${Date.now()}${Math.floor(Math.random() * 10_000)}`;
+  }
+  return value.slice(-length);
+};
 
 const readEnvFile = async (filePath: string) => {
   const values: Record<string, string> = {};
@@ -64,6 +70,14 @@ const requestJson = async <T = any>(input: string, init: RequestInit = {}): Prom
 
 const authHeaders = (token: string) => ({ authorization: `Bearer ${token}` });
 
+const buildAdminLoginPayload = (email: string, password: string, forceLogoutOtherSessions: boolean) => ({
+  email,
+  identifier: email,
+  password,
+  device: `production-upload-playback-loop-${runId}`,
+  forceLogoutOtherSessions,
+});
+
 const buildApprovedPlaybackHeaders = (token: string, deviceId: string) => ({
   ...authHeaders(token),
   accept: 'application/json',
@@ -80,17 +94,25 @@ const loginAdmin = async (env: Record<string, string>) => {
   if (!email || !password) {
     throw new Error('ADMIN_EMAIL and ADMIN_PASSWORD are required for production QA.');
   }
-  const { data } = await requestJson(`${apiBaseUrl}/auth/login`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      email,
-      identifier: email,
-      password,
-      device: `production-upload-playback-loop-${runId}`,
-      forceLogoutOtherSessions: true,
-    }),
-  });
+  let data: JsonRecord;
+  try {
+    ({ data } = await requestJson(`${apiBaseUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(buildAdminLoginPayload(email, password, adminForceLogoutOtherSessions)),
+    }));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!adminForceLogoutOtherSessions && adminTakeoverOnSessionActive && message.includes('409') && message.includes('already active on another device')) {
+      ({ data } = await requestJson(`${apiBaseUrl}/auth/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(buildAdminLoginPayload(email, password, true)),
+      }));
+    } else {
+      throw error;
+    }
+  }
   const token = data.token || data.accessToken || data.data?.token;
   if (!token) {
     throw new Error('Admin login succeeded but did not return a token.');
@@ -172,19 +194,19 @@ const uploadLesson = async (token: string, courseId: string, moduleId: string, c
   return data.video;
 };
 
-const registerStudent = async () => {
-  const email = `qa.playback.student.${runId}@example.com`;
+const registerStudent = async (label: string) => {
+  const email = `qa.playback.student.${safe(label)}.${runId}@example.com`;
   const password = process.env.QA_STUDENT_PASSWORD || 'Student@123';
-  const mobileNumber = `9${String(Date.now()).slice(-9)}`;
+  const mobileNumber = `9${uniqueDigits(9)}`;
   const { data } = await requestJson(`${apiBaseUrl}/auth/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      name: 'QA Playback Student',
+      name: `QA Playback Student ${label}`,
       email,
       mobileNumber,
       password,
-      device: `production-upload-playback-student-${runId}`,
+      device: `production-upload-playback-student-${safe(label)}-${runId}`,
     }),
   });
   const token = data.token || data.accessToken || data.data?.token;
@@ -195,14 +217,18 @@ const registerStudent = async () => {
   return { token: String(token), user, email, password };
 };
 
-const enrollStudentLocally = async (userId: string, courseId: string) => {
-  const backendEntry = path.join(rootDir, 'backend', 'lib', 'repositories.js');
-  const { platformRepository } = requireFromHere(backendEntry);
-  await platformRepository.enroll({
-    userId,
-    courseId,
-    source: 'production-upload-playback-loop',
-    accessType: 'course',
+const assignCourseAccess = async (adminToken: string, userId: string, courseId: string) => {
+  await requestJson(`${apiBaseUrl}/admin/purchases/assign-course`, {
+    method: 'POST',
+    headers: {
+      ...authHeaders(adminToken),
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      studentId: userId,
+      courseId,
+      adminNote: `Granted by production-course-upload-playback-loop ${runId}`,
+    }),
   });
 };
 
@@ -441,10 +467,14 @@ const verifyBrowserPlayback = async (token: string, courseId: string, lessonId: 
   await page.waitForLoadState('networkidle', { timeout: 60_000 }).catch(() => undefined);
   const courseScreenshot = await saveScreenshot(page, '01-course-route-loaded');
 
-  await Promise.race([
-    page.locator('video').first().waitFor({ timeout: 60_000 }),
-    page.getByText('Video is still preparing').first().waitFor({ timeout: 60_000 }),
-  ]);
+  await page.waitForFunction(() => {
+    const hasVideoElement = Boolean(document.querySelector('video'));
+    const text = String(document.body.textContent || '');
+    return hasVideoElement
+      || text.includes('Video is still preparing')
+      || text.includes('Lesson video unavailable')
+      || text.includes('Protected source playback is temporarily available');
+  }, { timeout: 60_000 });
   const playerScreenshot = await saveScreenshot(page, '02-player-visible');
 
   const clickTargets = [
@@ -473,15 +503,18 @@ const verifyBrowserPlayback = async (token: string, courseId: string, lessonId: 
       const video = document.querySelector('video') as HTMLVideoElement | null;
       const preparing = document.body.textContent?.includes('Video is still preparing') || false;
       const unsupported = document.body.textContent?.includes('protected course videos can be played only') || false;
+      const unavailable = document.body.textContent?.includes('Lesson video unavailable') || false;
       return {
         hasVideo: Boolean(video),
         preparing,
         unsupported,
+        unavailable,
         currentTime: video?.currentTime || 0,
         duration: video?.duration || 0,
         readyState: video?.readyState || 0,
         networkState: video?.networkState || 0,
         paused: video?.paused ?? null,
+        visible: Boolean(video && !!(video.offsetWidth || video.offsetHeight || video.getClientRects().length)),
         videoWidth: video?.videoWidth || 0,
         videoHeight: video?.videoHeight || 0,
         error: video?.error ? {
@@ -494,7 +527,10 @@ const verifyBrowserPlayback = async (token: string, courseId: string, lessonId: 
       maxCurrentTime,
       typeof state.currentTime === 'number' ? Number(state.currentTime) : 0,
     );
-    if (state.hasVideo && !state.preparing && !state.unsupported && state.readyState >= 2 && maxCurrentTime >= 1) {
+    if (state.hasVideo && !state.preparing && !state.unsupported && !state.unavailable && state.readyState >= 2 && maxCurrentTime >= 1) {
+      break;
+    }
+    if (state.unavailable) {
       break;
     }
     if (state.hasVideo && state.paused !== false) {
@@ -525,10 +561,12 @@ const verifyBrowserPlayback = async (token: string, courseId: string, lessonId: 
       const video = document.querySelector('video') as HTMLVideoElement | null;
       const preparing = document.body.textContent?.includes('Video is still preparing') || false;
       const unsupported = document.body.textContent?.includes('protected course videos can be played only') || false;
+      const unavailable = document.body.textContent?.includes('Lesson video unavailable') || false;
       return {
         hasVideo: Boolean(video),
         preparing,
         unsupported,
+        unavailable,
         currentTime: video?.currentTime || 0,
         duration: video?.duration || 0,
         readyState: video?.readyState || 0,
@@ -552,6 +590,9 @@ const verifyBrowserPlayback = async (token: string, courseId: string, lessonId: 
     const duration = typeof endState.duration === 'number' ? Number(endState.duration) : 0;
     const currentTime = typeof endState.currentTime === 'number' ? Number(endState.currentTime) : 0;
     if (ended || (duration > 0 && maxObservedCurrentTime >= Math.max(0, duration - 0.75))) {
+      break;
+    }
+    if (endState.unavailable) {
       break;
     }
     if (endState.hasVideo && endState.paused !== false) {
@@ -578,11 +619,12 @@ const verifyBrowserPlayback = async (token: string, courseId: string, lessonId: 
     endState,
     maxObservedCurrentTime,
   }, null, 2));
+  await fs.writeFile(path.join(runDir, 'browser-page-content.html'), await page.content());
 
   await context.close();
   await browser.close();
 
-  if (!startState.hasVideo || startState.preparing || startState.unsupported || startState.readyState < 2 || startState.currentTime <= 0) {
+  if (!startState.hasVideo || startState.preparing || startState.unsupported || startState.unavailable || startState.readyState < 2 || startState.currentTime <= 0) {
     throw new Error(`Browser playback did not start: ${JSON.stringify(startState)}`);
   }
 
@@ -628,7 +670,8 @@ const run = async () => {
 
   try {
     const admin = await loginAdmin(env);
-    const student = await registerStudent();
+    const apiStudent = await registerStudent('api');
+    const browserStudent = await registerStudent('browser');
     const course = await createCourse(admin.token);
     const courseId = course._id || course.id;
     const moduleEntry = await addModule(admin.token, courseId);
@@ -638,8 +681,14 @@ const run = async () => {
     report.module = moduleEntry;
     report.chapter = chapter;
     report.student = {
-      id: student.user._id,
-      email: student.email,
+      api: {
+        id: apiStudent.user._id,
+        email: apiStudent.email,
+      },
+      browser: {
+        id: browserStudent.user._id,
+        email: browserStudent.email,
+      },
     };
     await fs.writeFile(path.join(runDir, '01-created-course.json'), JSON.stringify(report, null, 2));
 
@@ -657,7 +706,8 @@ const run = async () => {
       await fs.writeFile(path.join(runDir, `02-upload-${index}.json`), JSON.stringify(lesson, null, 2));
     }
 
-    await enrollStudentLocally(student.user._id, courseId);
+    await assignCourseAccess(admin.token, apiStudent.user._id, courseId);
+    await assignCourseAccess(admin.token, browserStudent.user._id, courseId);
 
     const lessonIds = uploadedLessons.map((lesson) => lesson.id);
     const hlsReady = await waitForLessonsReady(admin.token, courseId, moduleEntry.id, lessonIds);
@@ -674,11 +724,11 @@ const run = async () => {
     };
 
     for (const lessonId of lessonIds) {
-      const apiPlayback = await verifyPlaybackApi(student.token, courseId, lessonId);
+      const apiPlayback = await verifyPlaybackApi(apiStudent.token, courseId, lessonId);
       report.apiPlayback.push({ lessonId, ...apiPlayback });
     }
 
-    const browserPlayback = await verifyBrowserPlayback(student.token, courseId, lessonIds[0]);
+    const browserPlayback = await verifyBrowserPlayback(browserStudent.token, courseId, lessonIds[0]);
     report.browserPlayback = browserPlayback;
     report.screenshots = browserPlayback.screenshots;
     report.finishedAt = iso();

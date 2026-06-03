@@ -7,14 +7,20 @@ Support a production course platform with:
 - many videos per course
 - low-cost storage on Hetzner
 - protected lesson playback
-- predictable scaling toward 1k concurrent viewers
+- predictable low-cost scaling toward the current `~1k` recorded-video class
 - minimal load on the main Node app
+
+> Current honest verdict: this low-cost single-host direction is still not proven for `3-5k` mixed traffic and is far from a `10-15k` mixed-traffic claim. See `docs/capacity-verdict-and-10k-mixed-traffic-plan.md` for the evidence, target architecture, and scale gates.
 
 ## Recommended Hetzner Architecture
 
+For the cheapest practical `5k` mixed-traffic infrastructure path, do **not** force an immediate video-storage migration just because this long-term architecture prefers object storage. Split the overloaded production roles first and keep the current recorded-video provider/storage path during the first scaling phase. The phased cost recommendation lives in:
+
+- `docs/cheapest-practical-5k-infrastructure-plan.md`
+
 ### 1. Storage
 
-Use **Hetzner Object Storage** as the source of truth for video assets.
+Use **object storage** as the long-term source of truth for video assets.
 
 Why:
 
@@ -131,11 +137,11 @@ Avoid:
 
 For your use case, cheapest production-safe order is:
 
-1. Hetzner Object Storage for videos
-2. small number of app replicas
+1. split Postgres and Redis off the current overloaded production box
+2. add app and media replicas
 3. cache shared HLS manifests aggressively
-4. redirect segment delivery to object storage
-5. keep app servers for API only
+4. keep the current working recorded-video provider/storage path during the first infra split
+5. standardize on the long-term object-storage hot path only after load evidence justifies the migration
 
 Do not optimize for:
 

@@ -3,8 +3,15 @@ const crypto = require('crypto');
 const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
-const ffmpegPath = require('ffmpeg-static');
 const { appConfig } = require('./config.js');
+const { resolveFfmpegPath } = require('./ffmpeg.js');
+const {
+  addRedisSetMember,
+  removeRedisSetMember,
+  getRedisSetMembers,
+  publishRedisMessage,
+  subscribeRedisChannel,
+} = require('./redis.js');
 const {
   buildPrivateHlsAssetKey,
   resolvePrivateVideoPath,
@@ -14,18 +21,61 @@ const {
 const {
   getPrivateVideoStorageProvider,
   downloadPrivateStorageObjectToFile,
+  getPrivateStorageObjectText,
+  privateStorageObjectExists,
   uploadPrivateStorageFile,
   deleteStoredPrivateVideoPrefix,
 } = require('./private-video-storage.js');
 const {
   buildManifestBundleStorageKey,
   createManifestBundleFromDirectory,
+  createManifestBundleFromStorage,
+  storeManifestBundle,
   writeManifestBundleToDirectory,
 } = require('./manifest-bundle.js');
 
 const activeJobs = new Set();
+const activeJobMeta = new Map();
 const queuedJobs = [];
+const queuedJobIds = new Set();
 let activeTranscodingJobs = 0;
+let recoveryTimer = null;
+let remoteEnqueueSubscriber = null;
+const backgroundWorkersEnabled = String(process.env.ENABLE_BACKGROUND_WORKERS || 'true').toLowerCase() !== 'false';
+const HLS_UPLOAD_CONCURRENCY = Math.max(Number(process.env.VIDEO_HLS_UPLOAD_CONCURRENCY || 8), 1);
+const HLS_UPLOAD_RETRY_ATTEMPTS = Math.max(Number(process.env.VIDEO_HLS_UPLOAD_RETRY_ATTEMPTS || 3), 1);
+const REMOTE_VIDEO_JOB_SET_KEY = 'video-processing:pending-course-jobs';
+const REMOTE_VIDEO_JOB_CHANNEL = 'video-processing:enqueue-course-job';
+const LOCAL_QUEUE_STALE_AFTER_MS = Math.max(
+  Number(appConfig.videoLocalQueueStaleAfterMs || 45_000),
+  5_000,
+);
+const PROCESSING_STALE_AFTER_MS = Math.max(
+  Number(appConfig.videoProcessingStaleAfterMs || 20 * 60 * 1000),
+  60_000,
+);
+
+const logVideoProcessingEvent = (level, event, payload = {}) => {
+  const message = `[video-processing] ${JSON.stringify({
+    at: new Date().toISOString(),
+    event,
+    ...payload,
+  })}`;
+
+  if (level === 'warn') {
+    console.warn(message);
+    return;
+  }
+
+  if (level === 'error') {
+    console.error(message);
+    return;
+  }
+
+  console.info(message);
+};
+
+const getFfmpegRuntimePath = () => resolveFfmpegPath();
 
 const getRecordedHlsStorageProvider = () => {
   const configured = String(appConfig.videoHlsStorageProvider || appConfig.privateVideoStorageProvider || 'local').toLowerCase();
@@ -45,8 +95,9 @@ const getTargetQualities = () => {
 const createInitialVideoDeliveryState = () => ({
   deliveryProfile: appConfig.videoDeliveryProfile,
   deliveryStrategy: 'hls',
-  sourceFallbackAllowed: false,
+  sourceFallbackAllowed: true,
   targetQualities: getTargetQualities(),
+  playbackReady: false,
   hlsStorageProvider: null,
   hlsProcessingStatus: appConfig.enableVideoTranscoding ? 'queued' : 'ready',
   hlsProcessingQueuedAt: appConfig.enableVideoTranscoding ? new Date().toISOString() : null,
@@ -83,10 +134,22 @@ const deleteProcessedHlsAssets = async (manifestPath, storageProvider = null) =>
   });
 };
 
+const trimFfmpegErrorOutput = (value) => String(value || '')
+  .replace(/\s+/g, ' ')
+  .trim()
+  .slice(-600);
+
 const waitForFfmpeg = (args) =>
   new Promise((resolve, reject) => {
-    const child = spawn(ffmpegPath, args, { stdio: 'ignore' });
+    const ffmpegPath = getFfmpegRuntimePath();
+    if (!ffmpegPath) {
+      reject(new Error('ffmpeg runtime is unavailable. Install ffmpeg in the runtime image or set FFMPEG_PATH.'));
+      return;
+    }
+
+    const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let settled = false;
+    let stderrTail = '';
     const timeoutMs = Math.max(Number(appConfig.videoTranscodingJobTimeoutMs || 0), 60_000);
     const timeout = setTimeout(() => {
       if (settled) {
@@ -94,8 +157,17 @@ const waitForFfmpeg = (args) =>
       }
       settled = true;
       child.kill('SIGKILL');
-      reject(new Error(`ffmpeg timed out after ${Math.round(timeoutMs / 1000)} seconds`));
+      const details = trimFfmpegErrorOutput(stderrTail);
+      reject(new Error(`ffmpeg timed out after ${Math.round(timeoutMs / 1000)} seconds${details ? `: ${details}` : ''}`));
     }, timeoutMs);
+    if (child.stderr) {
+      child.stderr.on('data', (chunk) => {
+        stderrTail = `${stderrTail}${chunk.toString('utf8')}`;
+        if (stderrTail.length > 8000) {
+          stderrTail = stderrTail.slice(-8000);
+        }
+      });
+    }
     child.on('error', (error) => {
       if (settled) {
         return;
@@ -114,7 +186,8 @@ const waitForFfmpeg = (args) =>
         resolve();
         return;
       }
-      reject(new Error(`ffmpeg exited with code ${code}`));
+      const details = trimFfmpegErrorOutput(stderrTail);
+      reject(new Error(`ffmpeg exited with code ${code}${details ? `: ${details}` : ''}`));
     });
   });
 
@@ -193,7 +266,11 @@ const downloadStorageSourceToLocal = async ({ lesson, workspaceDirectory }) => {
   };
 };
 
-const uploadProcessedHlsDirectory = async ({ outputDirectory, manifestKey }) => {
+const uploadProcessedHlsDirectory = async ({
+  outputDirectory,
+  manifestKey,
+  expectedAssetRelativePaths = [],
+}) => {
   const prefix = path.posix.dirname(manifestKey);
   const uploadTasks = [];
 
@@ -208,17 +285,288 @@ const uploadProcessedHlsDirectory = async ({ outputDirectory, manifestKey }) => 
 
       const relativePath = path.relative(outputDirectory, fullPath).split(path.sep).join(path.posix.sep);
       const extension = path.extname(entry.name).toLowerCase();
-      uploadTasks.push(uploadPrivateStorageFile({
-        storageProvider: 's3',
+      uploadTasks.push({
         storagePath: path.posix.join(prefix, relativePath),
         localFilePath: fullPath,
         contentType: hlsAssetMimeTypeByExtension[extension] || 'application/octet-stream',
-      }));
+      });
     });
   };
 
   walk(outputDirectory);
-  await Promise.all(uploadTasks);
+  await runWithConcurrency(uploadTasks, async (task) => {
+    await withRetries(() => uploadPrivateStorageFile({
+      storageProvider: 's3',
+      storagePath: task.storagePath,
+      localFilePath: task.localFilePath,
+      contentType: task.contentType,
+    }));
+  });
+
+  const assetPathsToVerify = expectedAssetRelativePaths.length > 0 ? expectedAssetRelativePaths : listRelativeFiles(outputDirectory);
+  await runWithConcurrency(assetPathsToVerify, async (relativePath) => {
+    const exists = await withRetries(() => privateStorageObjectExists({
+      storageProvider: 's3',
+      storagePath: path.posix.join(prefix, relativePath),
+    }));
+    if (!exists) {
+      throw new Error(`Uploaded HLS asset is missing from object storage: ${path.posix.join(prefix, relativePath)}`);
+    }
+  });
+};
+
+const uploadPrivateStorageText = async ({
+  storageProvider,
+  storagePath,
+  text,
+  contentType,
+  cacheControl,
+}) => {
+  const tempFilePath = path.join(
+    os.tmpdir(),
+    `edumaster-hls-text-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  );
+  fs.writeFileSync(tempFilePath, String(text || ''), 'utf8');
+  try {
+    await uploadPrivateStorageFile({
+      storageProvider,
+      storagePath,
+      localFilePath: tempFilePath,
+      contentType,
+      cacheControl,
+    });
+  } finally {
+    if (fs.existsSync(tempFilePath)) {
+      fs.unlinkSync(tempFilePath);
+    }
+  }
+};
+
+const buildMasterManifestText = (variants) => {
+  const lines = ['#EXTM3U', '#EXT-X-VERSION:3'];
+  variants.forEach((variant) => {
+    lines.push(`#EXT-X-STREAM-INF:BANDWIDTH=${variant.bandwidth},RESOLUTION=${variant.resolution}`);
+    lines.push(`${variant.name}/index.m3u8`);
+  });
+  return `${lines.join('\n')}\n`;
+};
+
+const parseManifestAssetReferences = (manifestText) => String(manifestText || '')
+  .split('\n')
+  .map((line) => line.trim())
+  .filter((line) => line && !line.startsWith('#'))
+  .map((line) => line.split('?')[0])
+  .filter((line) => line && !/^[a-z]+:\/\//i.test(line));
+
+const listRelativeFiles = (rootDirectory) => {
+  const files = [];
+  const walk = (directoryPath) => {
+    const entries = fs.readdirSync(directoryPath, { withFileTypes: true });
+    entries.forEach((entry) => {
+      const fullPath = path.join(directoryPath, entry.name);
+      if (entry.isDirectory()) {
+        walk(fullPath);
+        return;
+      }
+      files.push(path.relative(rootDirectory, fullPath).split(path.sep).join(path.posix.sep));
+    });
+  };
+  walk(rootDirectory);
+  return files.sort();
+};
+
+const withRetries = async (operation, attempts = HLS_UPLOAD_RETRY_ATTEMPTS) => {
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await operation(attempt);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(1000 * attempt, 3000)));
+    }
+  }
+  throw lastError;
+};
+
+const runWithConcurrency = async (items, worker, concurrency = HLS_UPLOAD_CONCURRENCY) => {
+  const limit = Math.max(Number(concurrency || HLS_UPLOAD_CONCURRENCY), 1);
+  let nextIndex = 0;
+
+  const runWorker = async () => {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      await worker(items[currentIndex], currentIndex);
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(limit, items.length || 1) }, () => runWorker()));
+};
+
+const validateStoredMediaManifest = async ({
+  storageProvider,
+  rootPath,
+  relativeManifestPath,
+}) => {
+  const manifestStoragePath = path.posix.join(rootPath, relativeManifestPath);
+  const manifestText = await getPrivateStorageObjectText({
+    storageProvider,
+    storagePath: manifestStoragePath,
+  });
+  if (!manifestText || !String(manifestText).includes('#EXTM3U')) {
+    return null;
+  }
+
+  const references = parseManifestAssetReferences(manifestText);
+  for (const reference of references) {
+    const assetRelativePath = path.posix.normalize(
+      path.posix.join(path.posix.dirname(relativeManifestPath), reference),
+    );
+    const exists = await privateStorageObjectExists({
+      storageProvider,
+      storagePath: path.posix.join(rootPath, assetRelativePath),
+    });
+    if (!exists) {
+      return null;
+    }
+  }
+
+  return manifestText;
+};
+
+const validateLocalHlsDirectory = ({ outputDirectory, requestedQualities }) => {
+  const validVariants = [];
+
+  for (const quality of requestedQualities) {
+    const profile = renditionProfiles[quality];
+    if (!profile) {
+      continue;
+    }
+
+    const relativeManifestPath = path.posix.join(quality, 'index.m3u8');
+    const absoluteManifestPath = path.join(outputDirectory, quality, 'index.m3u8');
+    if (!fs.existsSync(absoluteManifestPath)) {
+      continue;
+    }
+
+    const manifestText = fs.readFileSync(absoluteManifestPath, 'utf8');
+    if (!manifestText || !manifestText.includes('#EXTM3U')) {
+      continue;
+    }
+
+    const references = parseManifestAssetReferences(manifestText);
+    const allAssetsPresent = references.every((reference) => {
+      const relativeAssetPath = path.posix.normalize(
+        path.posix.join(path.posix.dirname(relativeManifestPath), reference),
+      );
+      return fs.existsSync(path.join(outputDirectory, ...relativeAssetPath.split('/')));
+    });
+
+    if (!allAssetsPresent) {
+      continue;
+    }
+
+    validVariants.push({
+      name: quality,
+      bandwidth: profile.bandwidth,
+      resolution: profile.resolution,
+    });
+  }
+
+  if (validVariants.length === 0) {
+    throw new Error('No fully valid HLS renditions were produced for this upload.');
+  }
+
+  fs.writeFileSync(path.join(outputDirectory, 'master.m3u8'), buildMasterManifestText(validVariants), 'utf8');
+
+  return {
+    validVariants,
+    assetRelativePaths: listRelativeFiles(outputDirectory),
+  };
+};
+
+const repairExistingHlsOutputs = async ({
+  courseId,
+  lesson,
+}) => {
+  if (!lesson) {
+    return null;
+  }
+
+  const outputStorageProvider = getRecordedHlsStorageProvider();
+  const outputKey = String(lesson.hlsManifestPath || buildPrivateHlsAssetKey({
+    courseId,
+    moduleId: lesson.moduleId || 'module',
+    lessonId: lesson.id,
+    assetName: 'master.m3u8',
+  }));
+  const outputRootPath = path.posix.dirname(outputKey);
+  const requestedQualities = Array.isArray(lesson.targetQualities) && lesson.targetQualities.length > 0
+    ? lesson.targetQualities
+    : getTargetQualities();
+  const availableVariants = [];
+
+  for (const quality of requestedQualities) {
+    const profile = renditionProfiles[quality];
+    if (!profile) {
+      continue;
+    }
+
+    const variantManifestPath = path.posix.join(quality, 'index.m3u8');
+    try {
+      const manifestText = await validateStoredMediaManifest({
+        storageProvider: outputStorageProvider,
+        rootPath: outputRootPath,
+        relativeManifestPath: variantManifestPath,
+      });
+      if (!manifestText) {
+        continue;
+      }
+      availableVariants.push({
+        name: quality,
+        bandwidth: profile.bandwidth,
+        resolution: profile.resolution,
+      });
+    } catch {
+      // Ignore missing renditions and keep probing.
+    }
+  }
+
+  if (availableVariants.length === 0) {
+    return null;
+  }
+
+  const manifestVersion = Date.now().toString(36);
+  await uploadPrivateStorageText({
+    storageProvider: outputStorageProvider,
+    storagePath: outputKey,
+    text: buildMasterManifestText(availableVariants),
+    contentType: hlsAssetMimeTypeByExtension['.m3u8'],
+    cacheControl: 'private, max-age=300, stale-while-revalidate=3600',
+  });
+
+  const bundle = await createManifestBundleFromStorage({
+    storageProvider: outputStorageProvider,
+    manifestPath: outputKey,
+    version: manifestVersion,
+  });
+  const manifestBundleKey = await storeManifestBundle({
+    storageProvider: outputStorageProvider,
+    bundlePath: bundle.bundlePath,
+    bundle,
+  });
+
+  return {
+    outputKey,
+    outputRootPath,
+    manifestBundleKey,
+    manifestVersion,
+    availableQualities: availableVariants.map((variant) => variant.name),
+    outputStorageProvider,
+  };
 };
 
 const transcodeToHls = async ({ sourcePath, outputDirectory, qualities }) => {
@@ -278,7 +626,72 @@ const transcodeToHls = async ({ sourcePath, outputDirectory, qualities }) => {
   writeMasterManifest({ outputDirectory, variants });
 };
 
-const runQueuedVideoJob = (job) => {
+const markActiveJobQueued = ({ jobId, courseId, lessonId, source }) => {
+  activeJobs.add(jobId);
+  activeJobMeta.set(jobId, {
+    jobId,
+    courseId: String(courseId),
+    lessonId: String(lessonId),
+    phase: 'queued',
+    source: source || 'unknown',
+    queuedAtMs: Date.now(),
+    startedAtMs: null,
+  });
+};
+
+const markActiveJobRunning = (jobId) => {
+  const current = activeJobMeta.get(jobId) || { jobId, queuedAtMs: Date.now() };
+  activeJobMeta.set(jobId, {
+    ...current,
+    phase: 'running',
+    startedAtMs: Date.now(),
+  });
+};
+
+const clearActiveJob = (jobId) => {
+  activeJobs.delete(jobId);
+  activeJobMeta.delete(jobId);
+};
+
+const isQueuedJobStale = (jobId) => {
+  const meta = activeJobMeta.get(jobId);
+  if (!meta || meta.phase !== 'queued') {
+    return false;
+  }
+  return Date.now() - Number(meta.queuedAtMs || 0) > LOCAL_QUEUE_STALE_AFTER_MS;
+};
+
+const isRunningJobStale = (jobId) => {
+  const meta = activeJobMeta.get(jobId);
+  if (!meta || meta.phase !== 'running') {
+    return false;
+  }
+  return Date.now() - Number(meta.startedAtMs || meta.queuedAtMs || 0) > PROCESSING_STALE_AFTER_MS;
+};
+
+const releaseActiveJobLock = (jobId, reason) => {
+  const meta = activeJobMeta.get(jobId);
+  if (!meta) {
+    return false;
+  }
+  clearActiveJob(jobId);
+  logVideoProcessingEvent('warn', 'local-lock-released', {
+    jobId,
+    courseId: meta.courseId,
+    lessonId: meta.lessonId,
+    phase: meta.phase,
+    reason,
+  });
+  return true;
+};
+
+const runQueuedVideoJob = (jobId, job) => {
+  markActiveJobRunning(jobId);
+  logVideoProcessingEvent('info', 'job-picked-up', {
+    jobId,
+    activeTranscodingJobs: activeTranscodingJobs + 1,
+    queuedJobs: queuedJobs.length,
+  });
   activeTranscodingJobs += 1;
   void job().finally(() => {
     activeTranscodingJobs = Math.max(activeTranscodingJobs - 1, 0);
@@ -291,28 +704,154 @@ const drainVideoProcessingQueue = () => {
   while (activeTranscodingJobs < maxConcurrency && queuedJobs.length > 0) {
     const nextJob = queuedJobs.shift();
     if (nextJob) {
-      runQueuedVideoJob(nextJob);
+      queuedJobIds.delete(nextJob.jobId);
+      runQueuedVideoJob(nextJob.jobId, nextJob.job);
     }
   }
 };
 
-const enqueueVideoProcessingJob = (job) => {
-  queuedJobs.push(job);
+const enqueueVideoProcessingJob = ({ jobId, job }) => {
+  if (queuedJobIds.has(jobId)) {
+    return false;
+  }
+  queuedJobIds.add(jobId);
+  queuedJobs.push({ jobId, job });
+  logVideoProcessingEvent('info', 'job-enqueued-locally', {
+    jobId,
+    queuedJobs: queuedJobs.length,
+    activeTranscodingJobs,
+  });
   drainVideoProcessingQueue();
+  return true;
 };
 
-const scheduleVideoProcessing = ({ courseId, lessonId }) => {
+const encodeRemoteVideoJob = ({ courseId, lessonId }) => `${String(courseId)}:${String(lessonId)}`;
+
+const decodeRemoteVideoJob = (value) => {
+  const normalized = String(value || '').trim();
+  const separatorIndex = normalized.indexOf(':');
+  if (!normalized || separatorIndex <= 0 || separatorIndex >= normalized.length - 1) {
+    return null;
+  }
+
+  return {
+    jobId: normalized,
+    courseId: normalized.slice(0, separatorIndex),
+    lessonId: normalized.slice(separatorIndex + 1),
+  };
+};
+
+const persistRemoteVideoProcessingRequest = async ({ courseId, lessonId }) => {
+  const payload = encodeRemoteVideoJob({ courseId, lessonId });
+  await addRedisSetMember(REMOTE_VIDEO_JOB_SET_KEY, payload);
+  logVideoProcessingEvent('info', 'job-persisted-remotely', { jobId: payload });
+  return payload;
+};
+
+const publishRemoteVideoProcessingRequest = async ({ jobId }) => {
+  await publishRedisMessage(REMOTE_VIDEO_JOB_CHANNEL, jobId);
+  logVideoProcessingEvent('info', 'job-published-remotely', { jobId });
+};
+
+const drainRemoteVideoProcessingRequests = async () => {
+  if (!backgroundWorkersEnabled) {
+    return { queued: 0, scheduled: 0 };
+  }
+
+  const members = await getRedisSetMembers(REMOTE_VIDEO_JOB_SET_KEY).catch(() => []);
+  let scheduled = 0;
+
+  for (const rawMember of members) {
+    const parsed = decodeRemoteVideoJob(rawMember);
+    if (!parsed) {
+      await removeRedisSetMember(REMOTE_VIDEO_JOB_SET_KEY, rawMember).catch(() => undefined);
+      continue;
+    }
+
+    if (activeJobs.has(parsed.jobId)) {
+      if (isQueuedJobStale(parsed.jobId) && !queuedJobIds.has(parsed.jobId)) {
+        releaseActiveJobLock(parsed.jobId, 'stale-queued-lock-detected-during-remote-drain');
+      } else {
+        continue;
+      }
+    }
+
+    if (await scheduleVideoProcessing({
+      courseId: parsed.courseId,
+      lessonId: parsed.lessonId,
+      alreadyPersisted: true,
+      announceRemote: false,
+      source: 'remote-drain',
+    })) {
+      scheduled += 1;
+      await removeRedisSetMember(REMOTE_VIDEO_JOB_SET_KEY, parsed.jobId).catch(() => undefined);
+    }
+  }
+
+  return {
+    queued: members.length,
+    scheduled,
+  };
+};
+
+const isLessonProcessingStale = (lesson) => {
+  const staleAfterMs = Math.max(Number(appConfig.videoProcessingStaleAfterMs || 0), 60_000);
+  const startedAt = Date.parse(lesson?.hlsProcessingStartedAt || lesson?.hlsProcessingQueuedAt || lesson?.uploadedAt || 0);
+  return Number.isFinite(startedAt) && startedAt > 0 && Date.now() - startedAt > staleAfterMs;
+};
+
+const scheduleVideoProcessing = async ({
+  courseId,
+  lessonId,
+  alreadyPersisted = false,
+  announceRemote = !backgroundWorkersEnabled,
+  source = 'direct',
+} = {}) => {
   if (!appConfig.enableVideoTranscoding) {
-    return;
+    return false;
   }
 
   const jobId = `${courseId}:${lessonId}`;
-  if (activeJobs.has(jobId)) {
-    return;
-  }
-  activeJobs.add(jobId);
 
-  enqueueVideoProcessingJob(async () => {
+  if (!alreadyPersisted) {
+    try {
+      await persistRemoteVideoProcessingRequest({ courseId, lessonId });
+    } catch (error) {
+      logVideoProcessingEvent('error', 'job-persist-failed', {
+        jobId,
+        courseId,
+        lessonId,
+        source,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+  }
+
+  if (!backgroundWorkersEnabled) {
+    if (announceRemote) {
+      await publishRemoteVideoProcessingRequest({ jobId });
+    }
+    return true;
+  }
+
+  if (activeJobs.has(jobId)) {
+    if (isQueuedJobStale(jobId) && !queuedJobIds.has(jobId)) {
+      releaseActiveJobLock(jobId, 'stale-queued-lock-detected-during-schedule');
+    } else {
+      logVideoProcessingEvent('info', 'job-deduplicated', {
+        jobId,
+        courseId,
+        lessonId,
+        source,
+        phase: activeJobMeta.get(jobId)?.phase || 'active',
+      });
+      return false;
+    }
+  }
+  markActiveJobQueued({ jobId, courseId, lessonId, source });
+
+  enqueueVideoProcessingJob({ jobId, job: async () => {
     const { coursesRepository } = require('./repositories.js');
     try {
       const course = await coursesRepository.findById(courseId);
@@ -328,37 +867,93 @@ const scheduleVideoProcessing = ({ courseId, lessonId }) => {
           hlsProcessingCompletedAt: new Date().toISOString(),
           hlsProcessingError: 'Source video file is missing for HLS processing.',
         }));
+        logVideoProcessingEvent('warn', 'job-failed-missing-source', {
+          jobId,
+          courseId,
+          lessonId,
+        });
         return;
       }
 
       await coursesRepository.updateLesson(courseId, lessonId, (current) => ({
         ...current,
+        sourceFallbackAllowed: true,
+        playbackReady: false,
         hlsProcessingStatus: 'processing',
         hlsProcessingStartedAt: new Date().toISOString(),
         hlsProcessingError: null,
       }));
-
-      if (!ffmpegPath) {
-        throw new Error('ffmpeg runtime is unavailable.');
-      }
+      logVideoProcessingEvent('info', 'job-started', {
+        jobId,
+        courseId,
+        lessonId,
+      });
 
       const workspaceDirectory = createTemporaryWorkspace(jobId);
-      const outputKey = buildPrivateHlsAssetKey({ courseId, moduleId: lesson.moduleId || 'module', lessonId, assetName: 'master.m3u8' });
+      const manifestVersion = Date.now().toString(36);
+      const outputKey = buildPrivateHlsAssetKey({
+        courseId,
+        moduleId: lesson.moduleId || 'module',
+        lessonId,
+        assetVersion: `v-${manifestVersion}`,
+        assetName: 'master.m3u8',
+      });
       const outputRootPath = path.posix.dirname(outputKey);
       const manifestBundleKey = buildManifestBundleStorageKey(outputKey);
       const localOutputDirectory = path.join(workspaceDirectory, 'hls');
       const outputStorageProvider = getRecordedHlsStorageProvider();
-      const { sourcePath, cleanup } = await downloadStorageSourceToLocal({
-        lesson,
-        workspaceDirectory,
-      });
-      const manifestVersion = Date.now().toString(36);
+      const previousManifestPath = lesson.hlsManifestPath ? String(lesson.hlsManifestPath) : null;
+      const previousStorageProvider = lesson.hlsStorageProvider || null;
+      let sourceDownload;
+      try {
+        sourceDownload = await downloadStorageSourceToLocal({
+          lesson,
+          workspaceDirectory,
+        });
+      } catch (error) {
+        const repaired = await repairExistingHlsOutputs({
+          courseId,
+          lesson,
+        });
+        if (repaired) {
+          await coursesRepository.updateLesson(courseId, lessonId, (current) => ({
+            ...current,
+            deliveryStrategy: 'hls',
+            sourceFallbackAllowed: true,
+            playbackReady: true,
+            hlsStorageProvider: repaired.outputStorageProvider,
+            hlsProcessingStatus: 'ready',
+            hlsProcessingCompletedAt: new Date().toISOString(),
+            hlsManifestPath: repaired.outputKey,
+            hlsPlaybackPath: repaired.outputKey,
+            hlsManifestBundlePath: repaired.manifestBundleKey,
+            hlsManifestRootPath: repaired.outputRootPath,
+            hlsManifestVersion: repaired.manifestVersion,
+            hlsProcessingError: null,
+            targetQualities: repaired.availableQualities,
+          }));
+          cleanupDirectory(workspaceDirectory);
+          logVideoProcessingEvent('info', 'job-repaired-from-existing-assets', {
+            jobId,
+            courseId,
+            lessonId,
+          });
+          return;
+        }
+        throw error;
+      }
+      const { sourcePath, cleanup } = sourceDownload;
+      let validatedOutputs = null;
 
       try {
         await transcodeToHls({
           sourcePath,
           outputDirectory: localOutputDirectory,
           qualities: Array.isArray(lesson.targetQualities) && lesson.targetQualities.length > 0 ? lesson.targetQualities : getTargetQualities(),
+        });
+        validatedOutputs = validateLocalHlsDirectory({
+          outputDirectory: localOutputDirectory,
+          requestedQualities: Array.isArray(lesson.targetQualities) && lesson.targetQualities.length > 0 ? lesson.targetQualities : getTargetQualities(),
         });
         const manifestBundle = createManifestBundleFromDirectory({
           outputDirectory: localOutputDirectory,
@@ -372,13 +967,10 @@ const scheduleVideoProcessing = ({ courseId, lessonId }) => {
         });
 
         if (outputStorageProvider === 's3') {
-          await deleteStoredPrivateVideoPrefix({
-            storageProvider: 's3',
-            storagePathPrefix: path.posix.dirname(outputKey),
-          });
           await uploadProcessedHlsDirectory({
             outputDirectory: localOutputDirectory,
             manifestKey: outputKey,
+            expectedAssetRelativePaths: validatedOutputs.assetRelativePaths,
           });
         } else {
           const resolvedOutputDirectory = path.dirname(resolvePrivateHlsPath(outputKey));
@@ -395,6 +987,8 @@ const scheduleVideoProcessing = ({ courseId, lessonId }) => {
         ...current,
         storagePath: appConfig.videoKeepSourceAfterProcessing ? current.storagePath : null,
         deliveryStrategy: 'hls',
+        sourceFallbackAllowed: true,
+        playbackReady: true,
         hlsStorageProvider: outputStorageProvider,
         hlsProcessingStatus: 'ready',
         hlsProcessingCompletedAt: new Date().toISOString(),
@@ -404,6 +998,7 @@ const scheduleVideoProcessing = ({ courseId, lessonId }) => {
         hlsManifestRootPath: outputRootPath,
         hlsManifestVersion: manifestVersion,
         hlsProcessingError: null,
+        targetQualities: validatedOutputs ? validatedOutputs.validVariants.map((variant) => variant.name) : current.targetQualities,
       }));
 
       if (!updatedLesson) {
@@ -422,23 +1017,44 @@ const scheduleVideoProcessing = ({ courseId, lessonId }) => {
           fs.unlinkSync(sourcePath);
         }
       }
+
+      if (previousManifestPath && path.posix.dirname(previousManifestPath) !== outputRootPath) {
+        await deleteProcessedHlsAssets(previousManifestPath, previousStorageProvider).catch(() => undefined);
+      }
+      logVideoProcessingEvent('info', 'job-finished', {
+        jobId,
+        courseId,
+        lessonId,
+        manifestPath: outputKey,
+      });
     } catch (error) {
       const { coursesRepository } = require('./repositories.js');
       await coursesRepository.updateLesson(courseId, lessonId, (current) => ({
         ...current,
+        sourceFallbackAllowed: true,
+        playbackReady: false,
         hlsProcessingStatus: 'failed',
         hlsProcessingCompletedAt: new Date().toISOString(),
         hlsProcessingError: error instanceof Error ? error.message : 'Video processing failed.',
       }));
+      logVideoProcessingEvent('error', 'job-failed', {
+        jobId,
+        courseId,
+        lessonId,
+        error: error instanceof Error ? error.message : String(error),
+      });
     } finally {
-      activeJobs.delete(jobId);
+      void removeRedisSetMember(REMOTE_VIDEO_JOB_SET_KEY, jobId).catch(() => undefined);
+      clearActiveJob(jobId);
     }
-  });
+  }});
+
+  return true;
 };
 
-const recoverPendingCourseVideoProcessingJobs = async () => {
+const recoverPendingCourseVideoProcessingJobs = async ({ forceRestartRecovery = false } = {}) => {
   const cloudflareStreamEnabled = String(appConfig.videoProcessingProvider || '').toLowerCase() === 'cloudflare-stream';
-  if (!appConfig.enableVideoTranscoding && !cloudflareStreamEnabled) {
+  if ((!appConfig.enableVideoTranscoding && !cloudflareStreamEnabled) || !backgroundWorkersEnabled) {
     return { scanned: 0, scheduled: 0 };
   }
 
@@ -482,15 +1098,38 @@ const recoverPendingCourseVideoProcessingJobs = async () => {
           continue;
         }
 
-        await coursesRepository.updateLesson(course._id, lesson.id, (current) => ({
+        if (status === 'queued') {
+          if (await scheduleVideoProcessing({
+            courseId: course._id,
+            lessonId: lesson.id,
+            source: forceRestartRecovery ? 'startup-recovery' : 'periodic-recovery',
+          })) {
+            scheduled += 1;
+          }
+          continue;
+        }
+
+        const shouldForceRecover = forceRestartRecovery && status === 'processing';
+        if (!shouldForceRecover && !isLessonProcessingStale(lesson)) {
+          continue;
+        }
+
+        const requeuedLesson = await coursesRepository.updateLesson(course._id, lesson.id, (current) => ({
           ...current,
+          sourceFallbackAllowed: true,
+          playbackReady: false,
           hlsProcessingStatus: 'queued',
-          hlsProcessingQueuedAt: current.hlsProcessingQueuedAt || new Date().toISOString(),
+          hlsProcessingQueuedAt: new Date().toISOString(),
           hlsProcessingStartedAt: null,
           hlsProcessingError: null,
         }));
-        scheduleVideoProcessing({ courseId: course._id, lessonId: lesson.id });
-        scheduled += 1;
+        if (requeuedLesson && await scheduleVideoProcessing({
+          courseId: course._id,
+          lessonId: lesson.id,
+          source: 'stale-recovery',
+        })) {
+          scheduled += 1;
+        }
       }
     }
   }
@@ -499,14 +1138,12 @@ const recoverPendingCourseVideoProcessingJobs = async () => {
 };
 
 const maybeRecoverStaleCourseVideoProcessingJob = async ({ courseId, lesson }) => {
-  if (!appConfig.enableVideoTranscoding || !lesson) {
+  if (!appConfig.enableVideoTranscoding || !lesson || !backgroundWorkersEnabled) {
     return false;
   }
 
   const status = String(lesson.hlsProcessingStatus || '').toLowerCase();
-  const staleAfterMs = Math.max(Number(appConfig.videoProcessingStaleAfterMs || 0), 60_000);
-  const startedAt = Date.parse(lesson.hlsProcessingStartedAt || lesson.hlsProcessingQueuedAt || lesson.uploadedAt || 0);
-  const stale = Number.isFinite(startedAt) && startedAt > 0 && Date.now() - startedAt > staleAfterMs;
+  const stale = isLessonProcessingStale(lesson);
   const needsHls = lesson.type === 'private-video'
     && lesson.deliveryStrategy === 'hls'
     && Boolean(lesson.storagePath)
@@ -521,6 +1158,8 @@ const maybeRecoverStaleCourseVideoProcessingJob = async ({ courseId, lesson }) =
   const { coursesRepository } = require('./repositories.js');
   const updatedLesson = await coursesRepository.updateLesson(courseId, lesson.id, (current) => ({
     ...current,
+    sourceFallbackAllowed: true,
+    playbackReady: false,
     hlsProcessingStatus: 'queued',
     hlsProcessingQueuedAt: new Date().toISOString(),
     hlsProcessingStartedAt: null,
@@ -531,18 +1170,95 @@ const maybeRecoverStaleCourseVideoProcessingJob = async ({ courseId, lesson }) =
     return false;
   }
 
-  scheduleVideoProcessing({ courseId, lessonId: lesson.id });
-  return true;
+  return scheduleVideoProcessing({ courseId, lessonId: lesson.id, source: 'player-stale-recovery' });
+};
+
+const repairCourseLessonHlsOutputs = async ({ courseId, lessonId }) => {
+  const { coursesRepository } = require('./repositories.js');
+  const course = await coursesRepository.findById(courseId);
+  const lesson = course ? course.modules.flatMap((module) => ([
+    ...(module.lessons || []),
+    ...((module.chapters || []).flatMap((chapter) => chapter.lessons || [])),
+  ])).find((entry) => entry.id === String(lessonId)) : null;
+
+  if (!lesson) {
+    throw new Error(`Lesson ${lessonId} was not found in course ${courseId}.`);
+  }
+
+  const repaired = await repairExistingHlsOutputs({
+    courseId,
+    lesson,
+  });
+
+  if (repaired) {
+    await coursesRepository.updateLesson(courseId, lessonId, (current) => ({
+      ...current,
+      deliveryStrategy: 'hls',
+      sourceFallbackAllowed: true,
+      playbackReady: true,
+      hlsStorageProvider: repaired.outputStorageProvider,
+      hlsProcessingStatus: 'ready',
+      hlsProcessingCompletedAt: new Date().toISOString(),
+      hlsManifestPath: repaired.outputKey,
+      hlsPlaybackPath: repaired.outputKey,
+      hlsManifestBundlePath: repaired.manifestBundleKey,
+      hlsManifestRootPath: repaired.outputRootPath,
+      hlsManifestVersion: repaired.manifestVersion,
+      hlsProcessingError: null,
+      targetQualities: repaired.availableQualities,
+    }));
+    return {
+      status: 'repaired',
+      availableQualities: repaired.availableQualities,
+      manifestPath: repaired.outputKey,
+    };
+  }
+
+  if (lesson.storagePath) {
+    const updatedLesson = await coursesRepository.updateLesson(courseId, lessonId, (current) => ({
+      ...current,
+      sourceFallbackAllowed: true,
+      playbackReady: false,
+      hlsProcessingStatus: 'queued',
+      hlsProcessingQueuedAt: new Date().toISOString(),
+      hlsProcessingStartedAt: null,
+      hlsProcessingCompletedAt: null,
+      hlsProcessingError: null,
+    }));
+    if (updatedLesson) {
+      await scheduleVideoProcessing({ courseId, lessonId, source: 'admin-retry' });
+      return {
+        status: 'requeued',
+        availableQualities: [],
+        manifestPath: null,
+      };
+    }
+  }
+
+  await coursesRepository.updateLesson(courseId, lessonId, (current) => ({
+    ...current,
+    sourceFallbackAllowed: true,
+    playbackReady: false,
+    hlsProcessingStatus: 'failed',
+    hlsProcessingCompletedAt: new Date().toISOString(),
+    hlsProcessingError: 'No healthy HLS renditions were found and no source file is available for reprocessing.',
+  }));
+
+  return {
+    status: 'failed',
+    availableQualities: [],
+    manifestPath: null,
+  };
 };
 
 const scheduleTestVideoProcessing = ({ testId }) => {
-  if (!appConfig.enableVideoTranscoding) {
-    return;
+  if (!appConfig.enableVideoTranscoding || !backgroundWorkersEnabled) {
+    return false;
   }
 
   const jobId = `test:${testId}`;
   if (activeJobs.has(jobId)) {
-    return;
+    return false;
   }
   activeJobs.add(jobId);
 
@@ -569,28 +1285,37 @@ const scheduleTestVideoProcessing = ({ testId }) => {
         hlsProcessingError: null,
       }));
 
-      if (!ffmpegPath) {
-        throw new Error('ffmpeg runtime is unavailable.');
-      }
-
       const workspaceDirectory = createTemporaryWorkspace(jobId);
       const videoId = String(video.id || `test-video-${testId}`);
-      const outputKey = buildPrivateHlsAssetKey({ courseId: 'tests', moduleId: testId, lessonId: videoId, assetName: 'master.m3u8' });
+      const manifestVersion = Date.now().toString(36);
+      const outputKey = buildPrivateHlsAssetKey({
+        courseId: 'tests',
+        moduleId: testId,
+        lessonId: videoId,
+        assetVersion: `v-${manifestVersion}`,
+        assetName: 'master.m3u8',
+      });
       const outputRootPath = path.posix.dirname(outputKey);
       const manifestBundleKey = buildManifestBundleStorageKey(outputKey);
       const localOutputDirectory = path.join(workspaceDirectory, 'hls');
       const outputStorageProvider = getRecordedHlsStorageProvider();
+      const previousManifestPath = video.hlsManifestPath ? String(video.hlsManifestPath) : null;
+      const previousStorageProvider = video.hlsStorageProvider || null;
       const { sourcePath, cleanup } = await downloadStorageSourceToLocal({
         lesson: video,
         workspaceDirectory,
       });
-      const manifestVersion = Date.now().toString(36);
+      let validatedOutputs = null;
 
       try {
         await transcodeToHls({
           sourcePath,
           outputDirectory: localOutputDirectory,
           qualities: Array.isArray(video.targetQualities) && video.targetQualities.length > 0 ? video.targetQualities : getTargetQualities(),
+        });
+        validatedOutputs = validateLocalHlsDirectory({
+          outputDirectory: localOutputDirectory,
+          requestedQualities: Array.isArray(video.targetQualities) && video.targetQualities.length > 0 ? video.targetQualities : getTargetQualities(),
         });
         const manifestBundle = createManifestBundleFromDirectory({
           outputDirectory: localOutputDirectory,
@@ -604,13 +1329,10 @@ const scheduleTestVideoProcessing = ({ testId }) => {
         });
 
         if (outputStorageProvider === 's3') {
-          await deleteStoredPrivateVideoPrefix({
-            storageProvider: 's3',
-            storagePathPrefix: path.posix.dirname(outputKey),
-          });
           await uploadProcessedHlsDirectory({
             outputDirectory: localOutputDirectory,
             manifestKey: outputKey,
+            expectedAssetRelativePaths: validatedOutputs.assetRelativePaths,
           });
         } else {
           const resolvedOutputDirectory = path.dirname(resolvePrivateHlsPath(outputKey));
@@ -648,7 +1370,12 @@ const scheduleTestVideoProcessing = ({ testId }) => {
         hlsManifestRootPath: outputRootPath,
         hlsManifestVersion: manifestVersion,
         hlsProcessingError: null,
+        targetQualities: validatedOutputs ? validatedOutputs.validVariants.map((variant) => variant.name) : current?.targetQualities,
       }));
+
+      if (previousManifestPath && path.posix.dirname(previousManifestPath) !== outputRootPath) {
+        await deleteProcessedHlsAssets(previousManifestPath, previousStorageProvider).catch(() => undefined);
+      }
     } catch (error) {
       const { testsRepository } = require('./repositories.js');
       await testsRepository.updateCompanionVideo(testId, (current) => ({
@@ -661,6 +1388,72 @@ const scheduleTestVideoProcessing = ({ testId }) => {
       activeJobs.delete(jobId);
     }
   });
+
+  return true;
+};
+
+const startVideoProcessingRecoveryLoop = () => {
+  if (!appConfig.enableVideoTranscoding || !backgroundWorkersEnabled || recoveryTimer) {
+    return () => undefined;
+  }
+
+  const pollMs = Math.max(Number(appConfig.videoProcessingRecoveryPollMs || 0), 5_000);
+  const tick = () => {
+    drainRemoteVideoProcessingRequests().catch((error) => {
+      console.error('[video-processing] remote request drain failed', error);
+    });
+    recoverPendingCourseVideoProcessingJobs().catch((error) => {
+      console.error('[video-processing] periodic recovery failed', error);
+    });
+  };
+
+  if (!remoteEnqueueSubscriber) {
+    remoteEnqueueSubscriber = subscribeRedisChannel({
+      channel: REMOTE_VIDEO_JOB_CHANNEL,
+      onMessage(message) {
+        const parsed = decodeRemoteVideoJob(message);
+        if (!parsed) {
+          return;
+        }
+        if (activeJobs.has(parsed.jobId)) {
+          return;
+        }
+        void scheduleVideoProcessing({
+          courseId: parsed.courseId,
+          lessonId: parsed.lessonId,
+          alreadyPersisted: true,
+          announceRemote: false,
+          source: 'redis-pubsub',
+        }).then((scheduled) => {
+          if (scheduled) {
+            void removeRedisSetMember(REMOTE_VIDEO_JOB_SET_KEY, parsed.jobId).catch(() => undefined);
+          }
+        }).catch((error) => {
+          console.error('[video-processing] remote enqueue schedule failed', error);
+        });
+      },
+      onError(error) {
+        console.error('[video-processing] remote enqueue subscriber failed', error);
+      },
+    });
+  }
+
+  recoveryTimer = setInterval(tick, pollMs);
+  if (typeof recoveryTimer.unref === 'function') {
+    recoveryTimer.unref();
+  }
+  tick();
+
+  return () => {
+    if (recoveryTimer) {
+      clearInterval(recoveryTimer);
+      recoveryTimer = null;
+    }
+    if (remoteEnqueueSubscriber) {
+      remoteEnqueueSubscriber.close();
+      remoteEnqueueSubscriber = null;
+    }
+  };
 };
 
 module.exports = {
@@ -669,5 +1462,7 @@ module.exports = {
   scheduleTestVideoProcessing,
   recoverPendingCourseVideoProcessingJobs,
   maybeRecoverStaleCourseVideoProcessingJob,
+  repairCourseLessonHlsOutputs,
+  startVideoProcessingRecoveryLoop,
   deleteProcessedHlsAssets,
 };

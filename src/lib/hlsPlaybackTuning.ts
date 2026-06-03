@@ -1,11 +1,30 @@
-import Hls, { ErrorDetails, ErrorTypes } from 'hls.js';
-
 export type ConnectionStrength = 'strong' | 'moderate' | 'weak' | 'unknown';
 export type RecordedVideoQualityOption = {
   label: string;
   level: number;
   height: number;
 };
+
+type HlsLike = {
+  startLevel: number;
+  nextLevel: number;
+  currentLevel: number;
+  autoLevelCapping: number;
+};
+
+const HLS_ERROR_TYPES = {
+  NETWORK_ERROR: 'networkError',
+} as const;
+
+const HLS_ERROR_DETAILS = {
+  MANIFEST_LOAD_ERROR: 'manifestLoadError',
+  MANIFEST_LOAD_TIMEOUT: 'manifestLoadTimeOut',
+  MANIFEST_PARSING_ERROR: 'manifestParsingError',
+  LEVEL_LOAD_ERROR: 'levelLoadError',
+  LEVEL_LOAD_TIMEOUT: 'levelLoadTimeOut',
+  FRAG_LOAD_ERROR: 'fragLoadError',
+  FRAG_LOAD_TIMEOUT: 'fragLoadTimeOut',
+} as const;
 
 export const RECORDED_VIDEO_ALLOWED_HEIGHTS = [240, 360, 480, 720] as const;
 
@@ -54,14 +73,10 @@ export const getPreferredStartupLevelIndex = (
   }
 
   if (connectionStrength === 'weak') {
-    return pickPreferredLevel(levels, 360);
+    return pickPreferredLevel(levels, 240);
   }
 
-  if (connectionStrength === 'moderate') {
-    return pickPreferredLevel(levels, 480);
-  }
-
-  return pickPreferredLevel(levels, 480);
+  return pickPreferredLevel(levels, 360);
 };
 
 export const createProtectedVodHlsConfig = () => {
@@ -72,32 +87,32 @@ export const createProtectedVodHlsConfig = () => {
   return {
     enableWorker: true,
     lowLatencyMode: false,
-    maxBufferLength: weakConnection ? 6 : moderateConnection ? 8 : 10,
-    backBufferLength: 10,
-    maxBufferSize: weakConnection ? 10 * 1000 * 1000 : 16 * 1000 * 1000,
-    maxMaxBufferLength: weakConnection ? 10 : 14,
+    maxBufferLength: weakConnection ? 10 : moderateConnection ? 12 : 16,
+    backBufferLength: 20,
+    maxBufferSize: weakConnection ? 14 * 1000 * 1000 : moderateConnection ? 18 * 1000 * 1000 : 24 * 1000 * 1000,
+    maxMaxBufferLength: weakConnection ? 14 : moderateConnection ? 18 : 22,
     maxBufferHole: 0.5,
     highBufferWatchdogPeriod: 1,
     nudgeOffset: 0.1,
     nudgeMaxRetry: 6,
-    fragLoadingMaxRetry: 5,
-    manifestLoadingMaxRetry: 5,
-    levelLoadingMaxRetry: 5,
-    fragLoadingRetryDelay: weakConnection ? 500 : 750,
-    manifestLoadingRetryDelay: 350,
-    levelLoadingRetryDelay: 350,
+    fragLoadingMaxRetry: 8,
+    manifestLoadingMaxRetry: 8,
+    levelLoadingMaxRetry: 8,
+    fragLoadingRetryDelay: weakConnection ? 1500 : moderateConnection ? 1250 : 1000,
+    manifestLoadingRetryDelay: weakConnection ? 1200 : 1000,
+    levelLoadingRetryDelay: weakConnection ? 1200 : 1000,
     abrEwmaFastVod: weakConnection ? 1.5 : 2,
     abrEwmaSlowVod: weakConnection ? 4 : 6,
-    testBandwidth: !weakConnection,
-    startFragPrefetch: true,
-    startLevel: -1,
+    testBandwidth: false,
+    startFragPrefetch: false,
+    startLevel: 0,
     autoStartLoad: true,
     capLevelToPlayerSize: true,
   };
 };
 
 export const applyPreferredStartupLevel = (
-  hls: Hls,
+  hls: HlsLike,
   levels: Array<{ height?: number }>,
 ) => {
   const connectionStrength = getConnectionStrength();
@@ -113,7 +128,7 @@ export const applyPreferredStartupLevel = (
   };
 };
 
-export const scheduleAutoLevelRelease = (hls: Hls, delayMs = 1500) => {
+export const scheduleAutoLevelRelease = (hls: HlsLike, delayMs = 1500) => {
   if (typeof window === 'undefined') {
     return () => undefined;
   }
@@ -182,12 +197,12 @@ export const shouldFallbackToSourceFromHlsError = (data: {
   details?: string | null;
 }) => Boolean(
   data?.fatal
-  || data?.type === ErrorTypes.NETWORK_ERROR
-  || data?.details === ErrorDetails.MANIFEST_LOAD_ERROR
-  || data?.details === ErrorDetails.MANIFEST_LOAD_TIMEOUT
-  || data?.details === ErrorDetails.MANIFEST_PARSING_ERROR
-  || data?.details === ErrorDetails.LEVEL_LOAD_ERROR
-  || data?.details === ErrorDetails.LEVEL_LOAD_TIMEOUT
-  || data?.details === ErrorDetails.FRAG_LOAD_ERROR
-  || data?.details === ErrorDetails.FRAG_LOAD_TIMEOUT
+  || data?.type === HLS_ERROR_TYPES.NETWORK_ERROR
+  || data?.details === HLS_ERROR_DETAILS.MANIFEST_LOAD_ERROR
+  || data?.details === HLS_ERROR_DETAILS.MANIFEST_LOAD_TIMEOUT
+  || data?.details === HLS_ERROR_DETAILS.MANIFEST_PARSING_ERROR
+  || data?.details === HLS_ERROR_DETAILS.LEVEL_LOAD_ERROR
+  || data?.details === HLS_ERROR_DETAILS.LEVEL_LOAD_TIMEOUT
+  || data?.details === HLS_ERROR_DETAILS.FRAG_LOAD_ERROR
+  || data?.details === HLS_ERROR_DETAILS.FRAG_LOAD_TIMEOUT
 );

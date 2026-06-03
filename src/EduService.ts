@@ -1,12 +1,39 @@
 import {
+  AdminAccessDiagnosis,
+  AdminAuditLogRecord,
+  AdminDashboardSummary,
+  AdminBulkRazorpaySyncResult,
+  AdminCourseAccessRecord,
+  AdminCourseContentAccessRule,
+  AdminCourseAccessSummary,
+  AdminLoginSessionRecord,
+  AdminLoginSessionSummary,
+  AdminManualReviewRecord,
+  AdminManualReviewSummary,
+  AdminPagination,
+  AdminPaymentRangeParams,
+  AdminPaymentReconciliationReport,
+  AdminPurchaseRecord,
+  AdminRepairResult,
+  AdminRazorpaySyncResult,
+  AdminStudentDetails,
+  AdminStudentLessonWatchOverride,
+  AdminStudentLiveMetricsSummary,
+  AdminStudentSummary,
+  AdminSystemHealthSummary,
+  AdminTransactionRecord,
+  AdminLessonDoubtListResponse,
+  AdminLessonReportListResponse,
   AiResponse,
   AuthResponse,
   AuthUser,
   CourseCard,
   CourseLesson,
+  CoursePdfAttachment,
   DailyQuizResult,
   GeneratedAssessmentDraft,
   LessonDoubtThread,
+  LessonReportRecord,
   LiveClass,
   LiveClassAccess,
   LiveClassChatMessage,
@@ -15,11 +42,14 @@ import {
   LiveClassSessionState,
   LiveTeacherProfile,
   MockTest,
+  NotificationItem,
   PlatformOverview,
   ProtectedLessonPlayback,
   RegisterPayload,
+  SupportAttachment,
   TestAttemptResult,
 } from './types';
+import { LIVE_CLASSES_ENABLED } from './lib/featureFlags';
 
 const trimTrailingSlash = (value: string) => value.replace(/\/+$/, '');
 const trimLeadingSlash = (value: string) => value.replace(/^\/+/, '');
@@ -43,9 +73,23 @@ const VIDEO_UPLOAD_CHUNK_SIZE_BYTES = 20 * 1024 * 1024;
 const DIRECT_VIDEO_UPLOAD_LIMIT_BYTES = 90 * 1024 * 1024;
 const TOKEN_KEY = 'edumaster.jwt';
 const AUTH_EVENT_KEY = 'edumaster.auth.event';
+const AUTH_SESSION_META_KEY = 'edumaster.auth.session';
 const DEVICE_ID_KEY = 'edumaster.device.id';
+const PLAYBACK_TAB_ID_KEY = 'edumaster.playback.tab.id';
+
+const toSearchParams = <T extends object>(params: T) => {
+  const searchParams = new URLSearchParams();
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') {
+      searchParams.set(key, String(value));
+    }
+  });
+  return searchParams;
+};
 
 let authToken: string | null = null;
+let deviceIdCache: string | null = null;
+let playbackTabIdCache: string | null = null;
 const authRequestInflight = new Map<string, Promise<unknown>>();
 const protectedLessonPlaybackCache = new Map<string, { expiresAt: number; value: ProtectedLessonPlayback }>();
 const protectedLessonPlaybackInflight = new Map<string, Promise<ProtectedLessonPlayback>>();
@@ -61,6 +105,12 @@ type LoginOptions = {
 };
 
 type FirebaseAuthProvider = 'password' | 'google' | 'apple';
+
+type AuthSessionMeta = {
+  userId: string | null;
+  sessionId: string | null;
+  issuedAt: string;
+};
 
 export class ApiRequestError extends Error {
   status: number;
@@ -290,6 +340,11 @@ const normalizeCourseLesson = (lesson: CourseLesson): CourseLesson => ({
   ...lesson,
   videoUrl: resolveAbsoluteUrl(lesson.videoUrl),
   notesUrl: resolveAbsoluteUrl(lesson.notesUrl),
+  attachments: (lesson.attachments || []).map(normalizeCoursePdfAttachment),
+});
+
+const normalizeCoursePdfAttachment = (attachment: CoursePdfAttachment): CoursePdfAttachment => ({
+  ...attachment,
 });
 
 const normalizeCourseCard = (course: CourseCard): CourseCard => ({
@@ -300,9 +355,11 @@ const normalizeCourseCard = (course: CourseCard): CourseCard => ({
   continueLesson: course.continueLesson ? normalizeCourseLesson(course.continueLesson) : course.continueLesson,
   modules: (course.modules || []).map((module) => ({
     ...module,
+    attachments: (module.attachments || []).map(normalizeCoursePdfAttachment),
     lessons: (module.lessons || []).map(normalizeCourseLesson),
     chapters: (module.chapters || []).map((chapter) => ({
       ...chapter,
+      attachments: (chapter.attachments || []).map(normalizeCoursePdfAttachment),
       lessons: (chapter.lessons || []).map(normalizeCourseLesson),
     })),
   })),
@@ -385,13 +442,56 @@ const getPersistentDeviceId = () => {
     return 'server-device';
   }
 
-  const existing = window.localStorage.getItem(DEVICE_ID_KEY);
-  if (existing) {
-    return existing;
+  if (deviceIdCache) {
+    return deviceIdCache;
+  }
+
+  try {
+    const existing = window.localStorage.getItem(DEVICE_ID_KEY);
+    if (existing) {
+      deviceIdCache = existing;
+      return existing;
+    }
+  } catch {
+    // Fall back to an in-memory device id when storage is temporarily unavailable.
   }
 
   const next = globalThis.crypto?.randomUUID?.() || `device_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-  window.localStorage.setItem(DEVICE_ID_KEY, next);
+  deviceIdCache = next;
+  try {
+    window.localStorage.setItem(DEVICE_ID_KEY, next);
+  } catch {
+    // Keep the generated id in memory so the current browser/device stays stable.
+  }
+  return next;
+};
+
+const getPlaybackTabId = () => {
+  if (typeof window === 'undefined') {
+    return 'server-playback-tab';
+  }
+
+  if (playbackTabIdCache) {
+    return playbackTabIdCache;
+  }
+
+  try {
+    const existing = window.sessionStorage.getItem(PLAYBACK_TAB_ID_KEY);
+    if (existing) {
+      playbackTabIdCache = existing;
+      return existing;
+    }
+  } catch {
+    // Fall back to an in-memory per-tab id when sessionStorage is not available.
+  }
+
+  const next = globalThis.crypto?.randomUUID?.() || `playback_tab_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+  playbackTabIdCache = next;
+  try {
+    window.sessionStorage.setItem(PLAYBACK_TAB_ID_KEY, next);
+  } catch {
+    // Keep the generated id in memory for this tab so requests stay consistent.
+  }
   return next;
 };
 
@@ -469,6 +569,44 @@ const saveToken = (token: string | null) => {
   }
 };
 
+const readAuthSessionMeta = (): AuthSessionMeta | null => {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+
+  try {
+    const raw = window.localStorage.getItem(AUTH_SESSION_META_KEY);
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as Partial<AuthSessionMeta>;
+    return {
+      userId: parsed.userId ? String(parsed.userId) : null,
+      sessionId: parsed.sessionId ? String(parsed.sessionId) : null,
+      issuedAt: parsed.issuedAt ? String(parsed.issuedAt) : '',
+    };
+  } catch {
+    return null;
+  }
+};
+
+const saveAuthSessionMeta = (user?: AuthUser | null) => {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  if (!user) {
+    window.localStorage.removeItem(AUTH_SESSION_META_KEY);
+    return;
+  }
+
+  window.localStorage.setItem(AUTH_SESSION_META_KEY, JSON.stringify({
+    userId: user._id || null,
+    sessionId: user.session || null,
+    issuedAt: new Date().toISOString(),
+  }));
+};
+
 const emitAuthEvent = (event: { type: 'login' | 'logout'; userId?: string | null; sessionId?: string | null }) => {
   if (typeof window === 'undefined') {
     return;
@@ -487,11 +625,14 @@ const emitAuthEvent = (event: { type: 'login' | 'logout'; userId?: string | null
 
 const buildHeaders = (hasBody: boolean, includeAuth = true) => {
   const token = includeAuth ? readStoredToken() : null;
+  const playbackTabId = getPlaybackTabId();
 
   return {
     ...(hasBody ? { 'content-type': 'application/json' } : {}),
     ...(token ? { authorization: `Bearer ${token}` } : {}),
     'x-edumaster-device-id': getPersistentDeviceId(),
+    'x-edumaster-playback-tab-id': playbackTabId,
+    'x-edumaster-browser-tab-id': playbackTabId,
     'x-edumaster-client-platform': getClientPlatform(),
     'x-edumaster-client-browser': getClientBrowser(),
     'x-edumaster-app': getClientAppMode(),
@@ -500,9 +641,12 @@ const buildHeaders = (hasBody: boolean, includeAuth = true) => {
 
 const buildAuthHeaders = () => {
   const token = readStoredToken();
+  const playbackTabId = getPlaybackTabId();
   return {
     ...(token ? { authorization: `Bearer ${token}` } : {}),
     'x-edumaster-device-id': getPersistentDeviceId(),
+    'x-edumaster-playback-tab-id': playbackTabId,
+    'x-edumaster-browser-tab-id': playbackTabId,
     'x-edumaster-client-platform': getClientPlatform(),
     'x-edumaster-client-browser': getClientBrowser(),
     'x-edumaster-app': getClientAppMode(),
@@ -535,6 +679,14 @@ const writeProtectedLessonPlaybackCache = (courseId: string, lessonId: string, v
   return value;
 };
 
+const invalidateProtectedLessonPlaybackCache = (courseId?: string | null, lessonId?: string | null) => {
+  if (!courseId || !lessonId) {
+    return;
+  }
+
+  protectedLessonPlaybackCache.delete(buildProtectedLessonPlaybackCacheKey(courseId, lessonId));
+};
+
 const parsePayload = async (response: Response) => {
   const text = await response.text();
   if (!text) {
@@ -555,14 +707,21 @@ const extractErrorMessage = (payload: any, path: string) =>
   || `Request failed for ${path}`;
 
 const handleUnauthorized = (payload?: any) => {
+  const activeMeta = readAuthSessionMeta();
   saveToken(null);
+  saveAuthSessionMeta(null);
 
   if (typeof window !== 'undefined') {
+    const detail = {
+      code: payload?.code || 'AUTH_EXPIRED',
+      message: payload?.message || 'Session expired. Please sign in again.',
+      details: payload?.details || null,
+      userId: activeMeta?.userId || null,
+      sessionId: activeMeta?.sessionId || null,
+    };
+    console.warn('[auth-expired]', detail);
     window.dispatchEvent(new CustomEvent('edumaster:auth-expired', {
-      detail: {
-        code: payload?.code || 'AUTH_EXPIRED',
-        message: payload?.message || 'Session expired. Please sign in again.',
-      },
+      detail,
     }));
   }
 };
@@ -639,8 +798,18 @@ const rootRequest = async <T>(path: string, options: RequestOptions = {}): Promi
 
 export const EduService = {
   getToken: () => readStoredToken(),
-  setToken: (token: string | null) => saveToken(token),
-  clearToken: () => saveToken(null),
+  getPersistentDeviceId,
+  getPlaybackTabId,
+  setToken: (token: string | null) => {
+    saveToken(token);
+    if (!token) {
+      saveAuthSessionMeta(null);
+    }
+  },
+  clearToken: () => {
+    saveToken(null);
+    saveAuthSessionMeta(null);
+  },
 
   register: async (payload: RegisterPayload): Promise<AuthResponse> => {
     const normalizedEmail = String(payload.email || '').trim().toLowerCase();
@@ -663,9 +832,20 @@ export const EduService = {
     });
   },
 
-  updateProfile: async (payload: { name: string; email: string; mobileNumber?: string | null }) => {
+  updateProfile: async (payload: { name: string; mobileNumber?: string | null }) => {
     return request<{ user: AuthUser }>('/users/profile', {
       method: 'PATCH',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  changePassword: async (payload: {
+    currentPassword: string;
+    newPassword: string;
+    confirmPassword: string;
+  }) => {
+    return request<{ success: boolean; message: string }>('/users/profile/password', {
+      method: 'POST',
       body: JSON.stringify(payload),
     });
   },
@@ -691,6 +871,7 @@ export const EduService = {
         });
 
         saveToken(response.token);
+        saveAuthSessionMeta(response.user);
         emitAuthEvent({
           type: 'login',
           userId: response.user._id,
@@ -726,6 +907,7 @@ export const EduService = {
     });
 
     saveToken(response.token);
+    saveAuthSessionMeta(response.user);
     emitAuthEvent({
       type: 'login',
       userId: response.user._id,
@@ -741,10 +923,26 @@ export const EduService = {
     }
 
     try {
-      const response = await request<{ user: AuthUser }>('/auth/session');
+      const response = await request<{ user: AuthUser }>('/auth/session', {
+        expireSessionOn401: false,
+      });
+      saveAuthSessionMeta(response.user);
       return response.user;
-    } catch {
-      saveToken(null);
+    } catch (error) {
+      if (error instanceof ApiRequestError && [401, 403, 404].includes(error.status)) {
+        handleUnauthorized({
+          code: error.code || 'AUTH_SESSION_INVALID',
+          message: error.message || 'Session expired. Please sign in again.',
+          details: error.details || null,
+        });
+        return null;
+      }
+
+      console.warn('[auth-session-restore]', {
+        code: error instanceof ApiRequestError ? error.code : 'RESTORE_SESSION_FAILED',
+        status: error instanceof ApiRequestError ? error.status : null,
+        message: error instanceof Error ? error.message : 'Unable to restore session',
+      });
       return null;
     }
   },
@@ -755,8 +953,14 @@ export const EduService = {
         await request<{ message: string }>('/auth/logout', { method: 'POST' });
       }
     } finally {
-      emitAuthEvent({ type: 'logout' });
+      const activeMeta = readAuthSessionMeta();
+      emitAuthEvent({
+        type: 'logout',
+        userId: activeMeta?.userId || null,
+        sessionId: activeMeta?.sessionId || null,
+      });
       saveToken(null);
+      saveAuthSessionMeta(null);
     }
   },
 
@@ -765,7 +969,9 @@ export const EduService = {
     return {
       ...overview,
       courses: (overview.courses || []).map(normalizeCourseCard),
-      liveClasses: (overview.liveClasses || []).filter(isPresent).map(normalizeLiveClass),
+      liveClasses: LIVE_CLASSES_ENABLED
+        ? (overview.liveClasses || []).filter(isPresent).map(normalizeLiveClass)
+        : [],
       dashboard: {
         ...overview.dashboard,
         continueLearning: (overview.dashboard?.continueLearning || []).map(normalizeCourseCard),
@@ -774,11 +980,17 @@ export const EduService = {
   },
 
   getLiveClasses: async () => {
+    if (!LIVE_CLASSES_ENABLED) {
+      return { liveClasses: [] };
+    }
     const response = await request<{ liveClasses: LiveClass[] }>('/live-classes');
     return { ...response, liveClasses: (response.liveClasses || []).filter(isPresent).map(normalizeLiveClass) };
   },
 
   getAdminLiveClasses: async () => {
+    if (!LIVE_CLASSES_ENABLED) {
+      return { liveClasses: [] };
+    }
     const response = await request<{ liveClasses: LiveClass[] }>('/live-classes/admin');
     return { ...response, liveClasses: (response.liveClasses || []).filter(isPresent).map(normalizeLiveClass) };
   },
@@ -1022,10 +1234,17 @@ export const EduService = {
       explanationSeconds?: number | null;
       videoWatchCount?: number | null;
       explanationWatchCount?: number | null;
+      durationSeconds?: number | null;
+      eventType?: string | null;
+      deviceId?: string | null;
+      playbackTabId?: string | null;
+      requestTimestamp?: string | null;
     } = {},
     requestOptions: RequestInit = {},
   ) => {
-    return request(`/platform/watch-progress`, {
+    const deviceId = metadata.deviceId ?? getPersistentDeviceId();
+    const playbackTabId = metadata.playbackTabId ?? getPlaybackTabId();
+    const response = await request(`/platform/watch-progress`, {
       ...requestOptions,
       method: 'POST',
       body: JSON.stringify({
@@ -1040,29 +1259,103 @@ export const EduService = {
         explanationSeconds: metadata.explanationSeconds ?? null,
         videoWatchCount: metadata.videoWatchCount ?? null,
         explanationWatchCount: metadata.explanationWatchCount ?? null,
+        durationSeconds: metadata.durationSeconds ?? null,
+        eventType: metadata.eventType ?? null,
+        deviceId,
+        playbackTabId,
+        requestTimestamp: metadata.requestTimestamp ?? new Date().toISOString(),
       }),
     });
+
+    invalidateProtectedLessonPlaybackCache(courseId, lessonId);
+    return response;
   },
 
   trackPlaybackHeartbeat: async (payload: {
     videoId: string;
     courseId?: string | null;
     lessonId?: string | null;
-    currentTimeSeconds: number;
+    videoType?: 'course' | 'explanation' | string | null;
+    playbackSessionId: string;
+    currentPositionSeconds: number;
+    previousPositionSeconds: number;
     durationSeconds: number;
     isPlaying: boolean;
-    completed?: boolean;
+    isPaused?: boolean;
+    isBuffering?: boolean;
+    playbackRate?: number;
+    timestamp?: string;
   }) => {
-    return request(`/track`, {
+    const response = await request<{
+      message: string;
+      accepted: boolean;
+      reason: string;
+      playbackSessionId?: string;
+      outcome: {
+        accepted: boolean;
+        reason: string;
+        countableSeconds: number;
+        uniqueSecondsAdded: number;
+        repeatSecondsAdded: number;
+        revisionBufferSecondsAdded: number;
+        completedFullWatch: boolean;
+        locked: boolean;
+        suspiciousReasons: string[];
+      };
+      watchState: ProtectedLessonPlayback['watchState'];
+      sessionStatus: string;
+    }>(`/track`, {
       method: 'POST',
       body: JSON.stringify({
         videoId: payload.videoId,
         courseId: payload.courseId || null,
         lessonId: payload.lessonId || null,
-        currentTimeSeconds: payload.currentTimeSeconds,
+        videoType: payload.videoType || null,
+        playbackSessionId: payload.playbackSessionId,
+        currentPositionSeconds: payload.currentPositionSeconds,
+        previousPositionSeconds: payload.previousPositionSeconds,
         durationSeconds: payload.durationSeconds,
         isPlaying: payload.isPlaying,
-        completed: payload.completed ?? false,
+        isPaused: payload.isPaused ?? false,
+        isBuffering: payload.isBuffering ?? false,
+        playbackRate: payload.playbackRate ?? 1,
+        timestamp: payload.timestamp || new Date().toISOString(),
+      }),
+    });
+
+    const shouldInvalidatePlaybackCache = Boolean(
+      response?.watchState?.locked
+      || String(response?.sessionStatus || '').toLowerCase() === 'locked'
+      || response?.outcome?.completedFullWatch,
+    );
+    if (shouldInvalidatePlaybackCache) {
+      invalidateProtectedLessonPlaybackCache(payload.courseId || null, payload.lessonId || null);
+    }
+    return response;
+  },
+
+  trackSuspiciousProtectedContentEvent: async (payload: {
+    eventName: string;
+    source?: string;
+    courseId?: string | null;
+    lessonId?: string | null;
+    videoId?: string | null;
+    videoType?: string | null;
+    playbackSessionId?: string | null;
+    timestamp?: string;
+  }) => {
+    return request<{ message: string; accepted: boolean }>(`/track/suspicious`, {
+      method: 'POST',
+      expireSessionOn401: false,
+      body: JSON.stringify({
+        eventName: payload.eventName,
+        source: payload.source || 'browser-content-protection',
+        courseId: payload.courseId || null,
+        lessonId: payload.lessonId || null,
+        videoId: payload.videoId || null,
+        videoType: payload.videoType || null,
+        playbackSessionId: payload.playbackSessionId || null,
+        timestamp: payload.timestamp || new Date().toISOString(),
       }),
     });
   },
@@ -1274,6 +1567,72 @@ export const EduService = {
     );
   },
 
+  updateLessonSettings: async (
+    courseId: string,
+    moduleId: string,
+    lessonId: string,
+    payload: {
+      chapterId?: string | null;
+      watchLimit?: number;
+      watchCompletionPercent?: number;
+    },
+  ) => {
+    return request<{ message: string; lesson: CourseLesson; course: CourseCard }>(
+      `/courses/${courseId}/modules/${moduleId}/lessons/${lessonId}/settings`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      },
+    );
+  },
+
+  uploadCourseEditorialVideo: async (
+    courseId: string,
+    file: File,
+    payload: {
+      title: string;
+      description?: string;
+      weekLabel?: string;
+      editorialDate?: string;
+      durationMinutes?: number;
+    },
+  ) => {
+    const formData = new FormData();
+    formData.append('video', file);
+    formData.append('title', payload.title);
+    formData.append('description', payload.description || '');
+    formData.append('weekLabel', payload.weekLabel || '');
+    formData.append('editorialDate', payload.editorialDate || '');
+    formData.append('durationMinutes', String(payload.durationMinutes || 0));
+
+    const response = await fetch(resolveRootPath(`/backend/api/courses/${courseId}/editorials`), {
+      method: 'POST',
+      headers: {
+        ...buildAuthHeaders(),
+      },
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.message || 'Editorial video upload failed');
+    }
+
+    return response.json();
+  },
+
+  deleteCourseEditorialVideo: async (courseId: string, editorialId: string) => {
+    return request<{ message: string; editorialId: string }>(`/courses/${courseId}/editorials/${editorialId}`, {
+      method: 'DELETE',
+    });
+  },
+
+  getProtectedEditorialPlayback: async (courseId: string, editorialId: string) => {
+    return request<ProtectedLessonPlayback>(`/courses/${courseId}/editorials/${editorialId}/player`, {
+      method: 'GET',
+    });
+  },
+
   createQuiz: async (payload: {
     date: string;
     questions: {
@@ -1304,6 +1663,428 @@ export const EduService = {
     });
   },
 
+  getAdminDashboard: async (params?: AdminPaymentRangeParams) => {
+    const searchParams = toSearchParams(params || {});
+    return request<AdminDashboardSummary>(`/admin/dashboard${searchParams.size ? `?${searchParams.toString()}` : ''}`);
+  },
+
+  getAdminStudentLiveMetrics: async () => request<AdminStudentLiveMetricsSummary>(`/admin/students/live-metrics`),
+
+  listAdminStudents: async (params: {
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    status?: string;
+    quickFilter?: string;
+    sortBy?: string;
+  }) => {
+    const searchParams = new URLSearchParams();
+    Object.entries(params || {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') {
+        searchParams.set(key, String(value));
+      }
+    });
+    return request<{ items: AdminStudentSummary[]; pagination: AdminPagination }>(`/admin/students?${searchParams.toString()}`);
+  },
+
+  listAdminLoginSessions: async (params: {
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    status?: string;
+  }) => {
+    const searchParams = new URLSearchParams();
+    Object.entries(params || {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') {
+        searchParams.set(key, String(value));
+      }
+    });
+    return request<{ summary: AdminLoginSessionSummary; items: AdminLoginSessionRecord[]; pagination: AdminPagination }>(`/admin/login-sessions?${searchParams.toString()}`);
+  },
+
+  createAdminStudent: async (payload: {
+    name: string;
+    email: string;
+    mobileNumber?: string;
+    password: string;
+  }) => {
+    return request<AuthUser>(`/admin/students`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  getAdminStudentDetails: async (studentId: string) => {
+    return request<AdminStudentDetails>(`/admin/students/${studentId}`);
+  },
+
+  updateAdminStudent: async (studentId: string, payload: {
+    name?: string;
+    email?: string;
+    mobileNumber?: string;
+  }) => {
+    return request<AuthUser>(`/admin/students/${studentId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  updateAdminStudentStatus: async (studentId: string, payload: {
+    status: string;
+    note?: string;
+  }) => {
+    return request<{ success?: boolean }>(`/admin/students/${studentId}/status`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  resetAdminStudentPassword: async (studentId: string, payload: {
+    newPassword: string;
+    reason?: string;
+  }) => {
+    return request<{ success: boolean }>(`/admin/students/${studentId}/reset-password`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  forceLogoutAdminStudent: async (studentId: string) => {
+    return request<{ success: boolean }>(`/admin/students/${studentId}/force-logout`, {
+      method: 'POST',
+    });
+  },
+
+  clearAdminPlaybackSessions: async (studentId: string) => {
+    return request<{ success: boolean }>(`/admin/students/${studentId}/playback-sessions/clear`, {
+      method: 'POST',
+    });
+  },
+
+  resetAdminWatchProgress: async (
+    studentId: string,
+    stateId: string,
+    payload?: { reason?: string; action?: 'full_reset' | 'completed_watches' | 'grace_unlock' },
+  ) => {
+    return request<{ success: boolean }>(`/admin/students/${studentId}/watch-progress/${stateId}/reset`, {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+    });
+  },
+
+  listAdminPurchases: async (params: {
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    studentId?: string;
+    courseId?: string;
+    paymentStatus?: string;
+    accessStatus?: string;
+  }) => {
+    const searchParams = new URLSearchParams();
+    Object.entries(params || {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') {
+        searchParams.set(key, String(value));
+      }
+    });
+    return request<{ items: AdminPurchaseRecord[]; pagination: AdminPagination }>(`/admin/purchases?${searchParams.toString()}`);
+  },
+
+  listAdminCourseAccess: async (params: {
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    studentId?: string;
+    courseId?: string;
+    paymentStatus?: string;
+    accessStatus?: string;
+  }) => {
+    const searchParams = new URLSearchParams();
+    Object.entries(params || {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') {
+        searchParams.set(key, String(value));
+      }
+    });
+    return request<{ summary: AdminCourseAccessSummary; items: AdminCourseAccessRecord[]; pagination: AdminPagination }>(`/admin/course-access?${searchParams.toString()}`);
+  },
+
+  listAdminCourseAccessRules: async (params: {
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    courseId?: string;
+    studentId?: string;
+    studentScope?: string;
+    contentScope?: string;
+  }) => {
+    const searchParams = toSearchParams(params || {});
+    return request<{ items: AdminCourseContentAccessRule[]; pagination: AdminPagination }>(`/admin/course-access/rules?${searchParams.toString()}`);
+  },
+
+  upsertAdminCourseAccessRule: async (payload: {
+    courseId: string;
+    studentScope?: string;
+    studentId?: string;
+    contentScope?: string;
+    moduleId?: string;
+    chapterId?: string;
+    lessonId?: string;
+    access?: string;
+    adminNote?: string;
+  }) => {
+    return request<{ success: boolean; rule: AdminCourseContentAccessRule }>(`/admin/course-access/rules`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  deleteAdminCourseAccessRule: async (ruleId: string) => {
+    return request<{ success: boolean; rule: AdminCourseContentAccessRule }>(`/admin/course-access/rules/${ruleId}`, {
+      method: 'DELETE',
+    });
+  },
+
+  listAdminStudentLessonWatchOverrides: async (params: {
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    courseId?: string;
+    studentId?: string;
+    lessonId?: string;
+  }) => {
+    const searchParams = toSearchParams(params || {});
+    return request<{ items: AdminStudentLessonWatchOverride[]; pagination: AdminPagination }>(`/admin/course-access/watch-overrides?${searchParams.toString()}`);
+  },
+
+  upsertAdminStudentLessonWatchOverride: async (payload: {
+    courseId: string;
+    studentId: string;
+    moduleId?: string;
+    chapterId?: string;
+    lessonId?: string;
+    allowedFullWatches: number;
+    watchCompletionPercent?: number;
+    bulkScope?: string;
+    adminNote?: string;
+  }) => {
+    return request<{ success: boolean; overrides: AdminStudentLessonWatchOverride[]; savedCount: number }>(`/admin/course-access/watch-overrides`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  deleteAdminStudentLessonWatchOverride: async (overrideId: string) => {
+    return request<{ success: boolean; override: AdminStudentLessonWatchOverride }>(`/admin/course-access/watch-overrides/${overrideId}`, {
+      method: 'DELETE',
+    });
+  },
+
+  assignAdminCourse: async (payload: {
+    studentId: string;
+    courseId: string;
+    validUntil?: string;
+    adminNote?: string;
+  }) => {
+    return request<{ success: boolean }>(`/admin/purchases/assign-course`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  updateAdminPurchase: async (purchaseId: string, payload: {
+    accessStatus?: string;
+    validUntil?: string;
+    paymentStatus?: string;
+    transactionId?: string;
+    adminNote?: string;
+  }) => {
+    return request<{ success: boolean }>(`/admin/purchases/${purchaseId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  removeAdminCourseAccess: async (payload: {
+    studentId: string;
+    courseId: string;
+    adminNote?: string;
+  }) => {
+    return request<{ success: boolean }>(`/admin/purchases/remove-course`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  diagnoseAdminCourseAccess: async (params: {
+    studentId: string;
+    courseId?: string;
+    transactionId?: string;
+  }) => {
+    const searchParams = new URLSearchParams();
+    Object.entries(params || {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') {
+        searchParams.set(key, String(value));
+      }
+    });
+    return request<AdminAccessDiagnosis>(`/admin/access/diagnose?${searchParams.toString()}`);
+  },
+
+  repairAdminCourseAccess: async (payload: {
+    studentId: string;
+    courseId?: string;
+    transactionId?: string;
+    adminNote?: string;
+  }) => {
+    return request<AdminRepairResult>(`/admin/access/repair`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  listAdminTransactions: async (params: {
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    courseId?: string;
+    paymentStatus?: string;
+    manualReviewOnly?: boolean;
+  } & AdminPaymentRangeParams) => {
+    const searchParams = toSearchParams(params || {});
+    return request<{ items: AdminTransactionRecord[]; pagination: AdminPagination }>(`/admin/transactions?${searchParams.toString()}`);
+  },
+
+  getAdminPaymentReconciliation: async (params?: AdminPaymentRangeParams) => {
+    const searchParams = toSearchParams(params || {});
+    return request<AdminPaymentReconciliationReport>(`/admin/payments/reconciliation?${searchParams.toString()}`);
+  },
+
+  listAdminManualReviewQueue: async (params: {
+    page?: number;
+    pageSize?: number;
+    search?: string;
+  }) => {
+    const searchParams = new URLSearchParams();
+    Object.entries(params || {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') {
+        searchParams.set(key, String(value));
+      }
+    });
+    return request<{ summary: AdminManualReviewSummary; items: AdminManualReviewRecord[]; pagination: AdminPagination }>(`/admin/manual-review?${searchParams.toString()}`);
+  },
+
+  listAdminAuditLogs: async (params: {
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    actionType?: string;
+  }) => {
+    const searchParams = new URLSearchParams();
+    Object.entries(params || {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') {
+        searchParams.set(key, String(value));
+      }
+    });
+    return request<{ items: AdminAuditLogRecord[]; pagination: AdminPagination }>(`/admin/audit-logs?${searchParams.toString()}`);
+  },
+
+  getAdminSystemHealth: async () => {
+    return request<AdminSystemHealthSummary>(`/admin/system-health`);
+  },
+
+  listAdminLessonDoubts: async (params: {
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    status?: string;
+    courseId?: string;
+    lessonId?: string;
+  }) => {
+    const searchParams = new URLSearchParams();
+    Object.entries(params || {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') {
+        searchParams.set(key, String(value));
+      }
+    });
+    return request<AdminLessonDoubtListResponse>(`/courses/admin/lesson-doubts?${searchParams.toString()}`);
+  },
+
+  replyAdminLessonDoubt: async (threadId: string, payload: { message: string; attachments?: SupportAttachment[] }) => {
+    return request<{ message: string; thread: LessonDoubtThread; notificationsSent: number }>(`/courses/admin/lesson-doubts/${threadId}/reply`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  updateAdminLessonDoubtStatus: async (threadId: string, payload: { status: string; reason?: string }) => {
+    return request<{ message: string; thread: LessonDoubtThread }>(`/courses/admin/lesson-doubts/${threadId}/status`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  listAdminLessonReports: async (params: {
+    page?: number;
+    pageSize?: number;
+    search?: string;
+    status?: string;
+    courseId?: string;
+    lessonId?: string;
+    issueType?: string;
+  }) => {
+    const searchParams = new URLSearchParams();
+    Object.entries(params || {}).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') {
+        searchParams.set(key, String(value));
+      }
+    });
+    return request<AdminLessonReportListResponse>(`/courses/admin/reports?${searchParams.toString()}`);
+  },
+
+  updateAdminLessonReport: async (reportId: string, payload: { status?: string; adminNote?: string; adminReply?: string; adminAttachments?: SupportAttachment[]; reason?: string }) => {
+    return request<{ message: string; report: LessonReportRecord }>(`/courses/admin/reports/${reportId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  updateAdminTransaction: async (paymentId: string, payload: {
+    status?: string;
+    transactionId?: string;
+    adminNote?: string;
+    manualReviewRequired?: boolean;
+    verificationDecision?: string;
+    verificationReason?: string;
+  }) => {
+    return request<{ success: boolean }>(`/admin/transactions/${paymentId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  syncAdminRazorpayPayment: async (payload: {
+    paymentId?: string;
+    transactionId?: string;
+    orderId?: string;
+    studentId?: string;
+    courseId?: string;
+    adminNote?: string;
+  }) => {
+    return request<AdminRazorpaySyncResult>(`/admin/transactions/sync-razorpay`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  syncAllAdminPendingRazorpayPayments: async (payload?: {
+    maxRecords?: number;
+    adminNote?: string;
+  }) => {
+    return request<AdminBulkRazorpaySyncResult>(`/admin/transactions/sync-razorpay-all`, {
+      method: 'POST',
+      body: JSON.stringify(payload || {}),
+    });
+  },
+
   retryPayment: async (paymentId: string) => {
     return request<{ _id: string; paymentUrl: string; status: string; attemptCount: number }>(`/payment/${paymentId}/retry`, {
       method: 'POST',
@@ -1324,57 +2105,6 @@ export const EduService = {
     },
   ) => {
     const onProgress = options?.onProgress;
-    try {
-      const session = await request<CloudflareStreamUploadSession>(
-        `/courses/${courseId}/modules/${moduleId}/videos/cloudflare/direct-upload`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            lessonTitle,
-            durationMinutes: durationMinutes || 0,
-            isPremium: Boolean(isPremium),
-            lessonType: 'video',
-            chapterId: chapterId || undefined,
-            originalFilename: file.name,
-            mimeType: file.type || 'video/mp4',
-            fileSize: file.size,
-          }),
-        },
-      );
-
-      if (!session?.upload?.uploadURL || !session.upload.uid) {
-        throw new Error('Cloudflare Stream upload session was not created.');
-      }
-
-      if (session.upload.method === 'tus') {
-        await uploadTusToCloudflare(session.upload.uploadURL, file, onProgress);
-      } else {
-        await uploadDirectPostToCloudflare(session.upload.uploadURL, file, onProgress);
-      }
-
-      await request(`/courses/${courseId}/modules/${moduleId}/videos/cloudflare/complete`, {
-        method: 'POST',
-        body: JSON.stringify({
-          uid: session.upload.uid,
-          lessonId: session.video?.id,
-        }),
-      }).catch(() => null);
-
-      return {
-        ...session,
-        message: session.message
-          || 'Video uploaded successfully. It will become visible to students after Cloudflare Stream finishes encoding.',
-      };
-    } catch (error) {
-      const apiError = error as ApiRequestError;
-      const canUseLegacyUpload = apiError instanceof ApiRequestError
-        && ['CLOUDFLARE_STREAM_NOT_CONFIGURED', 'REQUEST_FAILED'].includes(apiError.code)
-        && [404, 501, 503].includes(apiError.status);
-      if (!canUseLegacyUpload) {
-        throw error;
-      }
-    }
-
     const formData = new FormData();
     const appendSharedFields = (target: FormData) => {
       target.append('lessonTitle', lessonTitle);
@@ -1542,7 +2272,7 @@ export const EduService = {
   postLessonDoubtMessage: async (
     courseId: string,
     lessonId: string,
-    payload: { message: string; threadId?: string | null },
+    payload: { message: string; threadId?: string | null; attachments?: SupportAttachment[] },
   ) => {
     return request<{
       message: string;
@@ -1551,6 +2281,71 @@ export const EduService = {
     }>(`/courses/${courseId}/lessons/${lessonId}/doubts`, {
       method: 'POST',
       body: JSON.stringify(payload),
+    });
+  },
+
+  listLessonReports: async (courseId: string, lessonId: string) => {
+    return request<{ items: LessonReportRecord[] }>(`/courses/${courseId}/lessons/${lessonId}/reports/my`, {
+      method: 'GET',
+    });
+  },
+
+  postLessonReport: async (
+    courseId: string,
+    lessonId: string,
+    payload: {
+      issueType: string;
+      description: string;
+      pageUrl?: string | null;
+      screenshotUrl?: string | null;
+      attachmentMeta?: Record<string, unknown>;
+      attachments?: SupportAttachment[];
+    },
+  ) => {
+    return request<{ message: string; report: LessonReportRecord }>(`/courses/${courseId}/lessons/${lessonId}/reports`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  uploadLessonSupportMedia: async (courseId: string, lessonId: string, file: File) => {
+    const formData = new FormData();
+    formData.append('file', file, file.name);
+
+    const response = await fetch(resolveRootPath(`${API_BASE}/courses/${courseId}/lessons/${lessonId}/support-media`), {
+      method: 'POST',
+      headers: {
+        ...buildAuthHeaders(),
+      },
+      body: formData,
+    });
+
+    const payload = await parsePayload(response);
+
+    if (!response.ok) {
+      if (response.status === 401) {
+        handleUnauthorized(payload);
+        throw new Error('Session expired. Please sign in again.');
+      }
+      throw new ApiRequestError(extractErrorMessage(payload, `/courses/${courseId}/lessons/${lessonId}/support-media`), {
+        status: response.status,
+        code: payload?.code || 'REQUEST_FAILED',
+        details: payload?.details,
+      });
+    }
+
+    return payload as { message: string; attachment: SupportAttachment };
+  },
+
+  markNotificationRead: async (notificationId: string) => {
+    return request<{ message: string; notification: NotificationItem }>(`/notifications/${notificationId}/read`, {
+      method: 'PATCH',
+    });
+  },
+
+  markAllNotificationsRead: async () => {
+    return request<{ message: string; updated: number }>(`/notifications/read-all`, {
+      method: 'PATCH',
     });
   },
 
@@ -1567,9 +2362,105 @@ export const EduService = {
     });
   },
 
+  retryVideoProcessing: async (courseId: string, moduleId: string, videoId: string, chapterId?: string | null) => {
+    const query = chapterId ? `?chapterId=${encodeURIComponent(chapterId)}` : '';
+    return request(`/courses/${courseId}/modules/${moduleId}/videos/${videoId}/retry-processing${query}`, {
+      method: 'POST',
+    });
+  },
+
   getVideoMetadata: async (courseId: string, moduleId: string, videoId: string) => {
     return request(`/courses/${courseId}/modules/${moduleId}/videos/${videoId}`, {
       method: 'GET',
     });
   },
+
+  listCoursePdfAttachments: async (
+    courseId: string,
+    moduleId: string,
+    options: {
+      scope?: 'module' | 'chapter' | 'lesson';
+      chapterId?: string | null;
+      lessonId?: string | null;
+    } = {},
+  ) => {
+    const searchParams = toSearchParams({
+      scope: options.scope || 'module',
+      chapterId: options.chapterId || '',
+      lessonId: options.lessonId || '',
+    });
+    return request<{ attachments: CoursePdfAttachment[] }>(`/courses/${courseId}/modules/${moduleId}/pdfs?${searchParams.toString()}`, {
+      method: 'GET',
+    });
+  },
+
+  uploadCoursePdfAttachment: async (
+    courseId: string,
+    moduleId: string,
+    file: File,
+    payload: {
+      title: string;
+      scope: 'module' | 'chapter' | 'lesson';
+      chapterId?: string | null;
+      lessonId?: string | null;
+      premium?: boolean;
+    },
+  ) => {
+    const formData = new FormData();
+    formData.append('pdf', file, file.name);
+    formData.append('title', payload.title);
+    formData.append('scope', payload.scope);
+    if (payload.chapterId) {
+      formData.append('chapterId', payload.chapterId);
+    }
+    if (payload.lessonId) {
+      formData.append('lessonId', payload.lessonId);
+    }
+    formData.append('premium', payload.premium ? 'true' : 'false');
+
+    const response = await fetch(resolveRootPath(`/backend/api/courses/${courseId}/modules/${moduleId}/pdfs`), {
+      method: 'POST',
+      headers: {
+        ...(readStoredToken() ? { Authorization: `Bearer ${readStoredToken()}` } : {}),
+      },
+      body: formData,
+    });
+
+    const responseText = await response.text();
+    let body: any = null;
+    try {
+      body = responseText ? JSON.parse(responseText) : null;
+    } catch {
+      body = null;
+    }
+    if (!response.ok) {
+      throw new Error(body?.error?.message || body?.message || 'PDF upload failed');
+    }
+    return body as { message: string; attachment: CoursePdfAttachment; course: CourseCard };
+  },
+
+  deleteCoursePdfAttachment: async (
+    courseId: string,
+    moduleId: string,
+    attachmentId: string,
+    options: {
+      scope?: 'module' | 'chapter' | 'lesson';
+      chapterId?: string | null;
+      lessonId?: string | null;
+    } = {},
+  ) => {
+    const searchParams = toSearchParams({
+      scope: options.scope || 'module',
+      chapterId: options.chapterId || '',
+      lessonId: options.lessonId || '',
+    });
+    return request<{ message: string; attachmentId: string }>(`/courses/${courseId}/modules/${moduleId}/pdfs/${attachmentId}?${searchParams.toString()}`, {
+      method: 'DELETE',
+    });
+  },
+
+  getProtectedCoursePdfRequest: (courseId: string, attachmentId: string) => ({
+    url: resolveRootPath(`/backend/api/courses/${courseId}/pdf-attachments/${attachmentId}/view`),
+    headers: buildAuthHeaders(),
+  }),
 };

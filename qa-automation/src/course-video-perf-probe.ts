@@ -30,6 +30,8 @@ type ScreenshotArtifact = {
 const chromePath = process.env.QA_CHROME_EXECUTABLE || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const courseId = process.env.QA_COURSE_ID || 'course_1899470118af44b4b9447b35fd296761';
 const lessonId = process.env.QA_LESSON_ID || 'video_1778758229576';
+const courseText = process.env.QA_COURSE_TEXT || 'SSC';
+const lessonText = process.env.QA_LESSON_TEXT || 'INTRODUCTION';
 const watchWindowMs = Math.max(10_000, Number(process.env.QA_WATCH_WINDOW_MS || 20_000));
 const hlsPattern = /\/backend\/api\/course-manifests\/|\/backend\/api\/courses\/stream\/|\.m3u8(?:\?|$)|\.(?:ts|m4s|mp4)(?:\?|$)/i;
 
@@ -59,6 +61,38 @@ const login = async () => {
   }
 
   return payload.token as string;
+};
+
+const waitForSelectorOptional = async (page: puppeteer.Page, selector: string, timeoutMs: number) => page
+  .waitForSelector(selector, { timeout: timeoutMs })
+  .then(() => true)
+  .catch(() => false);
+
+const openCourseFromCatalog = async (page: puppeteer.Page, text: string) => {
+  const clicked = await page.evaluate((cardSelector, courseLabel) => {
+    const cards = Array.from(document.querySelectorAll(cardSelector)) as HTMLElement[];
+    const target = cards.find((card) => (card.textContent || '').toLowerCase().includes(courseLabel.toLowerCase())) || cards[0];
+    target?.scrollIntoView({ block: 'center', inline: 'nearest' });
+    target?.click();
+    return Boolean(target);
+  }, selectors.courseCatalogCard, text);
+  if (!clicked) {
+    throw new Error('No course card was available for the video perf probe.');
+  }
+};
+
+const openLessonFromCourse = async (page: puppeteer.Page, text: string) => {
+  await page.waitForSelector(selectors.courseLessonOpen, { timeout: 30_000 });
+  const clicked = await page.evaluate((lessonSelector, lessonLabel) => {
+    const buttons = Array.from(document.querySelectorAll(lessonSelector)) as HTMLElement[];
+    const target = buttons.find((button) => (button.textContent || '').toLowerCase().includes(lessonLabel.toLowerCase())) || buttons[0];
+    target?.scrollIntoView({ block: 'center', inline: 'nearest' });
+    target?.click();
+    return Boolean(target);
+  }, selectors.courseLessonOpen, text);
+  if (!clicked) {
+    throw new Error('No lesson entry was available for the video perf probe.');
+  }
 };
 
 const screenshot = async (
@@ -146,8 +180,26 @@ const main = async () => {
 
     const lessonUrl = `${config.baseUrl.replace(/\/$/, '')}/?tab=courses&courseId=${encodeURIComponent(courseId)}&lessonId=${encodeURIComponent(lessonId)}`;
     const startedAt = Date.now();
+    await page.goto(config.baseUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
     await page.goto(lessonUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    await page.waitForSelector(selectors.coursePlayerHeading, { timeout: 30_000 });
+    const loginVisible = await waitForSelectorOptional(page, selectors.loginEmail, 8_000);
+    if (loginVisible) {
+      await page.type(selectors.loginEmail, process.env.QA_LOGIN_EMAIL || config.loginEmail);
+      await page.type(selectors.loginPassword, process.env.QA_LOGIN_PASSWORD || config.loginPassword);
+      await page.click(selectors.loginSubmit);
+      await page.waitForSelector(selectors.shellReady, { timeout: 45_000 });
+      await page.goto(lessonUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+    }
+
+    const playerReachedDirectly = await waitForSelectorOptional(page, `${selectors.coursePlayerHeading}, ${selectors.coursePlayerFullscreen}, video`, 20_000);
+    if (!playerReachedDirectly) {
+      await page.goto(`${config.baseUrl.replace(/\/$/, '')}/?tab=courses`, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      await page.waitForSelector(selectors.courseCatalogCard, { timeout: 30_000 });
+      await openCourseFromCatalog(page, courseText);
+      await openLessonFromCourse(page, lessonText);
+      await page.waitForSelector(`${selectors.coursePlayerHeading}, ${selectors.coursePlayerFullscreen}, video`, { timeout: 30_000 });
+    }
+
     const headingReadyMs = Date.now() - startedAt;
     const shellShot = await screenshot(page, ctx, '01', 'lesson-shell');
     if (shellShot.error) {
@@ -161,6 +213,17 @@ const main = async () => {
       artifactWarnings.push(`video-visible screenshot: ${videoShot.error}`);
     }
 
+    await page.click(selectors.coursePlayerVideoPlay).catch(() => undefined);
+    await page.$eval('video', (video) => {
+      (video as HTMLVideoElement).scrollIntoView({ block: 'center', inline: 'nearest' });
+    }).catch(() => undefined);
+    const videoHandle = await page.$('video');
+    if (videoHandle) {
+      const box = await videoHandle.boundingBox();
+      if (box) {
+        await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2).catch(() => undefined);
+      }
+    }
     await page.evaluate(() => {
       const video = document.querySelector('video') as HTMLVideoElement | null;
       if (!video) {

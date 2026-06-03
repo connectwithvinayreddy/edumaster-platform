@@ -16,6 +16,7 @@ const { requireAuth } = require("./backend/middleware/auth.js");
 const { appConfig, getProductionConfigDiagnostics } = require("./backend/lib/config.js");
 const { connectDatabase } = require("./backend/lib/database.js");
 const { paymentRepository, coursesRepository } = require("./backend/lib/repositories.js");
+const { verifyRazorpayWebhookSignature } = require("./backend/payment/razorpay-client.js");
 
 const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || "";
 const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || "";
@@ -127,12 +128,16 @@ const getDiscountedCoursePrice = (course: { price?: number; offerPercentage?: nu
 const sendRootError = (res: express.Response, error: unknown) => {
   const status = error instanceof RootApiError ? error.status : 500;
   const message = error instanceof Error ? error.message : "Internal server error";
+  const requestId = String(res.getHeader("X-Request-Id") || "");
 
   if (status >= 500) {
     console.error(error);
   }
 
-  return res.status(status).json({ error: message });
+  return res.status(status).json({
+    error: message,
+    requestId: requestId || undefined,
+  });
 };
 
 async function startServer() {
@@ -161,14 +166,19 @@ async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 3000);
   const HOST = process.env.HOST || "0.0.0.0";
-
-  app.disable("x-powered-by");
-  app.set("trust proxy", true);
-  app.use(express.json({
+  const rootJsonParser = express.json({
     verify: (req: express.Request & { rawBody?: Buffer }, _res, buffer) => {
       req.rawBody = Buffer.from(buffer);
     },
-  }));
+  });
+
+  app.disable("x-powered-by");
+  app.set("trust proxy", true);
+  app.use((req, res, next) => {
+    const requestId = String(req.headers["x-request-id"] || req.headers["cf-ray"] || crypto.randomUUID());
+    res.setHeader("X-Request-Id", requestId);
+    next();
+  });
   app.use(addRootSecurityHeaders);
   app.use((req, res, next) => {
     if (
@@ -180,6 +190,7 @@ async function startServer() {
     return next();
   });
   app.use("/backend", backendApp);
+  app.use("/api", rootJsonParser);
 
   app.get("/healthz", async (_req, res) => {
     const response = await fetch(`http://127.0.0.1:${PORT}/backend/api/health`).catch(() => null);
@@ -243,6 +254,14 @@ async function startServer() {
         providerOrderId: order.id,
       });
 
+      console.info("[payments] razorpay order created", {
+        paymentId: payment._id,
+        orderId: order.id,
+        courseId,
+        userId,
+        amount,
+      });
+
       return res.json({
         provider: "razorpay",
         order_id: order.id,
@@ -273,8 +292,20 @@ async function startServer() {
       const razorpaySignature = requireString(req.body?.razorpay_signature || req.body?.signature, "razorpay_signature");
 
       if (!isValidRazorpaySignature(razorpayOrderId, razorpayPaymentId, razorpaySignature)) {
+        console.warn("[payments] razorpay callback signature failed", {
+          paymentId: localPaymentId,
+          orderId: razorpayOrderId,
+          gatewayPaymentId: razorpayPaymentId,
+        });
         throw new RootApiError(400, "Payment signature verification failed.");
       }
+
+      console.info("[payments] razorpay callback received", {
+        paymentId: localPaymentId,
+        orderId: razorpayOrderId,
+        gatewayPaymentId: razorpayPaymentId,
+        userId: req.user?.id || null,
+      });
 
       const remotePayment = await razorpay.payments.fetch(razorpayPaymentId);
       const remoteOrderId = String(remotePayment?.order_id || "");
@@ -282,10 +313,6 @@ async function startServer() {
       if (remoteOrderId !== razorpayOrderId) {
         throw new RootApiError(400, "Razorpay payment is linked to a different order.");
       }
-      if (!["authorized", "captured"].includes(remoteStatus)) {
-        throw new RootApiError(400, "Razorpay payment is not successful.");
-      }
-
       const course = await coursesRepository.findById(courseId);
       if (!course) {
         throw new RootApiError(404, "Course not found.");
@@ -303,15 +330,28 @@ async function startServer() {
         providerOrderId: razorpayOrderId,
         providerPaymentId: razorpayPaymentId,
         providerSignature: razorpaySignature,
+        remoteStatus,
+        remoteCreatedAt: remotePayment?.created_at || null,
+        remoteMethod: remotePayment?.method || null,
+        remoteAcquirerData: remotePayment?.acquirer_data || null,
+      });
+
+      console.info("[payments] razorpay callback verified", {
+        paymentId: localPaymentId,
+        orderId: razorpayOrderId,
+        gatewayPaymentId: razorpayPaymentId,
+        gatewayStatus: remoteStatus,
+        enrollmentActivated: Boolean(result.enrollment),
       });
 
       return res.json({
-        status: "paid",
+        status: result.verificationDecision === "VERIFIED_CAPTURED_ACTIVATED" ? "paid" : "pending",
         enrollment: result.enrollment,
         courseId,
         paymentId: localPaymentId,
         orderId: razorpayOrderId,
         razorpayPaymentId,
+        verificationDecision: result.verificationDecision || null,
       });
     } catch (error: any) {
       if (isRazorpayAuthError(error)) {
@@ -326,6 +366,57 @@ async function startServer() {
   app.post("/api/razorpay/create-order", requireAuth, handleRazorpayCreateOrder);
   app.post("/api/verify-payment", requireAuth, handleRazorpayVerifyPayment);
   app.post("/api/razorpay/verify-payment", requireAuth, handleRazorpayVerifyPayment);
+  app.post("/api/razorpay/webhook", async (req: any, res: express.Response) => {
+    try {
+      const signature = String(req.get("x-razorpay-signature") || "").trim();
+      if (signature && req.rawBody?.length) {
+        const valid = verifyRazorpayWebhookSignature({
+          rawBody: req.rawBody,
+          signature,
+        });
+        if (!valid) {
+          console.warn("[payments] razorpay webhook signature failed");
+          return res.status(401).json({ error: "Invalid Razorpay webhook signature." });
+        }
+      }
+
+      console.info("[payments] razorpay webhook received", {
+        event: req.body?.event || "payment.updated",
+      });
+
+      const result = await paymentRepository.handleWebhook(req.body || {});
+      return res.json({
+        ok: true,
+        webhook: result,
+      });
+    } catch (error) {
+      return sendRootError(res, error);
+    }
+  });
+
+  app.use((error: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (res.headersSent) {
+      return next(error);
+    }
+
+    if (error?.type === "entity.parse.failed") {
+      return res.status(400).json({
+        error: "Malformed JSON body",
+        code: "INVALID_JSON",
+        requestId: String(res.getHeader("X-Request-Id") || ""),
+      });
+    }
+
+    if (error?.type === "entity.too.large") {
+      return res.status(413).json({
+        error: "Request body is too large",
+        code: "PAYLOAD_TOO_LARGE",
+        requestId: String(res.getHeader("X-Request-Id") || ""),
+      });
+    }
+
+    return next(error);
+  });
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({

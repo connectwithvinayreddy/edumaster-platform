@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { testsRepository, sessionRepository } = require('../lib/repositories.js');
+const { testsRepository, sessionRepository, videoPlaybackRepository } = require('../lib/repositories.js');
 const {
   ApiError,
   asyncHandler,
@@ -18,6 +18,7 @@ const {
   resolvePrivateVideoPath,
   getProtectedAssetStorageRoot,
 } = require('../lib/private-video.js');
+const { buildSecurePlaybackClientContext } = require('../lib/secure-playback.js');
 const {
   storePrivateVideoUpload,
   deleteStoredPrivateVideo,
@@ -38,6 +39,15 @@ const validVideoExtensions = new Set(['.mp4', '.webm', '.ogg', '.mov', '.mkv']);
 const maxSize = appConfig.maxVideoUploadMb * 1024 * 1024;
 
 const HLS_ACCESS_COOKIE_PATH = '/backend/api/';
+
+const requestMatchesPlaybackContext = (req, payload = {}) => {
+  if (!payload?.userAgentHash) {
+    return true;
+  }
+
+  const requestContext = buildSecurePlaybackClientContext(req);
+  return String(requestContext.userAgentHash || '') === String(payload.userAgentHash || '');
+};
 
 const setPlaybackCookie = (res, token, expiresAtIso) => {
   const expiresAtMs = Number(new Date(expiresAtIso || '').getTime() || 0);
@@ -89,6 +99,11 @@ const appendPlaybackGrantCookieIfNeeded = (req, res, player) => {
     userId: req.user?.id || null,
     sessionId: req.user?.session || null,
     storageRoot,
+    playbackSessionId: player?.playbackSessionId || null,
+    courseId: player?.courseId || null,
+    videoType: player?.videoType || null,
+    videoId: player?.videoId || null,
+    userAgentHash: buildSecurePlaybackClientContext(req).userAgentHash,
   }, {
     expiresAtMs: Number(new Date(player.tokenExpiresAt || '').getTime() || 0) || undefined,
     ttlSeconds: appConfig.privateVideoHlsSegmentTokenTtlSeconds,
@@ -220,6 +235,7 @@ const getProtectedTestVideoPlayer = asyncHandler(async (req, res) => {
     userId: req.user?.id || null,
     userRole: req.user?.role || 'guest',
     user: req.user?.profile || req.user || null,
+    requestContext: buildSecurePlaybackClientContext(req),
   });
   appendPlaybackGrantCookieIfNeeded(req, res, player);
   return ok(res, player);
@@ -238,6 +254,31 @@ const streamProtectedTestVideo = asyncHandler(async (req, res) => {
     : null;
   if (payload.sessionId && activeSessionId !== payload.sessionId) {
     throw new ApiError(401, 'Playback session is no longer active', { code: 'PLAYBACK_SESSION_INVALID' });
+  }
+
+  if (!requestMatchesPlaybackContext(req, payload)) {
+    throw new ApiError(401, 'Playback token is not valid for this device or browser session', {
+      code: 'PLAYBACK_CONTEXT_INVALID',
+    });
+  }
+
+  if (payload.userId && payload.playbackSessionId) {
+    const requestContext = buildSecurePlaybackClientContext(req);
+    const activePlaybackSession = await videoPlaybackRepository.validatePlaybackSession({
+      userId: String(payload.userId),
+      playbackSessionId: String(payload.playbackSessionId),
+      authSessionId: payload.sessionId || null,
+      courseId: payload.courseId || null,
+      videoId: payload.videoId || null,
+      videoType: payload.videoType || null,
+      requestContext,
+    });
+    if (!activePlaybackSession) {
+      throw new ApiError(401, 'Playback session is no longer valid', { code: 'PLAYBACK_SESSION_INVALID' });
+    }
+    if (String(activePlaybackSession.status || '').toLowerCase() === 'locked') {
+      throw new ApiError(403, 'Video watch limit reached', { code: 'VIDEO_WATCH_LIMIT_REACHED' });
+    }
   }
 
   if (isS3Provider(payload.storageProvider)) {

@@ -295,14 +295,14 @@ const expandLessonDoubtsSection = async (page: puppeteer.Page) => {
   if (state !== 'expanded') {
     await page.$eval('[data-testid="course-lesson-doubts-section"] > button', (button) => (button as HTMLButtonElement).click());
   }
-  await page.waitForSelector('[data-testid="course-lesson-doubt-send"]', { timeout: 20000 });
+  await page.waitForSelector('[data-testid="lesson-doubt-send-button"]', { timeout: 20000 });
 };
 
 const submitLessonDoubt = async (page: puppeteer.Page, message: string, role: 'student' | 'admin') => {
   await expandLessonDoubtsSection(page);
   const placeholder = role === 'admin' ? 'Reply to this learner...' : 'Type your doubt...';
   await page.locator(`input[placeholder="${placeholder}"]`).fill(message);
-  await page.locator('[data-testid="course-lesson-doubt-send"]').click();
+  await page.locator('[data-testid="lesson-doubt-send-button"]').click();
   await page.waitForFunction(
     (expected) => (document.body?.innerText || '').includes(String(expected)),
     { timeout: 30000 },

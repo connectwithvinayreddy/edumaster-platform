@@ -5,7 +5,10 @@ const state = {
   testAttempts: [],
   quizzes: [],
   enrollments: [],
+  courseContentAccessRules: [],
   watchHistory: [],
+  videoWatchStates: [],
+  studentLessonWatchOverrides: [],
   videoAccessGrants: [],
   liveReplayAccessGrants: [],
   liveClasses: [],
@@ -18,10 +21,12 @@ const state = {
   notifications: [],
   lessonDoubtThreads: [],
   lessonDoubtMessages: [],
+  lessonReports: [],
   referrals: [],
   uploads: [],
   payments: [],
   webhooks: [],
+  adminAuditLogs: [],
 };
 
 const counters = new Map();

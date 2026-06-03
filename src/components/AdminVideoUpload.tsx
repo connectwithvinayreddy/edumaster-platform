@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Upload, Trash2, Play, Lock, Loader, AlertCircle, CheckCircle } from 'lucide-react';
+import { Upload, Trash2, Play, Lock, Loader, AlertCircle, CheckCircle, RefreshCw } from 'lucide-react';
 import { EduService } from '../EduService';
 
 const MAX_VIDEO_UPLOAD_MB = Number(import.meta.env.VITE_MAX_VIDEO_UPLOAD_MB || 2048);
@@ -32,6 +32,7 @@ interface Video {
   cloudflareStreamStatus?: string | null;
   cloudflareStreamPctComplete?: number | null;
   targetQualities?: string[];
+  sourceFallbackAllowed?: boolean;
 }
 
 type ProcessingProvider = 'cloudflare-stream' | 'local-hls' | 'unknown';
@@ -94,6 +95,18 @@ const isProcessingVideo = (video: Video): boolean => {
     || ['queued', 'processing'].includes(processingStatus);
 };
 
+const hasSourceFallbackProtection = (video: Video): boolean =>
+  Boolean(video.sourceFallbackAllowed)
+  && String(video.deliveryStrategy || '').toLowerCase() !== 'cloudflare-stream';
+
+const isFallbackPlayableVideo = (video: Video): boolean => {
+  if (!hasSourceFallbackProtection(video)) {
+    return false;
+  }
+  const processingStatus = String(video.hlsProcessingStatus || '').toLowerCase();
+  return ['queued', 'processing', 'failed'].includes(processingStatus);
+};
+
 const getVideoProcessingProvider = (video: Video): ProcessingProvider => {
   const storageProvider = String(video.storageProvider || '').toLowerCase();
   const streamProvider = String(video.streamProvider || '').toLowerCase();
@@ -138,7 +151,10 @@ const getProcessingNotice = (video: Video): string => {
     return 'Students will not see this topic until Cloudflare Stream finishes encoding and marks it ready.';
   }
   if (provider === 'local-hls') {
-    return 'Students will not see this topic until the private adaptive HLS packaging job finishes.';
+    if (isFallbackPlayableVideo(video)) {
+      return 'Students can open this topic immediately with protected source playback while adaptive HLS packaging finishes or recovers.';
+    }
+    return 'Adaptive HLS packaging is running. Students will see the topic as soon as secure playback becomes available.';
   }
   return 'Students will not see this topic until video processing finishes.';
 };
@@ -147,6 +163,9 @@ const getStudentVisibilityLabel = (video: Video): string => {
   if (video.playbackReady) {
     return 'Visible to students';
   }
+  if (isFallbackPlayableVideo(video)) {
+    return 'Visible via source fallback';
+  }
   if (isFailedVideo(video)) {
     return 'Hidden from students';
   }
@@ -154,6 +173,25 @@ const getStudentVisibilityLabel = (video: Video): string => {
     return 'Hidden until encoding finishes';
   }
   return 'Availability pending';
+};
+
+const getAdminPipelineState = (video: Video): 'Uploading' | 'Processing' | 'Ready' | 'Failed' => {
+  const streamStatus = String(video.cloudflareStreamStatus || '').toLowerCase();
+  const processingStatus = String(video.hlsProcessingStatus || '').toLowerCase();
+
+  if (video.playbackReady) {
+    return 'Ready';
+  }
+  if (isFailedVideo(video)) {
+    return 'Failed';
+  }
+  if (['upload-pending', 'pendingupload'].includes(streamStatus)) {
+    return 'Uploading';
+  }
+  if (['queued', 'processing'].includes(processingStatus) || ['queued', 'processing', 'inprogress'].includes(streamStatus)) {
+    return 'Processing';
+  }
+  return 'Processing';
 };
 
 const getVideoSortRank = (video: Video): number => {
@@ -181,6 +219,7 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
   }>({ type: null, message: '' });
   const [deleteLoading, setDeleteLoading] = useState<string | null>(null);
   const [bulkDeleteLoading, setBulkDeleteLoading] = useState(false);
+  const [retryLoading, setRetryLoading] = useState<string | null>(null);
   const [videos, setVideos] = useState<Video[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const activeUploadLabel = uploadStatus.type === 'info' && uploadStatus.message
@@ -387,6 +426,38 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
       });
     } finally {
       setBulkDeleteLoading(false);
+    }
+  };
+
+  const handleRetryVideo = async (videoId: string) => {
+    setRetryLoading(videoId);
+    setUploadStatus({
+      type: 'info',
+      message: 'Restarting video processing...',
+    });
+
+    try {
+      const response = await EduService.retryVideoProcessing(
+        selectedCourse,
+        selectedModule,
+        videoId,
+        selectedChapter || null,
+      ) as { message?: string };
+
+      setUploadStatus({
+        type: 'success',
+        message: typeof response?.message === 'string'
+          ? response.message
+          : 'Video processing restarted successfully.',
+      });
+      await loadModuleVideos();
+    } catch (err) {
+      setUploadStatus({
+        type: 'error',
+        message: err instanceof Error ? err.message : 'Video processing retry failed.',
+      });
+    } finally {
+      setRetryLoading(null);
     }
   };
 
@@ -642,6 +713,8 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
                         className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
                           video.playbackReady
                             ? 'bg-[var(--success-soft)] text-[var(--success)]'
+                            : isFallbackPlayableVideo(video)
+                              ? 'bg-blue-100 text-blue-700'
                             : isFailedVideo(video)
                               ? 'bg-red-100 text-red-700'
                               : 'bg-amber-100 text-amber-700'
@@ -666,10 +739,10 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
                           <span>Pipeline: {getProviderLabel(video)}</span>
                         </>
                       )}
-                      {video.hlsProcessingStatus && (
+                      {(video.hlsProcessingStatus || video.cloudflareStreamStatus || video.playbackReady) && (
                         <>
                           <span>•</span>
-                          <span>{video.playbackReady ? 'Ready' : `Encoding: ${video.hlsProcessingStatus}`}</span>
+                          <span>State: {getAdminPipelineState(video)}</span>
                         </>
                       )}
                       {typeof video.cloudflareStreamPctComplete === 'number' && !video.playbackReady && (
@@ -689,9 +762,14 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
                         HLS processing issue: {video.hlsProcessingError}
                       </p>
                     ) : null}
+                    {getVideoProcessingProvider(video) === 'cloudflare-stream' ? (
+                      <p className="mt-2 text-xs font-medium text-amber-700">
+                        Legacy Cloudflare Stream lesson detected. New uploads should use the private adaptive HLS pipeline instead.
+                      </p>
+                    ) : null}
                     {isFailedVideo(video) ? (
                       <p className="mt-2 text-xs font-medium text-red-700">
-                        This failed upload is safe to remove if a replacement topic is already ready.
+                        This lesson is not playable yet. Retry processing first, or remove it if you already uploaded a working replacement.
                       </p>
                     ) : null}
                     {isProcessingVideo(video) ? (
@@ -699,9 +777,28 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
                         {getProcessingNotice(video)}
                       </p>
                     ) : null}
+                    {isFallbackPlayableVideo(video) ? (
+                      <p className="mt-2 text-xs font-medium text-blue-700">
+                        Students can use protected source playback while adaptive HLS finishes or recovers.
+                      </p>
+                    ) : null}
                   </div>
 
                   <div className="flex gap-2">
+                    {isFailedVideo(video) && (
+                      <button
+                        onClick={() => handleRetryVideo(video.id)}
+                        disabled={retryLoading === video.id || deleteLoading === video.id || bulkDeleteLoading}
+                        className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-blue-700 transition hover:bg-blue-100 disabled:opacity-50"
+                        title="Retry processing"
+                      >
+                        {retryLoading === video.id ? (
+                          <Loader className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <RefreshCw className="h-4 w-4" />
+                        )}
+                      </button>
+                    )}
                     <button
                       onClick={() => video.videoUrl && window.open(video.videoUrl, '_blank')}
                       disabled={!video.videoUrl}
@@ -735,7 +832,7 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
         <ul className="space-y-1 list-disc list-inside">
           <li>Select a course, then choose the subject and optional chapter where you want to add topics</li>
           <li>Upload your recorded session file here and the backend stores it in private hosting outside public lesson URLs</li>
-          <li>New uploads are queued for lower-cost adaptive delivery so popular long lectures can shift to cheaper HLS playback</li>
+          <li>New uploads start protected source playback first, then background HLS packaging converts them into private adaptive playback</li>
           <li>Students receive only short-lived signed playback links from the secure backend API</li>
           <li>Mark topics as premium so only enrolled students can request playback tokens and access the stream</li>
           <li>Leave premium turned off when you want a demo preview video visible before the course is purchased</li>

@@ -61,6 +61,7 @@ const isProtectedMediaStreamRequest = (req) => {
     || requestPath.startsWith('/api/courses/h/')
     || requestPath.startsWith('/api/courses/hls/')
     || requestPath.startsWith('/api/course-manifests/b/')
+    || /^\/api\/courses\/[^/]+\/pdf-attachments\/[^/]+\/view$/.test(requestPath)
     || requestPath.startsWith('/api/live-classes/stream/');
 };
 
@@ -81,10 +82,23 @@ const getRateLimitPolicy = (req) => {
   const requestPath = String(req.path || '');
 
   if (/^\/api\/auth\/(login|register|signup|social)/.test(requestPath)) {
+    const ipIdentity = `ip:${req.ip || 'unknown'}`;
+    if (getLoginSubjectKey(req)) {
+      return {
+        name: 'auth-subject',
+        max: Math.max(1, Number(appConfig.rateLimitAuthMax || 30)),
+        identity: getLoginSubjectKey(req),
+        secondary: {
+          name: 'auth-ip',
+          max: Math.max(1, Number(appConfig.rateLimitAuthIpMax || appConfig.rateLimitAuthMax || 30)),
+          identity: ipIdentity,
+        },
+      };
+    }
     return {
       name: 'auth',
       max: Math.max(1, Number(appConfig.rateLimitAuthMax || 30)),
-      identity: getLoginSubjectKey(req) || `ip:${req.ip || 'unknown'}`,
+      identity: ipIdentity,
     };
   }
 
@@ -145,33 +159,48 @@ const basicRateLimit = async (req, res, next) => {
 
   const now = Date.now();
   const policy = getRateLimitPolicy(req);
-  const key = buildRateLimitKey(req, policy);
+  const applyPolicy = async (activePolicy) => {
+    const key = buildRateLimitKey(req, activePolicy);
 
-  try {
-    const redisCount = await incrementRedisCounter(`ratelimit:${key}`, Math.ceil(appConfig.rateLimitWindowMs / 1000));
-    if (redisCount !== null) {
-      const limited = applyHeadersAndCheckLimit(res, redisCount, policy.max);
-      if (limited) {
-        return limited;
+    try {
+      const redisCount = await incrementRedisCounter(`ratelimit:${key}`, Math.ceil(appConfig.rateLimitWindowMs / 1000));
+      if (redisCount !== null) {
+        const limited = applyHeadersAndCheckLimit(res, redisCount, activePolicy.max);
+        if (limited) {
+          return limited;
+        }
+
+        return null;
       }
-
-      return next();
+    } catch {
+      // Fall back to in-memory limiting if Redis is unavailable.
     }
-  } catch {
-    // Fall back to in-memory limiting if Redis is unavailable.
-  }
 
-  const bucket = requestBuckets.get(key) || { count: 0, windowStart: now };
-  if (now - bucket.windowStart > appConfig.rateLimitWindowMs) {
-    bucket.count = 0;
-    bucket.windowStart = now;
-  }
-  bucket.count += 1;
-  requestBuckets.set(key, bucket);
+    const bucket = requestBuckets.get(key) || { count: 0, windowStart: now };
+    if (now - bucket.windowStart > appConfig.rateLimitWindowMs) {
+      bucket.count = 0;
+      bucket.windowStart = now;
+    }
+    bucket.count += 1;
+    requestBuckets.set(key, bucket);
 
-  const limited = applyHeadersAndCheckLimit(res, bucket.count, policy.max);
-  if (limited) {
-    return limited;
+    const limited = applyHeadersAndCheckLimit(res, bucket.count, activePolicy.max);
+    if (limited) {
+      return limited;
+    }
+
+    return null;
+  };
+
+  const primaryLimited = await applyPolicy(policy);
+  if (primaryLimited) {
+    return primaryLimited;
+  }
+  if (policy.secondary) {
+    const secondaryLimited = await applyPolicy(policy.secondary);
+    if (secondaryLimited) {
+      return secondaryLimited;
+    }
   }
 
   if (requestBuckets.size > 5000) {

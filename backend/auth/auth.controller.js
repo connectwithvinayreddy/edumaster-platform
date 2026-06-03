@@ -1,8 +1,16 @@
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { randomUUID } = require('crypto');
+const { performance } = require('perf_hooks');
 const { appConfig } = require('../lib/config.js');
-const { usersRepository, sanitizeUser, sessionRepository, platformRepository } = require('../lib/repositories.js');
+const {
+  usersRepository,
+  sanitizeUser,
+  sessionRepository,
+  platformRepository,
+  videoPlaybackRepository,
+} = require('../lib/repositories.js');
+const { getPool } = require('../lib/postgres.js');
 const { verifyFirebaseIdToken } = require('../lib/auth-social.js');
 const { ApiError, asyncHandler, ok, created, requireString, optionalString, requireBoolean } = require('../lib/http.js');
 
@@ -16,14 +24,141 @@ const normalizeMobileNumber = (value) => {
   if (!normalized) {
     return '';
   }
-  if (normalized.startsWith('+')) {
-    return `+${normalized.slice(1).replace(/\D/g, '')}`;
+  const digitsOnly = normalized.replace(/\D/g, '');
+  if (!digitsOnly) {
+    return '';
   }
-  return normalized.replace(/\D/g, '');
+  if (digitsOnly.length === 11 && digitsOnly.startsWith('0')) {
+    return digitsOnly.slice(-10);
+  }
+  if (digitsOnly.length === 12 && digitsOnly.startsWith('91')) {
+    return digitsOnly.slice(-10);
+  }
+  if (normalized.startsWith('+')) {
+    return `+${digitsOnly}`;
+  }
+  return digitsOnly;
+};
+
+const registerGateState = {
+  active: 0,
+  queue: [],
+};
+
+const AUTH_HASH_ROUNDS = Math.max(4, Number(appConfig.authPasswordHashRounds || 10));
+const AUTH_REGISTER_MAX_CONCURRENT = Math.max(1, Number(appConfig.authRegisterMaxConcurrent || 4));
+const AUTH_REGISTER_MAX_QUEUE = Math.max(0, Number(appConfig.authRegisterMaxQueue || 100));
+const AUTH_REGISTER_DB_TIMEOUT_MS = Math.max(500, Number(appConfig.authRegisterDbTimeoutMs || 5_000));
+
+const maskEmail = (value) => {
+  const normalized = normalizeEmail(value);
+  if (!normalized || !normalized.includes('@')) {
+    return '';
+  }
+  const [local, domain] = normalized.split('@');
+  const visibleLocal = local.slice(0, 2);
+  return `${visibleLocal}${'*'.repeat(Math.max(0, local.length - visibleLocal.length))}@${domain}`;
+};
+
+const maskMobile = (value) => {
+  const normalized = normalizeMobileNumber(value);
+  if (!normalized) {
+    return '';
+  }
+  const digits = normalized.replace(/\D/g, '');
+  if (digits.length <= 4) {
+    return digits;
+  }
+  return `${'*'.repeat(Math.max(0, digits.length - 4))}${digits.slice(-4)}`;
+};
+
+const getDbPoolSnapshot = () => {
+  const pool = getPool();
+  if (!pool) {
+    return { total: null, idle: null, waiting: null };
+  }
+  return {
+    total: pool.totalCount,
+    idle: pool.idleCount,
+    waiting: pool.waitingCount,
+  };
+};
+
+const logRegisterEvent = (context, stage, extra = {}) => {
+  const memory = process.memoryUsage();
+  console.log('[auth-register]', JSON.stringify({
+    request_id: context.requestId,
+    container_name: process.env.HOSTNAME || appConfig.serviceName || 'unknown',
+    masked_email: context.maskedEmail,
+    masked_mobile: context.maskedMobile,
+    request_ip: context.requestIp,
+    user_agent: context.userAgent,
+    stage,
+    duration_ms: Math.round(performance.now() - context.startedAt),
+    hash_duration_ms: context.hashDurationMs,
+    db_duration_ms: context.dbDurationMs,
+    response_status: extra.responseStatus ?? null,
+    error_code: extra.errorCode ?? null,
+    handled: extra.handled ?? true,
+    pool: getDbPoolSnapshot(),
+    memory: {
+      rss_mb: Math.round(memory.rss / 1024 / 1024),
+      heap_used_mb: Math.round(memory.heapUsed / 1024 / 1024),
+    },
+    ...extra,
+  }));
+};
+
+const createRegisterContext = (req) => ({
+  requestId: req.requestId || randomUUID(),
+  startedAt: performance.now(),
+  hashDurationMs: 0,
+  dbDurationMs: 0,
+  maskedEmail: maskEmail(req.body?.email),
+  maskedMobile: maskMobile(req.body?.mobileNumber),
+  requestIp: req.ip || req.headers['x-forwarded-for'] || null,
+  userAgent: req.headers['user-agent'] || null,
+});
+
+const requireTypedString = (value, fieldName, { minLength = 1, maxLength = null } = {}) => {
+  if (typeof value !== 'string') {
+    throw new ApiError(400, `${fieldName} must be a string`, { code: 'VALIDATION_ERROR' });
+  }
+  return requireString(value, fieldName, { minLength, maxLength });
+};
+
+const optionalTypedString = (value, fallback = '', { maxLength = null } = {}) => {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+  if (typeof value !== 'string') {
+    throw new ApiError(400, 'Value must be a string', { code: 'VALIDATION_ERROR' });
+  }
+  return optionalString(value, fallback, { maxLength });
+};
+
+const validateEmail = (value) => {
+  const normalized = normalizeEmail(requireTypedString(value, 'email', { maxLength: 160 }));
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) {
+    throw new ApiError(400, 'email must be a valid email address', { code: 'VALIDATION_ERROR' });
+  }
+  return normalized;
+};
+
+const validateMobileNumber = (value) => {
+  const normalized = normalizeMobileNumber(optionalTypedString(value, '', { maxLength: 20 }));
+  if (!normalized) {
+    return '';
+  }
+  const digits = normalized.replace(/\D/g, '');
+  if (digits.length < 10 || digits.length > 15) {
+    throw new ApiError(400, 'mobileNumber must be a valid mobile number', { code: 'VALIDATION_ERROR' });
+  }
+  return normalized;
 };
 
 const validatePassword = (password) => {
-  const normalized = requireString(password, 'password', { minLength: 8, maxLength: 128 });
+  const normalized = requireTypedString(password, 'password', { minLength: 8, maxLength: 128 });
   if (!/[A-Za-z]/.test(normalized) || !/\d/.test(normalized)) {
     throw new ApiError(400, 'password must include at least one letter and one number', { code: 'VALIDATION_ERROR' });
   }
@@ -31,8 +166,108 @@ const validatePassword = (password) => {
   return normalized;
 };
 
+const withTimeout = async (label, promiseFactory, timeoutMs) => {
+  let timeoutHandle;
+  try {
+    return await Promise.race([
+      promiseFactory(),
+      new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          reject(new ApiError(503, `${label} timed out`, { code: 'DB_TIMEOUT' }));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+};
+
+const acquireRegisterSlot = async () => {
+  if (registerGateState.active < AUTH_REGISTER_MAX_CONCURRENT) {
+    registerGateState.active += 1;
+    return () => {
+      registerGateState.active = Math.max(0, registerGateState.active - 1);
+      const next = registerGateState.queue.shift();
+      if (next) {
+        registerGateState.active += 1;
+        next(resolveRegisterRelease());
+      }
+    };
+  }
+
+  if (registerGateState.queue.length >= AUTH_REGISTER_MAX_QUEUE) {
+    throw new ApiError(503, 'Registration service is busy. Please retry shortly.', {
+      code: 'AUTH_REGISTER_BUSY',
+      details: {
+        maxConcurrent: AUTH_REGISTER_MAX_CONCURRENT,
+        maxQueue: AUTH_REGISTER_MAX_QUEUE,
+      },
+    });
+  }
+
+  return new Promise((resolve) => {
+    registerGateState.queue.push(resolve);
+  });
+};
+
+const resolveRegisterRelease = () => () => {
+  registerGateState.active = Math.max(0, registerGateState.active - 1);
+  const next = registerGateState.queue.shift();
+  if (next) {
+    registerGateState.active += 1;
+    next(resolveRegisterRelease());
+  }
+};
+
+const mapRegisterError = (error) => {
+  if (error instanceof ApiError) {
+    return error;
+  }
+
+  if (error?.code === '23505') {
+    const detail = String(error?.detail || '');
+    if (/email/i.test(detail)) {
+      return new ApiError(409, 'Email already exists', { code: 'EMAIL_EXISTS' });
+    }
+    if (/mobile_number/i.test(detail) || /mobile/i.test(detail)) {
+      return new ApiError(409, 'Mobile number already exists', { code: 'MOBILE_EXISTS' });
+    }
+    return new ApiError(409, 'User already exists', { code: 'USER_EXISTS' });
+  }
+
+  if (error?.code === 11000) {
+    const keyValue = JSON.stringify(error?.keyValue || {});
+    if (/email/i.test(keyValue)) {
+      return new ApiError(409, 'Email already exists', { code: 'EMAIL_EXISTS' });
+    }
+    if (/mobile/i.test(keyValue)) {
+      return new ApiError(409, 'Mobile number already exists', { code: 'MOBILE_EXISTS' });
+    }
+    return new ApiError(409, 'User already exists', { code: 'USER_EXISTS' });
+  }
+
+  if (['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED'].includes(String(error?.code || ''))) {
+    return new ApiError(503, 'Database temporarily unavailable', { code: 'DB_UNAVAILABLE' });
+  }
+
+  if (/timeout/i.test(String(error?.message || ''))) {
+    return new ApiError(503, 'Database temporarily unavailable', { code: 'DB_TIMEOUT' });
+  }
+
+  return new ApiError(500, 'Internal server error', { code: 'INTERNAL_SERVER_ERROR' });
+};
+
 const issueAuthSession = async ({ user, device, forceLogoutOtherSessions = false }) => {
   const userId = String(user._id);
+  const accountStatus = String(user.accountStatus || 'active').toLowerCase();
+  if (accountStatus !== 'active') {
+    throw new ApiError(403, `This account is ${accountStatus}. Please contact support.`, {
+      code: 'ACCOUNT_DISABLED',
+      details: {
+        accountStatus,
+      },
+    });
+  }
   const activeSessionId = await sessionRepository.getActiveSessionId(userId, user.session || null);
   if (activeSessionId && !forceLogoutOtherSessions) {
     const recentSessions = await sessionRepository.getRecentSessions(userId).catch(() => []);
@@ -61,12 +296,14 @@ const issueAuthSession = async ({ user, device, forceLogoutOtherSessions = false
       device: user.device || device || null,
       reason: 'replaced',
     });
+    await videoPlaybackRepository.clearActivePlaybackSession(userId);
   }
 
   const sessionId = Math.random().toString(36).substring(2);
   const updatedUser = await usersRepository.update(userId, {
     session: sessionId,
     device: device || null,
+    lastLoginAt: new Date().toISOString(),
   });
   await sessionRepository.recordLogin({
     userId,
@@ -179,40 +416,96 @@ const issueFirebaseSession = async ({
 };
 
 const register = asyncHandler(async (req, res) => {
-  const name = requireString(req.body?.name, 'name', { maxLength: 80 });
-  const email = requireString(req.body?.email, 'email', { maxLength: 160 }).toLowerCase();
-  const mobileNumber = optionalString(req.body?.mobileNumber, '', { maxLength: 20 });
-  const password = validatePassword(req.body?.password);
-  const device = optionalString(req.body?.device, 'web-dashboard', { maxLength: 120 });
+  const context = createRegisterContext(req);
+  let releaseSlot = null;
+  let createdUser = null;
 
-  if (req.body?.role && req.body.role !== 'student') {
-    throw new ApiError(403, 'Self-service registration can only create student accounts', {
-      code: 'ROLE_NOT_ALLOWED',
-    });
-  }
+  try {
+    logRegisterEvent(context, 'received');
 
-  const existingEmail = await usersRepository.findByEmail(email);
-  if (existingEmail) {
-    throw new ApiError(409, 'Email already exists', { code: 'EMAIL_EXISTS' });
-  }
+    if (!req.is('application/json')) {
+      throw new ApiError(400, 'Content-Type must be application/json', { code: 'INVALID_CONTENT_TYPE' });
+    }
 
-  if (mobileNumber) {
-    const existingMobile = await usersRepository.findByMobileNumber(mobileNumber);
+    if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+      throw new ApiError(400, 'Request body must be a JSON object', { code: 'VALIDATION_ERROR' });
+    }
+
+    releaseSlot = await acquireRegisterSlot();
+
+    logRegisterEvent(context, 'validate_payload');
+    const name = requireTypedString(req.body?.name, 'name', { maxLength: 80 });
+    const email = validateEmail(req.body?.email);
+    const mobileNumber = validateMobileNumber(req.body?.mobileNumber);
+    const password = validatePassword(req.body?.password);
+    const device = optionalTypedString(req.body?.device, 'web-dashboard', { maxLength: 120 });
+    context.maskedEmail = maskEmail(email);
+    context.maskedMobile = maskMobile(mobileNumber);
+
+    if (req.body?.role && req.body.role !== 'student') {
+      throw new ApiError(403, 'Self-service registration can only create student accounts', {
+        code: 'ROLE_NOT_ALLOWED',
+      });
+    }
+
+    logRegisterEvent(context, 'normalize_identity');
+    const duplicateCheckStarted = performance.now();
+    const [existingEmail, existingMobile] = await Promise.all([
+      withTimeout('email duplicate check', () => usersRepository.findByEmail(email), AUTH_REGISTER_DB_TIMEOUT_MS),
+      mobileNumber
+        ? withTimeout('mobile duplicate check', () => usersRepository.findByMobileNumber(mobileNumber), AUTH_REGISTER_DB_TIMEOUT_MS)
+        : Promise.resolve(null),
+    ]);
+    context.dbDurationMs += Math.round(performance.now() - duplicateCheckStarted);
+
+    logRegisterEvent(context, 'check_duplicate');
+    if (existingEmail) {
+      throw new ApiError(409, 'Email already exists', { code: 'EMAIL_EXISTS' });
+    }
+
     if (existingMobile) {
       throw new ApiError(409, 'Mobile number already exists', { code: 'MOBILE_EXISTS' });
     }
+
+    logRegisterEvent(context, 'hash_password');
+    const hashStarted = performance.now();
+    const hashed = await bcrypt.hash(password, AUTH_HASH_ROUNDS);
+    context.hashDurationMs = Math.round(performance.now() - hashStarted);
+
+    logRegisterEvent(context, 'db_insert_user');
+    const insertStarted = performance.now();
+    createdUser = await withTimeout('user creation', () => usersRepository.create({
+      name,
+      email,
+      mobileNumber,
+      password: hashed,
+      role: 'student',
+    }), AUTH_REGISTER_DB_TIMEOUT_MS);
+    context.dbDurationMs += Math.round(performance.now() - insertStarted);
+
+    logRegisterEvent(context, 'create_session');
+    const responsePayload = await withTimeout('session creation', () => issueAuthSession({ user: createdUser, device }), AUTH_REGISTER_DB_TIMEOUT_MS);
+    logRegisterEvent(context, 'response_sent', { responseStatus: 201, errorCode: null, handled: true });
+    return created(res, {
+      requestId: context.requestId,
+      ...responsePayload,
+    });
+  } catch (error) {
+    const mappedError = mapRegisterError(error);
+    if (createdUser && mappedError.status >= 500) {
+      await usersRepository.delete(createdUser._id).catch(() => undefined);
+    }
+    logRegisterEvent(context, 'response_sent', {
+      responseStatus: mappedError.status,
+      errorCode: mappedError.code,
+      handled: mappedError instanceof ApiError,
+    });
+    throw mappedError;
+  } finally {
+    if (typeof releaseSlot === 'function') {
+      releaseSlot();
+    }
   }
-
-  const hashed = await bcrypt.hash(password, 10);
-  const user = await usersRepository.create({
-    name,
-    email,
-    mobileNumber,
-    password: hashed,
-    role: 'student',
-  });
-
-  return created(res, await issueAuthSession({ user, device }));
 });
 
 const login = asyncHandler(async (req, res) => {
@@ -228,6 +521,14 @@ const login = asyncHandler(async (req, res) => {
   const user = await usersRepository.findByLoginIdentifier(identifier);
   if (!user) {
     throw new ApiError(401, 'Invalid credentials', { code: 'INVALID_CREDENTIALS' });
+  }
+  if (String(user.accountStatus || 'active').toLowerCase() !== 'active') {
+    throw new ApiError(403, `This account is ${String(user.accountStatus || 'disabled').toLowerCase()}. Please contact support.`, {
+      code: 'ACCOUNT_DISABLED',
+      details: {
+        accountStatus: String(user.accountStatus || 'disabled').toLowerCase(),
+      },
+    });
   }
 
   const match = await bcrypt.compare(password, user.password);

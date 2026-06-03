@@ -34,11 +34,32 @@ const createStorageFileName = (lessonId, originalName = '') => {
   return `${lessonId}${extension}`;
 };
 
+const normalizePrivateStorageKeyPrefix = (value = '') => String(value || '')
+  .split(/[\\/]+/)
+  .map((segment) => segment.trim())
+  .filter((segment) => segment && segment !== '.' && segment !== '..')
+  .map((segment) => segment.replace(/[^a-zA-Z0-9._-]/g, '_'))
+  .join('/');
+
+const getPrivateStorageKeyPrefix = () => normalizePrivateStorageKeyPrefix(appConfig.privateVideoStorageKeyPrefix);
+
+const getPrivateStorageKeyPrefixSegments = () => {
+  const prefix = getPrivateStorageKeyPrefix();
+  return prefix ? prefix.split('/').filter(Boolean) : [];
+};
+
+const buildPrefixedPrivateStorageKey = (...segments) => {
+  const prefix = getPrivateStorageKeyPrefix();
+  return prefix
+    ? path.posix.join(prefix, ...segments)
+    : path.posix.join(...segments);
+};
+
 const buildPrivateVideoStorageKey = ({ courseId, moduleId, lessonId, originalName }) => {
   const safeCourseId = String(courseId || 'course').replace(/[^a-zA-Z0-9_-]/g, '_');
   const safeModuleId = String(moduleId || 'module').replace(/[^a-zA-Z0-9_-]/g, '_');
   const fileName = createStorageFileName(lessonId, originalName);
-  return path.posix.join(safeCourseId, safeModuleId, fileName);
+  return buildPrefixedPrivateStorageKey(safeCourseId, safeModuleId, fileName);
 };
 
 const buildPrivateVideoStoragePath = ({ courseId, moduleId, lessonId, originalName }) => {
@@ -51,12 +72,22 @@ const buildPrivateVideoStoragePath = ({ courseId, moduleId, lessonId, originalNa
   }));
 };
 
-const buildPrivateHlsAssetKey = ({ courseId, moduleId, lessonId, assetName = 'master.m3u8' }) => {
+const buildPrivateHlsAssetKey = ({
+  courseId,
+  moduleId,
+  lessonId,
+  assetVersion = '',
+  assetName = 'master.m3u8',
+}) => {
   const safeCourseId = String(courseId || 'course').replace(/[^a-zA-Z0-9_-]/g, '_');
   const safeModuleId = String(moduleId || 'module').replace(/[^a-zA-Z0-9_-]/g, '_');
   const safeLessonId = String(lessonId || 'lesson').replace(/[^a-zA-Z0-9_-]/g, '_');
+  const safeAssetVersion = String(assetVersion || '').replace(/[^a-zA-Z0-9._/-]/g, '_').replace(/^\/+|\/+$/g, '');
   const safeAssetName = String(assetName || 'master.m3u8').replace(/[^a-zA-Z0-9._/-]/g, '_');
-  return path.posix.join(safeCourseId, safeModuleId, safeLessonId, safeAssetName);
+  if (safeAssetVersion) {
+    return buildPrefixedPrivateStorageKey(safeCourseId, safeModuleId, safeLessonId, safeAssetVersion, safeAssetName);
+  }
+  return buildPrefixedPrivateStorageKey(safeCourseId, safeModuleId, safeLessonId, safeAssetName);
 };
 
 const resolvePrivateHlsPath = (assetPath) => {
@@ -318,17 +349,20 @@ const resolvePrivateVideoPath = (storagePath) => {
   return resolved;
 };
 
-const getProtectedAssetStorageRoot = (assetPath) => String(assetPath || '')
-  .split('/')
-  .filter(Boolean)
-  .slice(0, 3)
-  .join('/');
+const getProtectedAssetStorageRoot = (assetPath) => {
+  const segments = String(assetPath || '')
+    .split('/')
+    .filter(Boolean);
+  const rootLength = getPrivateStorageKeyPrefixSegments().length + 3;
+  return segments.slice(0, rootLength).join('/');
+};
 
 module.exports = {
   HLS_ACCESS_COOKIE_NAME,
   privateVideosRoot,
   privateHlsRoot,
   ensurePrivateVideoRoot,
+  getPrivateStorageKeyPrefix,
   buildPrivateVideoStorageKey,
   buildPrivateVideoStoragePath,
   buildPrivateHlsAssetKey,

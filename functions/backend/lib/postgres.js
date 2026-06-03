@@ -4,6 +4,7 @@ const { appConfig } = require('./config.js');
 let pool = null;
 let postgresReady = false;
 let postgresInitPromise = null;
+const POSTGRES_SCHEMA_INIT_LOCK_ID = 612348901;
 
 const schemaStatements = [
   `
@@ -536,8 +537,13 @@ const initializePostgres = async () => {
 
       try {
         client = await currentPool.connect();
-        for (const statement of schemaStatements) {
-          await client.query(statement);
+        await client.query('SELECT pg_advisory_lock($1)', [POSTGRES_SCHEMA_INIT_LOCK_ID]);
+        try {
+          for (const statement of schemaStatements) {
+            await client.query(statement);
+          }
+        } finally {
+          await client.query('SELECT pg_advisory_unlock($1)', [POSTGRES_SCHEMA_INIT_LOCK_ID]).catch(() => {});
         }
         postgresReady = true;
         return {

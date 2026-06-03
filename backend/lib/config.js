@@ -47,9 +47,14 @@ const appConfig = {
   rateLimitWindowMs: toNumber(process.env.RATE_LIMIT_WINDOW_MS, 60_000),
   rateLimitMax: toNumber(process.env.RATE_LIMIT_MAX, 300),
   rateLimitAuthMax: toNumber(process.env.RATE_LIMIT_AUTH_MAX, 120),
+  rateLimitAuthIpMax: toNumber(process.env.RATE_LIMIT_AUTH_IP_MAX, 60),
   rateLimitAuthenticatedMax: toNumber(process.env.RATE_LIMIT_AUTHENTICATED_MAX, 1200),
   rateLimitReadMax: toNumber(process.env.RATE_LIMIT_READ_MAX, 1800),
   rateLimitWriteMax: toNumber(process.env.RATE_LIMIT_WRITE_MAX, 900),
+  authPasswordHashRounds: toNumber(process.env.AUTH_PASSWORD_HASH_ROUNDS, 10),
+  authRegisterMaxConcurrent: toNumber(process.env.AUTH_REGISTER_MAX_CONCURRENT, 4),
+  authRegisterMaxQueue: toNumber(process.env.AUTH_REGISTER_MAX_QUEUE, 100),
+  authRegisterDbTimeoutMs: toNumber(process.env.AUTH_REGISTER_DB_TIMEOUT_MS, 5_000),
   jwtSecret: process.env.JWT_SECRET || DEFAULT_JWT_SECRET,
   adminName: process.env.ADMIN_NAME || 'Platform Admin',
   adminEmail: process.env.ADMIN_EMAIL || DEFAULT_ADMIN_EMAIL,
@@ -61,16 +66,16 @@ const appConfig = {
   postgresConnectionTimeoutMillis: toNumber(process.env.POSTGRES_CONNECTION_TIMEOUT_MS, 10_000),
   postgresStatementTimeoutMillis: toNumber(process.env.POSTGRES_STATEMENT_TIMEOUT_MS, 15_000),
   platformReadyCacheTtlMs: toNumber(process.env.PLATFORM_READY_CACHE_TTL_MS, 60_000),
-  platformDataCacheTtlMs: toNumber(process.env.PLATFORM_DATA_CACHE_TTL_MS, 3_000),
-  courseCacheTtlMs: toNumber(process.env.COURSE_CACHE_TTL_MS, 3_000),
+  platformDataCacheTtlMs: toNumber(process.env.PLATFORM_DATA_CACHE_TTL_MS, 30_000),
+  courseCacheTtlMs: toNumber(process.env.COURSE_CACHE_TTL_MS, 15_000),
   cachePrefix: process.env.CACHE_PREFIX || 'varonenglish',
-  testsCacheTtlMs: toNumber(process.env.TESTS_CACHE_TTL_MS, 3_000),
+  testsCacheTtlMs: toNumber(process.env.TESTS_CACHE_TTL_MS, 15_000),
   analyticsCacheTtlMs: toNumber(process.env.ANALYTICS_CACHE_TTL_MS, 5_000),
-  userAnalyticsCacheTtlMs: toNumber(process.env.USER_ANALYTICS_CACHE_TTL_MS, 2_000),
+  userAnalyticsCacheTtlMs: toNumber(process.env.USER_ANALYTICS_CACHE_TTL_MS, 10_000),
   watchProgressCacheInvalidationIntervalMs: toNumber(process.env.WATCH_PROGRESS_CACHE_INVALIDATION_INTERVAL_MS, 300_000),
   watchProgressCacheInvalidationPercentStep: toNumber(process.env.WATCH_PROGRESS_CACHE_INVALIDATION_PERCENT_STEP, 25),
   quizCacheTtlMs: toNumber(process.env.QUIZ_CACHE_TTL_MS, 3_000),
-  notificationsCacheTtlMs: toNumber(process.env.NOTIFICATIONS_CACHE_TTL_MS, 2_000),
+  notificationsCacheTtlMs: toNumber(process.env.NOTIFICATIONS_CACHE_TTL_MS, 10_000),
   firebaseStateStorage: toBool(process.env.FIREBASE_STATE_STORAGE, false),
   firebaseStateDatabaseId: process.env.FIREBASE_STATE_DATABASE_ID || '',
   firebaseStateCollection: process.env.FIREBASE_STATE_COLLECTION || 'app_state',
@@ -82,6 +87,8 @@ const appConfig = {
   s3AccessKeyId: process.env.S3_ACCESS_KEY_ID || '',
   s3SecretAccessKey: process.env.S3_SECRET_ACCESS_KEY || '',
   s3ForcePathStyle: toBool(process.env.S3_FORCE_PATH_STYLE, false),
+  privateVideoStorageKeyPrefix: String(process.env.PRIVATE_VIDEO_STORAGE_KEY_PREFIX || '').trim(),
+  stagingAllowSharedProdStorage: toBool(process.env.STAGING_ALLOW_SHARED_PROD_STORAGE, false),
   razorpayKeyId: process.env.RAZORPAY_KEY_ID || '',
   razorpayKeySecret: process.env.RAZORPAY_KEY_SECRET || '',
   stripeSecretKey: process.env.STRIPE_SECRET_KEY || '',
@@ -120,16 +127,24 @@ const appConfig = {
   privateVideoDrmPlayreadyLicenseUrl: process.env.PRIVATE_VIDEO_DRM_PLAYREADY_LICENSE_URL || '',
   privateVideoRequireDrmForPaidPlayback: toBool(
     process.env.PRIVATE_VIDEO_REQUIRE_DRM_FOR_PAID_PLAYBACK,
-    toBool(process.env.PRIVATE_VIDEO_DRM_ENABLED, false),
+    false,
   ),
+  privateVideoStrictPlatformRestriction: toBool(process.env.PRIVATE_VIDEO_STRICT_PLATFORM_RESTRICTION, false),
   privateVideoStorageProvider: process.env.PRIVATE_VIDEO_STORAGE_PROVIDER || 's3',
   privateVideoLegacyLessonWatchLimit: toNumber(process.env.PRIVATE_VIDEO_LEGACY_LESSON_WATCH_LIMIT, 2),
   privateVideoNewUploadWatchLimit: toNumber(process.env.PRIVATE_VIDEO_NEW_UPLOAD_WATCH_LIMIT, 1),
   videoWatchCompletionThresholdPercent: toNumber(process.env.VIDEO_WATCH_COMPLETION_THRESHOLD_PERCENT, 90),
+  videoWatchChunkSeconds: toNumber(process.env.VIDEO_WATCH_CHUNK_SECONDS, 10),
+  videoPlaybackHeartbeatGraceSeconds: toNumber(process.env.VIDEO_PLAYBACK_HEARTBEAT_GRACE_SECONDS, 8),
+  videoPlaybackReconnectGraceSeconds: toNumber(process.env.VIDEO_PLAYBACK_RECONNECT_GRACE_SECONDS, 60),
+  videoPlaybackSessionTtlSeconds: toNumber(process.env.VIDEO_PLAYBACK_SESSION_TTL_SECONDS, 120),
+  videoPlaybackMaxHeartbeatGapSeconds: toNumber(process.env.VIDEO_PLAYBACK_MAX_HEARTBEAT_GAP_SECONDS, 90),
+  videoPlaybackMaxRate: toNumber(process.env.VIDEO_PLAYBACK_MAX_RATE, 2),
+  courseVideoAccessMode: String(process.env.COURSE_VIDEO_ACCESS_MODE || 'free_order').trim().toLowerCase() === 'sequential'
+    ? 'sequential'
+    : 'free_order',
   videoHlsStorageProvider: process.env.VIDEO_HLS_STORAGE_PROVIDER || process.env.PRIVATE_VIDEO_STORAGE_PROVIDER || 's3',
-  videoProcessingProvider: process.env.VIDEO_PROCESSING_PROVIDER || (
-    process.env.NODE_ENV === 'production' ? 'cloudflare-stream' : 'local-hls'
-  ),
+  videoProcessingProvider: process.env.VIDEO_PROCESSING_PROVIDER || 'local-hls',
   cloudflareStreamAccountId: process.env.CLOUDFLARE_STREAM_ACCOUNT_ID || process.env.CLOUDFLARE_ACCOUNT_ID || '',
   cloudflareStreamApiToken: process.env.CLOUDFLARE_STREAM_API_TOKEN || '',
   cloudflareStreamCustomerCode: process.env.CLOUDFLARE_STREAM_CUSTOMER_CODE || '',
@@ -147,7 +162,7 @@ const appConfig = {
   cloudflareStreamStatusPollMaxAttempts: toNumber(process.env.CLOUDFLARE_STREAM_STATUS_POLL_MAX_ATTEMPTS, 36),
   courseDefaultValidityDays: toNumber(process.env.COURSE_DEFAULT_VALIDITY_DAYS, 365),
   enableVideoTranscoding: toBool(process.env.ENABLE_VIDEO_TRANSCODING, true),
-  sourcePlaybackFallbackEnabled: toBool(process.env.SOURCE_PLAYBACK_FALLBACK_ENABLED, false),
+  sourcePlaybackFallbackEnabled: toBool(process.env.SOURCE_PLAYBACK_FALLBACK_ENABLED, true),
   videoDeliveryProfile: process.env.VIDEO_DELIVERY_PROFILE || 'r2-private-hls',
   videoTargetRenditions: (process.env.VIDEO_TARGET_RENDITIONS || '240p,360p,480p,720p')
     .split(',')
@@ -157,7 +172,9 @@ const appConfig = {
   videoTranscodingConcurrency: Math.max(1, Math.floor(toNumber(process.env.VIDEO_TRANSCODING_CONCURRENCY, 1))),
   videoTranscodingJobTimeoutMs: toNumber(process.env.VIDEO_TRANSCODING_JOB_TIMEOUT_MS, 45 * 60 * 1000),
   videoProcessingStaleAfterMs: toNumber(process.env.VIDEO_PROCESSING_STALE_AFTER_MS, 20 * 60 * 1000),
-  videoKeepSourceAfterProcessing: toBool(process.env.VIDEO_KEEP_SOURCE_AFTER_PROCESSING, false),
+  videoProcessingRecoveryPollMs: toNumber(process.env.VIDEO_PROCESSING_RECOVERY_POLL_MS, 15 * 1000),
+  videoLocalQueueStaleAfterMs: toNumber(process.env.VIDEO_LOCAL_QUEUE_STALE_AFTER_MS, 45 * 1000),
+  videoKeepSourceAfterProcessing: toBool(process.env.VIDEO_KEEP_SOURCE_AFTER_PROCESSING, true),
   videoReplayViewLimitEnabled: toBool(process.env.VIDEO_REPLAY_VIEW_LIMIT_ENABLED, true),
   videoReplayMaxViews: toNumber(process.env.VIDEO_REPLAY_MAX_VIEWS, 2),
   videoReplayRetentionDays: toNumber(process.env.VIDEO_REPLAY_RETENTION_DAYS, 365),
@@ -177,6 +194,7 @@ const appConfig = {
   livekitRoomPrefix: process.env.LIVEKIT_ROOM_PREFIX || 'edumaster-live',
   livekitTokenTtlSeconds: toNumber(process.env.LIVEKIT_TOKEN_TTL_SECONDS, 600),
   liveClassMaxAttendees: toNumber(process.env.LIVE_CLASS_MAX_ATTENDEES, 2500),
+  liveClassesEnabled: toBool(process.env.LIVE_CLASSES_ENABLED, false),
 };
 
 appConfig.hasLiveKit = isLiveKitConfiguredValue(appConfig.livekitUrl)
@@ -221,6 +239,7 @@ const getConfigSummary = () => ({
   hasLiveKit: appConfig.hasLiveKit,
   hasManagedLiveHls: appConfig.hasManagedLiveHls,
   preferredLivePlaybackType: appConfig.preferredLivePlaybackType,
+  liveClassesEnabled: appConfig.liveClassesEnabled,
   s3EndpointConfigured: Boolean(appConfig.s3Endpoint),
   hasYouTubeUpload: Boolean(
     appConfig.googleOauthClientId
@@ -230,10 +249,14 @@ const getConfigSummary = () => ({
   hasPrivateVideoSigning: Boolean(appConfig.privateVideoTokenSecret),
   privateVideoDrmEnabled: appConfig.privateVideoDrmEnabled,
   privateVideoRequireDrmForPaidPlayback: appConfig.privateVideoRequireDrmForPaidPlayback,
+  privateVideoStrictPlatformRestriction: appConfig.privateVideoStrictPlatformRestriction,
   privateVideoDrmManifestBaseUrlConfigured: Boolean(appConfig.privateVideoDrmManifestBaseUrl),
   privateVideoStorageProvider: appConfig.privateVideoStorageProvider,
+  privateVideoStorageKeyPrefix: appConfig.privateVideoStorageKeyPrefix,
+  stagingAllowSharedProdStorage: appConfig.stagingAllowSharedProdStorage,
   videoHlsStorageProvider: appConfig.videoHlsStorageProvider,
   videoProcessingProvider: appConfig.videoProcessingProvider,
+  courseVideoAccessMode: appConfig.courseVideoAccessMode,
   hasCloudflareStream: Boolean(appConfig.cloudflareStreamAccountId && appConfig.cloudflareStreamApiToken),
   cloudflareStreamCustomerCodeConfigured: Boolean(appConfig.cloudflareStreamCustomerCode),
   courseDefaultValidityDays: appConfig.courseDefaultValidityDays,
@@ -316,20 +339,12 @@ const getProductionConfigDiagnostics = () => {
     warnings.push('ENABLE_VIDEO_TRANSCODING is on. Make sure ffmpeg is available in the runtime image for replay processing.');
   }
 
-  if (isProduction && appConfig.videoProcessingProvider !== 'cloudflare-stream') {
-    warnings.push('VIDEO_PROCESSING_PROVIDER is not cloudflare-stream. Recorded lessons will use the configured private HLS processor and object storage.');
-  }
-
-  if (
-    isProduction
-    && appConfig.videoProcessingProvider !== 'cloudflare-stream'
-    && appConfig.cloudflareStreamAccountId
-    && appConfig.cloudflareStreamApiToken
-  ) {
-    warnings.push('Cloudflare Stream credentials are configured, but VIDEO_PROCESSING_PROVIDER is not cloudflare-stream. Admin uploads will not use Cloudflare Stream until the provider is switched.');
+  if (isProduction && appConfig.videoProcessingProvider !== 'local-hls') {
+    warnings.push('VIDEO_PROCESSING_PROVIDER is not local-hls. Recorded uploads will stay on the legacy provider until the environment is switched to the low-cost HLS pipeline.');
   }
 
   if (isProduction && appConfig.videoProcessingProvider === 'cloudflare-stream') {
+    warnings.push('VIDEO_PROCESSING_PROVIDER=cloudflare-stream is a legacy mode. Prefer local-hls with r2-private-hls delivery for the lower-cost recorded video pipeline.');
     if (!appConfig.cloudflareStreamAccountId) {
       errors.push('CLOUDFLARE_STREAM_ACCOUNT_ID is required when VIDEO_PROCESSING_PROVIDER=cloudflare-stream.');
     }
@@ -356,47 +371,22 @@ const getProductionConfigDiagnostics = () => {
     if (!appConfig.cloudflareStreamWebhookSecret) {
       warnings.push('CLOUDFLARE_STREAM_WEBHOOK_SECRET is missing. Status polling will work, but signed Cloudflare webhook verification should be enabled for production.');
     }
-
-    if (String(appConfig.videoDeliveryProfile || '').toLowerCase() !== 'cloudflare-stream') {
-      warnings.push('VIDEO_DELIVERY_PROFILE does not match cloudflare-stream. Update it so admin/status screens reflect the active production pipeline accurately.');
-    }
   }
 
   if (
     isProduction
-    && appConfig.privateVideoRequireDrmForPaidPlayback
     && appConfig.videoProcessingProvider !== 'cloudflare-stream'
+    && appConfig.cloudflareStreamAccountId
+    && appConfig.cloudflareStreamApiToken
   ) {
-    if (!appConfig.privateVideoDrmEnabled) {
-      errors.push('PRIVATE_VIDEO_REQUIRE_DRM_FOR_PAID_PLAYBACK=true requires PRIVATE_VIDEO_DRM_ENABLED=true.');
-    }
-
-    if (!appConfig.privateVideoDrmManifestBaseUrl) {
-      errors.push('PRIVATE_VIDEO_DRM_MANIFEST_BASE_URL is required when DRM is mandatory for paid playback.');
-    }
-
-    if (!appConfig.privateVideoDrmWidevineLicenseUrl) {
-      errors.push('PRIVATE_VIDEO_DRM_WIDEVINE_LICENSE_URL is required when DRM is mandatory for paid playback.');
-    }
-
-    if (!appConfig.privateVideoDrmFairplayLicenseUrl) {
-      errors.push('PRIVATE_VIDEO_DRM_FAIRPLAY_LICENSE_URL is required when DRM is mandatory for paid playback.');
-    }
-
-    if (!appConfig.privateVideoDrmPlayreadyLicenseUrl) {
-      errors.push('PRIVATE_VIDEO_DRM_PLAYREADY_LICENSE_URL is required when DRM is mandatory for paid playback.');
-    }
+    warnings.push('Cloudflare Stream credentials are still configured, but local-hls is active. Keep them only for legacy migration or cleanup tasks.');
   }
 
-  if (
-    isProduction
-    && appConfig.videoProcessingProvider === 'cloudflare-stream'
-    && appConfig.privateVideoRequireDrmForPaidPlayback
-  ) {
-    warnings.push('PRIVATE_VIDEO_REQUIRE_DRM_FOR_PAID_PLAYBACK is enabled, but Cloudflare Stream recorded playback is running without DRM in this phase.');
+  if (isProduction && appConfig.privateVideoRequireDrmForPaidPlayback) {
+    warnings.push('PRIVATE_VIDEO_REQUIRE_DRM_FOR_PAID_PLAYBACK is enabled, but paid recorded web playback no longer uses DRM as a platform gate. Leave it false unless DRM is being reintroduced deliberately.');
   }
 
-  if (isProduction && appConfig.hasManagedLiveHls && !appConfig.liveIngestPublisherSecret) {
+  if (isProduction && appConfig.liveClassesEnabled && appConfig.hasManagedLiveHls && !appConfig.liveIngestPublisherSecret) {
     errors.push('Managed HLS ingest is configured, but LIVE_INGEST_PUBLISHER_SECRET is missing. Protect the RTMP publish callback before launch.');
   }
 
@@ -410,7 +400,7 @@ const getProductionConfigDiagnostics = () => {
     }
   });
 
-  if (isProduction && appConfig.hasManagedLiveHls && appConfig.liveClassMaxAttendees < 1000) {
+  if (isProduction && appConfig.liveClassesEnabled && appConfig.hasManagedLiveHls && appConfig.liveClassMaxAttendees < 1000) {
     warnings.push('LIVE_CLASS_MAX_ATTENDEES is below 1000. Increase it before running large batches.');
   }
 
@@ -422,7 +412,7 @@ const getProductionConfigDiagnostics = () => {
     warnings.push('VIDEO_REPLAY_VIEW_LIMIT_ENABLED=true can block students before the 6-month course ends. Keep it false for unlimited replay during entitlement.');
   }
 
-  if (isProduction && !appConfig.hasLiveKit && !appConfig.hasManagedLiveHls) {
+  if (isProduction && appConfig.liveClassesEnabled && !appConfig.hasLiveKit && !appConfig.hasManagedLiveHls) {
     errors.push('No LiveKit or managed HLS live stack is configured. Production live classes must use a real media backend.');
   }
 

@@ -237,12 +237,6 @@ const deleteCourse = asyncHandler(async (req, res) => {
   const id = requireString(req.params.id, 'course id');
   const course = await loadCourseOrThrow(id);
 
-  if (course.enrollmentCount && course.enrollmentCount > 0) {
-    throw new ApiError(409, `Cannot delete course with ${course.enrollmentCount} active enrollments. Archive instead.`, {
-      code: 'COURSE_HAS_ENROLLMENTS',
-    });
-  }
-
   const fs = require('fs');
   const path = require('path');
   const courseVideosPath = path.join(__dirname, `../../uploads/videos/course_${id}`);

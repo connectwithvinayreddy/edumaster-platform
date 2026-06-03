@@ -1,20 +1,13 @@
-const { asyncHandler, ok, requireString, optionalString, requireNumber, ApiError } = require('../lib/http.js');
-const { platformRepository, coursesRepository } = require('../lib/repositories.js');
-const { appConfig } = require('../lib/config.js');
-const { buildSecurePlaybackClientContext } = require('../lib/secure-playback.js');
 const {
-  getRedisJson,
-  setRedisJson,
-  addRedisSetMember,
-  removeRedisSetMember,
-} = require('../lib/redis.js');
-
-const ACTIVE_TRACK_SET = 'playback:heartbeat:active';
-const HEARTBEAT_TTL_SECONDS = 180;
-const WATCH_COMPLETION_THRESHOLD = Math.min(
-  Math.max(Number(appConfig.videoWatchCompletionThresholdPercent || 90) / 100, 0.5),
-  1,
-);
+  ApiError,
+  asyncHandler,
+  ok,
+  requireNumber,
+  requireString,
+  optionalString,
+} = require('../lib/http.js');
+const { videoPlaybackRepository } = require('../lib/repositories.js');
+const { buildSecurePlaybackClientContext } = require('../lib/secure-playback.js');
 
 const normalizeBoolean = (value) => {
   if (typeof value === 'boolean') {
@@ -32,13 +25,15 @@ const normalizeBoolean = (value) => {
   return false;
 };
 
-const buildHeartbeatKey = ({ userId, videoId, courseId, lessonId }) => [
-  'playback:heartbeat',
-  String(userId),
-  String(courseId || 'course'),
-  String(lessonId || videoId || 'lesson'),
-  String(videoId),
-].join(':');
+const buildHeartbeatLogPayload = (req, requestContext, extra = {}) => ({
+  request_id: req.requestId || null,
+  replica: requestContext?.replica || String(process.env.REPLICA_NAME || process.env.HOSTNAME || process.env.SERVICE_NAME || `pid:${process.pid}`),
+  user_id: req.user?.id || null,
+  auth_session_id: req.user?.session || null,
+  device_id: requestContext?.deviceId || null,
+  browser_tab_id: requestContext?.playbackTabId || null,
+  ...extra,
+});
 
 const trackHeartbeat = asyncHandler(async (req, res) => {
   const userId = req.user?.id || null;
@@ -47,95 +42,132 @@ const trackHeartbeat = asyncHandler(async (req, res) => {
   }
 
   const videoId = requireString(req.body?.videoId, 'videoId', { maxLength: 120 });
-  const courseId = optionalString(req.body?.courseId || '', '', { maxLength: 120 }) || null;
-  const lessonId = optionalString(req.body?.lessonId || '', '', { maxLength: 120 }) || null;
-  const currentTimeSeconds = requireNumber(req.body?.currentTimeSeconds ?? 0, 'currentTimeSeconds', { min: 0 });
-  const durationSeconds = requireNumber(req.body?.durationSeconds ?? 0, 'durationSeconds', { min: 0 });
-  const isPlaying = normalizeBoolean(req.body?.isPlaying);
-  const completed = normalizeBoolean(req.body?.completed);
-  const now = new Date().toISOString();
-
-  const key = buildHeartbeatKey({ userId, videoId, courseId, lessonId });
-  const existing = await getRedisJson(key);
-  const watchSeconds = Math.max(
-    Number(existing?.watchSeconds || 0),
-    Number(existing?.currentTimeSeconds || 0),
-    Number(currentTimeSeconds || 0),
+  const playbackSessionId = requireString(req.body?.playbackSessionId, 'playbackSessionId', { maxLength: 160 });
+  const courseId = optionalString(req.body?.courseId || '', 'courseId', { maxLength: 160 }) || null;
+  const lessonId = optionalString(req.body?.lessonId || '', 'lessonId', { maxLength: 160 }) || null;
+  const videoType = optionalString(req.body?.videoType || '', 'videoType', { maxLength: 64 }) || null;
+  const currentPositionSeconds = requireNumber(
+    req.body?.currentPositionSeconds ?? req.body?.currentTimeSeconds ?? 0,
+    'currentPositionSeconds',
+    { min: 0 },
   );
-
-  const shouldCountCompletedWatch = !existing?.viewCountedAt
-    && courseId
-    && lessonId
-    && durationSeconds > 0
-    && watchSeconds >= (durationSeconds * WATCH_COMPLETION_THRESHOLD);
-
-  if (shouldCountCompletedWatch) {
-    // Re-check playback eligibility before counting a completed watch so
-    // heartbeat spoofing cannot bypass lesson release, unlock, or platform rules.
-    await coursesRepository.getProtectedLessonPlayback({
-      userId,
-      user: req.user?.profile || null,
-      courseId,
+  const previousPositionSeconds = requireNumber(
+    req.body?.previousPositionSeconds ?? 0,
+    'previousPositionSeconds',
+    { min: 0 },
+  );
+  const durationSeconds = requireNumber(req.body?.durationSeconds ?? 0, 'durationSeconds', { min: 0 });
+  const playbackRate = requireNumber(req.body?.playbackRate ?? 1, 'playbackRate', { min: 0, max: 8 });
+  const timestamp = optionalString(req.body?.timestamp || '', 'timestamp', { maxLength: 64 }) || null;
+  const requestContext = buildSecurePlaybackClientContext(req);
+  const startedAtMs = Date.now();
+  try {
+    const heartbeatResult = await videoPlaybackRepository.recordHeartbeat({
+      userId: String(userId),
+      courseId: courseId || 'course',
       lessonId,
-      requestContext: buildSecurePlaybackClientContext(req),
-    });
-
-    await platformRepository.recordCompletedVideoWatch({
-      userId,
-      courseId,
-      lessonId,
-      progressSeconds: watchSeconds,
-      durationSeconds,
-      sessionId: req.user?.session || null,
-      device: {
-        id: req.headers['x-edumaster-device-id'] || null,
-        platform: req.headers['x-edumaster-client-platform'] || null,
-        browser: req.headers['x-edumaster-client-browser'] || null,
-        app: req.headers['x-edumaster-app'] || 'web',
-        userAgent: req.headers['user-agent'] || null,
+      videoId,
+      videoType,
+      videoDurationSeconds: durationSeconds,
+      playbackSessionId,
+      authSessionId: req.user?.session || null,
+      requestContext,
+      ipAddress: requestContext.ipAddress || null,
+      userAgent: requestContext.userAgent || null,
+      heartbeatPayload: {
+        courseId,
+        lessonId,
+        videoId,
+        videoType,
+        playbackSessionId,
+        currentPositionSeconds,
+        previousPositionSeconds,
+        durationSeconds,
+        isPlaying: normalizeBoolean(req.body?.isPlaying),
+        isPaused: normalizeBoolean(req.body?.isPaused),
+        isBuffering: normalizeBoolean(req.body?.isBuffering),
+        playbackRate,
+        timestamp,
       },
     });
+
+    console.info(`[video-playback-heartbeat] ${JSON.stringify(buildHeartbeatLogPayload(req, requestContext, {
+      course_id: courseId,
+      lesson_id: lessonId,
+      video_id: videoId,
+      video_type: videoType,
+      playback_session_id: heartbeatResult.playbackSession?.playbackSessionId || playbackSessionId,
+      heartbeat_duration_ms: Date.now() - startedAtMs,
+      accepted: heartbeatResult.outcome.accepted,
+      reason: heartbeatResult.outcome.reason,
+      session_status: heartbeatResult.playbackSession?.status || 'active',
+      conflict_reason: heartbeatResult.outcome.conflictReason || null,
+    }))}`);
+
+    return ok(res, {
+      message: 'Heartbeat tracked',
+      accepted: heartbeatResult.outcome.accepted,
+      reason: heartbeatResult.outcome.reason,
+      outcome: heartbeatResult.outcome,
+      watchState: heartbeatResult.watchState,
+      playbackSessionId: heartbeatResult.playbackSession?.playbackSessionId || playbackSessionId,
+      sessionStatus: heartbeatResult.playbackSession?.status || 'active',
+    });
+  } catch (error) {
+    console.warn(`[video-playback-heartbeat] ${JSON.stringify(buildHeartbeatLogPayload(req, requestContext, {
+      course_id: courseId,
+      lesson_id: lessonId,
+      video_id: videoId,
+      video_type: videoType,
+      playback_session_id: playbackSessionId,
+      heartbeat_duration_ms: Date.now() - startedAtMs,
+      accepted: false,
+      reason: error instanceof ApiError ? error.code : 'UNKNOWN_ERROR',
+      session_status: 'error',
+      conflict_reason: error instanceof ApiError ? error.details?.conflictReason || error.details?.decisionReason || null : null,
+      error_message: error instanceof Error ? error.message : String(error),
+    }))}`);
+    throw error;
+  }
+});
+
+const trackSuspiciousActivity = asyncHandler(async (req, res) => {
+  const userId = req.user?.id || null;
+  if (!userId) {
+    throw new ApiError(401, 'Authorization token required', { code: 'AUTH_REQUIRED' });
   }
 
-  const payload = {
-    userId,
-    videoId,
-    courseId,
-    lessonId,
-    currentTimeSeconds: Number(currentTimeSeconds || 0),
-    durationSeconds: Number(durationSeconds || 0),
-    watchSeconds,
-    isPlaying,
-    completed,
-    lastSeenAt: now,
-    startedAt: existing?.startedAt || now,
-    viewCountedAt: existing?.viewCountedAt || (shouldCountCompletedWatch ? now : null),
-    sessionId: req.user?.session || null,
-    device: {
-      id: req.headers['x-edumaster-device-id'] || null,
-      platform: req.headers['x-edumaster-client-platform'] || null,
-      browser: req.headers['x-edumaster-client-browser'] || null,
-      app: req.headers['x-edumaster-app'] || 'web',
-      userAgent: req.headers['user-agent'] || null,
-    },
-  };
+  const eventName = requireString(req.body?.eventName || req.body?.reason, 'eventName', { maxLength: 80 });
+  const courseId = optionalString(req.body?.courseId || '', 'courseId', { maxLength: 160 }) || null;
+  const lessonId = optionalString(req.body?.lessonId || '', 'lessonId', { maxLength: 160 }) || null;
+  const videoId = optionalString(req.body?.videoId || '', 'videoId', { maxLength: 160 }) || null;
+  const videoType = optionalString(req.body?.videoType || '', 'videoType', { maxLength: 64 }) || null;
+  const playbackSessionId = optionalString(req.body?.playbackSessionId || '', 'playbackSessionId', { maxLength: 160 }) || null;
+  const source = optionalString(req.body?.source || 'browser-content-protection', 'source', { maxLength: 80 });
+  const timestamp = optionalString(req.body?.timestamp || '', 'timestamp', { maxLength: 64 }) || null;
+  const requestContext = buildSecurePlaybackClientContext(req);
 
-  await setRedisJson(key, payload, { ttlSeconds: HEARTBEAT_TTL_SECONDS });
-  await addRedisSetMember(ACTIVE_TRACK_SET, key);
-
-  if (!isPlaying) {
-    await removeRedisSetMember(ACTIVE_TRACK_SET, key);
-  }
+  console.warn(`[protected-content-suspicious] ${JSON.stringify(buildHeartbeatLogPayload(req, requestContext, {
+    event_name: eventName,
+    source,
+    course_id: courseId,
+    lesson_id: lessonId,
+    video_id: videoId,
+    video_type: videoType,
+    playback_session_id: playbackSessionId,
+    timestamp,
+    platform: requestContext.platform || null,
+    browser: requestContext.browser || null,
+    ip_address: requestContext.ipAddress || null,
+  }))}`);
 
   return ok(res, {
-    message: 'Heartbeat tracked',
-    sessionKey: key,
-    watchSeconds: payload.watchSeconds,
+    message: 'Suspicious protected-content event logged',
+    accepted: true,
   });
 });
 
 module.exports = {
   trackHeartbeat,
-  ACTIVE_TRACK_SET,
-  HEARTBEAT_TTL_SECONDS,
+  trackSuspiciousActivity,
 };

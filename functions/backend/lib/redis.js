@@ -506,45 +506,33 @@ const checkRedisHealth = async () => {
     };
   }
 
-  return new Promise((resolve) => {
-    const socket = net.createConnection({ host: target.host, port: target.port });
-    let settled = false;
-
-    const finish = (status, detail) => {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      socket.destroy();
-      resolve({
+  try {
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Redis connection timed out')), 5_000);
+    });
+    const response = await Promise.race([
+      executeRedisCommand(['PING']),
+      timeoutPromise,
+    ]);
+    if (String(response || '').toUpperCase() === 'PONG') {
+      return {
         enabled: true,
-        status,
-        detail,
-      });
+        status: 'up',
+        detail: `${target.host}:${target.port}`,
+      };
+    }
+    return {
+      enabled: true,
+      status: 'down',
+      detail: `Unexpected Redis health response: ${String(response)}`,
     };
-
-    socket.setTimeout(5_000);
-
-    socket.on('connect', () => {
-      if (target.password) {
-        writeResp(socket, ['AUTH', target.password]);
-      }
-      writeResp(socket, ['PING']);
-    });
-
-    socket.on('data', (data) => {
-      const response = data.toString('utf8');
-      if (response.includes('+PONG')) {
-        finish('up', `${target.host}:${target.port}`);
-      } else if (response.startsWith('-ERR')) {
-        finish('down', response.trim());
-      }
-    });
-
-    socket.on('timeout', () => finish('down', 'Redis connection timed out'));
-    socket.on('error', (error) => finish('down', error.message));
-  });
+  } catch (error) {
+    return {
+      enabled: true,
+      status: 'down',
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
 };
 
 module.exports = {

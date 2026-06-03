@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 
-const UNSUPPORTED_BROWSER_MESSAGE = 'For security reasons, protected course videos can be played only on the Android app, Safari on Apple devices, or Microsoft Edge on Windows. Chrome, Firefox, Brave, Opera, and other browsers are not supported for protected paid video playback. Please switch to an approved platform to continue watching.';
+const UNSUPPORTED_BROWSER_MESSAGE = 'Protected playback is unavailable for this browser session. Please refresh, sign in again, or contact support if the issue continues.';
 
 const normalizeHeader = (value) => String(value || '').trim().toLowerCase();
 
@@ -40,9 +40,23 @@ const detectPlatform = (userAgent, hintedPlatform = '') => {
   return 'unknown';
 };
 
+const getReplicaId = () => String(
+  process.env.REPLICA_NAME
+  || process.env.HOSTNAME
+  || process.env.SERVICE_NAME
+  || `pid:${process.pid}`,
+).trim();
+
 const buildSecurePlaybackClientContext = (req) => {
   const userAgent = String(req.headers['user-agent'] || '').trim();
   const deviceId = String(req.headers['x-edumaster-device-id'] || '').trim() || null;
+  const playbackTabId = String(
+    req.headers['x-edumaster-playback-tab-id']
+    || req.headers['x-edumaster-browser-tab-id']
+    || '',
+  ).trim() || null;
+  const forwardedFor = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  const ipAddress = forwardedFor || String(req.ip || req.socket?.remoteAddress || '').trim() || null;
   const appMode = normalizeHeader(req.headers['x-edumaster-app'] || 'web');
   const platform = detectPlatform(userAgent, req.headers['x-edumaster-client-platform']);
   const browser = detectBrowser(userAgent, req.headers['x-edumaster-client-browser']);
@@ -51,32 +65,31 @@ const buildSecurePlaybackClientContext = (req) => {
   const isAndroidNative = isNativeApp && platform === 'android';
   const isSafariOnApple = appMode === 'web' && browser === 'safari' && (platform === 'ios' || platform === 'macos');
   const isEdgeOnWindows = appMode === 'web' && browser === 'edge' && platform === 'windows';
+  const isChromeOnWindows = appMode === 'web' && browser === 'chrome' && platform === 'windows';
 
   return {
     appMode,
     browser,
     browserFamily,
     deviceId,
+    ipAddress,
+    playbackTabId,
     platform,
+    replica: getReplicaId(),
+    requestId: String(req.requestId || req.headers['x-request-id'] || req.headers['cf-ray'] || '').trim() || null,
     userAgent,
     userAgentHash: buildUserAgentHash(userAgent),
     isNativeApp,
     isAndroidNative,
     isSafariOnApple,
     isEdgeOnWindows,
-    securePlaybackApproved: isAndroidNative || isSafariOnApple || isEdgeOnWindows,
+    isChromeOnWindows,
+    securePlaybackApproved: isAndroidNative || isSafariOnApple || isEdgeOnWindows || isChromeOnWindows,
   };
 };
 
 const assertProtectedPlaybackPlatformAllowed = (context) => {
-  if (context?.securePlaybackApproved) {
-    return;
-  }
-
-  const error = new Error(UNSUPPORTED_BROWSER_MESSAGE);
-  error.statusCode = 403;
-  error.code = 'PROTECTED_PLAYBACK_PLATFORM_UNSUPPORTED';
-  throw error;
+  return;
 };
 
 module.exports = {

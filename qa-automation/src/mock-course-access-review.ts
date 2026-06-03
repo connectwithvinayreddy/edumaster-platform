@@ -1,6 +1,12 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import puppeteer from 'puppeteer-core';
+import {
+  assertMutationAllowed,
+  certificationModeSummary,
+  isProdSafeExistingDataMode,
+  requireValueInProdSafeMode,
+} from './certification-mode.js';
 import { config } from './config.js';
 import { qaFetch } from './network.js';
 import { selectors } from './selectors.js';
@@ -18,6 +24,13 @@ const apiOrigin = (() => {
 const chromePath = process.env.QA_CHROME_EXECUTABLE || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const adminEmail = process.env.QA_ADMIN_EMAIL || process.env.ADMIN_EMAIL || 'admin@varoonenglish.com';
 const adminPassword = process.env.QA_ADMIN_PASSWORD || process.env.ADMIN_PASSWORD || '';
+const PROD_SAFE_MODE = isProdSafeExistingDataMode();
+const existingLockedEmail = String(process.env.QA_MOCK_ACCESS_LOCKED_EMAIL || '').trim();
+const existingLockedPassword = String(process.env.QA_MOCK_ACCESS_LOCKED_PASSWORD || process.env.QA_LOGIN_PASSWORD || '').trim();
+const existingEnrolledEmail = String(process.env.QA_MOCK_ACCESS_ENROLLED_EMAIL || '').trim();
+const existingEnrolledPassword = String(process.env.QA_MOCK_ACCESS_ENROLLED_PASSWORD || process.env.QA_LOGIN_PASSWORD || '').trim();
+const existingCourseId = String(process.env.QA_MOCK_ACCESS_COURSE_ID || '').trim();
+const existingTestId = String(process.env.QA_MOCK_ACCESS_TEST_ID || '').trim();
 
 type AuthSession = {
   token: string;
@@ -43,6 +56,7 @@ type TestRecord = {
 };
 
 const registerStudent = async (label: string) => {
+  assertMutationAllowed('Registering synthetic mock access review students');
   const email = `qa.${label}+${Date.now()}@local.test`;
   const response = await qaFetch(new URL('/backend/api/auth/register', apiOrigin), {
     method: 'POST',
@@ -98,7 +112,13 @@ const ensurePaidCourse = async (token: string) => {
     throw new Error('Unable to load admin course list for mock access review.');
   }
 
-  const paidCourse = payload.find((course) => Number(course.price || 0) > 0);
+  if (PROD_SAFE_MODE) {
+    requireValueInProdSafeMode('QA_MOCK_ACCESS_COURSE_ID', existingCourseId);
+  }
+
+  const paidCourse = existingCourseId
+    ? payload.find((course) => course._id === existingCourseId)
+    : payload.find((course) => Number(course.price || 0) > 0);
   if (!paidCourse) {
     throw new Error('No paid course is available for mock access review.');
   }
@@ -112,11 +132,21 @@ const ensureLinkedMockTest = async (token: string, course: CourseRecord) => {
     throw new Error('Unable to load tests for mock access review.');
   }
 
-  const existing = payload.find((test) => test.course === course._id && String(test.type || '').includes('full'));
+  if (PROD_SAFE_MODE) {
+    requireValueInProdSafeMode('QA_MOCK_ACCESS_TEST_ID', existingTestId);
+  }
+
+  const existing = existingTestId
+    ? payload.find((test) => test._id === existingTestId)
+    : payload.find((test) => test.course === course._id && String(test.type || '').includes('full'));
   if (existing) {
+    if (existing.course && existing.course !== course._id) {
+      throw new Error(`QA_MOCK_ACCESS_TEST_ID=${existing._id} is not linked to QA_MOCK_ACCESS_COURSE_ID=${course._id}.`);
+    }
     return existing;
   }
 
+  assertMutationAllowed('Creating linked mock tests for mock access review');
   const createResponse = await apiRequest<TestRecord>('/backend/api/tests', token, {
     method: 'POST',
     body: JSON.stringify({
@@ -148,18 +178,19 @@ const ensureLinkedMockTest = async (token: string, course: CourseRecord) => {
   return createResponse.payload;
 };
 
-const enrollStudent = async (token: string, courseId: string) => {
-  const { response, payload } = await apiRequest('/backend/api/platform/enroll', token, {
+const grantCourseAccess = async (adminToken: string, studentId: string, courseId: string) => {
+  assertMutationAllowed('Granting course access for mock access review');
+  const { response, payload } = await apiRequest('/backend/api/admin/purchases/assign-course', adminToken, {
     method: 'POST',
     body: JSON.stringify({
+      studentId,
       courseId,
-      source: 'razorpay',
-      accessType: 'course',
+      adminNote: 'QA mock course access review manual grant',
     }),
   });
 
   if (!response.ok) {
-    throw new Error(`Unable to enroll QA student through payment source: ${JSON.stringify(payload)}`);
+    throw new Error(`Unable to grant QA student course access: ${JSON.stringify(payload)}`);
   }
 };
 
@@ -176,9 +207,13 @@ const takeScreenshot = async (
   return { screenshotPath, sourcePath };
 };
 
+const storeAuthToken = async (page: puppeteer.Page, token: string) => {
+  await page.evaluateOnNewDocument((jwt) => window.localStorage.setItem('edumaster.jwt', jwt), token);
+};
+
 const storeSessionAndLoadShell = async (page: puppeteer.Page, token: string) => {
   await page.goto(config.baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => undefined);
-  await page.evaluate((jwt) => window.localStorage.setItem('edumaster.jwt', jwt), token);
+  await storeAuthToken(page, token);
   await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => undefined);
   await page.waitForSelector(selectors.shellReady, { timeout: 30000 });
 };
@@ -248,6 +283,14 @@ export const runMockCourseAccessReview = async (): Promise<{ captures: CaptureRe
   if (!adminPassword) {
     throw new Error('QA_ADMIN_PASSWORD or ADMIN_PASSWORD must be set for mock access review.');
   }
+  if (PROD_SAFE_MODE) {
+    requireValueInProdSafeMode('QA_MOCK_ACCESS_LOCKED_EMAIL', existingLockedEmail);
+    requireValueInProdSafeMode('QA_MOCK_ACCESS_LOCKED_PASSWORD', existingLockedPassword);
+    requireValueInProdSafeMode('QA_MOCK_ACCESS_ENROLLED_EMAIL', existingEnrolledEmail);
+    requireValueInProdSafeMode('QA_MOCK_ACCESS_ENROLLED_PASSWORD', existingEnrolledPassword);
+    requireValueInProdSafeMode('QA_MOCK_ACCESS_COURSE_ID', existingCourseId);
+    requireValueInProdSafeMode('QA_MOCK_ACCESS_TEST_ID', existingTestId);
+  }
 
   const ctx = await createRunContext();
   const captures: CaptureRecord[] = [];
@@ -257,9 +300,15 @@ export const runMockCourseAccessReview = async (): Promise<{ captures: CaptureRe
   const paidCourse = await ensurePaidCourse(admin.token);
   const linkedMock = await ensureLinkedMockTest(admin.token, paidCourse);
 
-  const lockedStudent = await registerStudent('locked');
-  const enrolledStudent = await registerStudent('enrolled');
-  await enrollStudent(enrolledStudent.token, paidCourse._id);
+  const lockedStudent = PROD_SAFE_MODE
+    ? await login(existingLockedEmail, existingLockedPassword, 'qa-mock-access-locked')
+    : await registerStudent('locked');
+  const enrolledStudent = PROD_SAFE_MODE
+    ? await login(existingEnrolledEmail, existingEnrolledPassword, 'qa-mock-access-enrolled')
+    : await registerStudent('enrolled');
+  if (!PROD_SAFE_MODE) {
+    await grantCourseAccess(admin.token, enrolledStudent.user._id, paidCourse._id);
+  }
 
   const lockedTests = await apiRequest<TestRecord[]>('/backend/api/tests', lockedStudent.token);
   const enrolledTests = await apiRequest<TestRecord[]>('/backend/api/tests', enrolledStudent.token);
@@ -325,6 +374,7 @@ export const runMockCourseAccessReview = async (): Promise<{ captures: CaptureRe
   }
 
   await writeJson(path.join(ctx.analysisDir, 'summary.json'), {
+    certificationMode: certificationModeSummary(),
     captures,
     failures,
     evidence: {

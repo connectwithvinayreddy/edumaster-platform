@@ -1,7 +1,7 @@
 // Course Controller
 const fs = require('fs');
 const path = require('path');
-const { coursesRepository, sessionRepository } = require('../lib/repositories.js');
+const { coursesRepository, sessionRepository, videoPlaybackRepository } = require('../lib/repositories.js');
 const {
   ApiError,
   asyncHandler,
@@ -46,6 +46,16 @@ const sourceManifestMemoryCache = new Map();
 const rewrittenManifestMemoryCache = new Map();
 const COMPACT_HLS_ROUTE_BASE = '/backend/api/courses/h';
 const HLS_ACCESS_COOKIE_PATH = '/backend/api/';
+
+const buildPlaybackRouteLogPayload = (req, requestContext, extra = {}) => ({
+  request_id: req.requestId || null,
+  replica: requestContext?.replica || String(process.env.REPLICA_NAME || process.env.HOSTNAME || process.env.SERVICE_NAME || `pid:${process.pid}`),
+  user_id: req.user?.id || null,
+  auth_session_id: req.user?.session || null,
+  device_id: requestContext?.deviceId || null,
+  browser_tab_id: requestContext?.playbackTabId || null,
+  ...extra,
+});
 
 const parseRequestCookies = (req) => String(req.headers.cookie || '')
   .split(';')
@@ -108,6 +118,23 @@ const getValidHlsGrantFromRequest = async (req, storageRoot) => {
 
   if (!requestMatchesPlaybackContext(req, payload)) {
     return null;
+  }
+
+  if (payload.userId && payload.playbackSessionId) {
+    const requestContext = buildSecurePlaybackClientContext(req);
+    const activePlaybackSession = await videoPlaybackRepository.validatePlaybackSession({
+      userId: String(payload.userId),
+      playbackSessionId: String(payload.playbackSessionId),
+      authSessionId: payload.sessionId || null,
+      courseId: payload.courseId || null,
+      videoId: payload.videoId || null,
+      videoType: payload.videoType || null,
+      requestContext,
+    });
+
+    if (!activePlaybackSession || String(activePlaybackSession.status || '').toLowerCase() === 'locked') {
+      return null;
+    }
   }
 
   return payload;
@@ -552,6 +579,10 @@ const appendPlaybackGrantCookieIfNeeded = (req, res, player) => {
     userId: req.user?.id || null,
     sessionId: req.user?.session || null,
     storageRoot,
+    playbackSessionId: player?.playbackSessionId || null,
+    courseId: player?.courseId || null,
+    videoId: player?.videoId || null,
+    videoType: player?.videoType || null,
     userAgentHash: buildSecurePlaybackClientContext(req).userAgentHash,
   }, {
     expiresAtMs: Number(new Date(player.tokenExpiresAt || '').getTime() || 0) || undefined,
@@ -560,33 +591,112 @@ const appendPlaybackGrantCookieIfNeeded = (req, res, player) => {
   setPlaybackCookie(res, issuedGrant.token, issuedGrant.expiresAt);
 };
 
+const assertActivePlaybackSession = async (payload, requestContext = null) => {
+  if (!(payload?.userId && payload?.playbackSessionId)) {
+    return null;
+  }
+
+  const activePlaybackSession = await videoPlaybackRepository.validatePlaybackSession({
+    userId: String(payload.userId),
+    playbackSessionId: String(payload.playbackSessionId),
+    authSessionId: payload.sessionId || null,
+    courseId: payload.courseId || null,
+    videoId: payload.videoId || payload.lessonId || null,
+    videoType: payload.videoType || null,
+    requestContext,
+  });
+
+  if (!activePlaybackSession) {
+    throw new ApiError(401, 'Playback session is no longer valid', { code: 'PLAYBACK_SESSION_INVALID' });
+  }
+
+  if (String(activePlaybackSession.status || '').toLowerCase() === 'locked') {
+    throw new ApiError(403, 'Video watch limit reached', { code: 'VIDEO_WATCH_LIMIT_REACHED' });
+  }
+
+  return activePlaybackSession;
+};
+
 const getProtectedLessonPlayer = asyncHandler(async (req, res) => {
   const courseId = requireString(req.params.id, 'course id');
   const lessonId = requireString(req.params.lessonId, 'lesson id');
-  const player = await coursesRepository.getProtectedLessonPlayback({
-    userId: req.user?.id || null,
-    courseId,
-    lessonId,
-    requestContext: buildSecurePlaybackClientContext(req),
-  });
+  const requestContext = buildSecurePlaybackClientContext(req);
+  const startedAtMs = Date.now();
+  try {
+    const player = await coursesRepository.getProtectedLessonPlayback({
+      userId: req.user?.id || null,
+      courseId,
+      lessonId,
+      requestContext,
+    });
 
-  appendPlaybackGrantCookieIfNeeded(req, res, player);
+    console.info(`[video-playback-bootstrap] ${JSON.stringify(buildPlaybackRouteLogPayload(req, requestContext, {
+      course_id: courseId,
+      lesson_id: lessonId,
+      playback_session_id: player?.playbackSessionId || null,
+      bootstrap_duration_ms: Date.now() - startedAtMs,
+      result: 'ok',
+      player_type: player?.playerType || null,
+      stream_format: player?.streamFormat || player?.drmConfig?.manifestFormat || null,
+      conflict_reason: null,
+    }))}`);
 
-  return ok(res, player);
+    appendPlaybackGrantCookieIfNeeded(req, res, player);
+    return ok(res, player);
+  } catch (error) {
+    console.warn(`[video-playback-bootstrap] ${JSON.stringify(buildPlaybackRouteLogPayload(req, requestContext, {
+      course_id: courseId,
+      lesson_id: lessonId,
+      bootstrap_duration_ms: Date.now() - startedAtMs,
+      result: 'error',
+      error_code: error instanceof ApiError ? error.code : 'UNKNOWN_ERROR',
+      error_message: error instanceof Error ? error.message : String(error),
+      conflict_reason: error instanceof ApiError ? error.details?.conflictReason || error.details?.decisionReason || null : null,
+    }))}`);
+    throw error;
+  }
 });
 
 const getProtectedLessonBootstrap = asyncHandler(async (req, res) => {
   const courseId = requireString(req.params.id, 'course id');
   const lessonId = requireString(req.params.lessonId, 'lesson id');
-  const bootstrap = await coursesRepository.getProtectedLessonBootstrap({
-    userId: req.user?.id || null,
-    courseId,
-    lessonId,
-    requestContext: buildSecurePlaybackClientContext(req),
-  });
+  const requestContext = buildSecurePlaybackClientContext(req);
+  const startedAtMs = Date.now();
+  try {
+    const bootstrap = await coursesRepository.getProtectedLessonBootstrap({
+      userId: req.user?.id || null,
+      courseId,
+      lessonId,
+      requestContext,
+    });
 
-  appendPlaybackGrantCookieIfNeeded(req, res, bootstrap.player);
-  return ok(res, bootstrap);
+    console.info(`[video-playback-bootstrap] ${JSON.stringify(buildPlaybackRouteLogPayload(req, requestContext, {
+      course_id: courseId,
+      lesson_id: lessonId,
+      playback_session_id: bootstrap?.player?.playbackSessionId || null,
+      bootstrap_duration_ms: Date.now() - startedAtMs,
+      result: 'ok',
+      bootstrap_mode: 'bootstrap',
+      player_type: bootstrap?.player?.playerType || null,
+      stream_format: bootstrap?.player?.streamFormat || bootstrap?.player?.drmConfig?.manifestFormat || null,
+      conflict_reason: null,
+    }))}`);
+
+    appendPlaybackGrantCookieIfNeeded(req, res, bootstrap.player);
+    return ok(res, bootstrap);
+  } catch (error) {
+    console.warn(`[video-playback-bootstrap] ${JSON.stringify(buildPlaybackRouteLogPayload(req, requestContext, {
+      course_id: courseId,
+      lesson_id: lessonId,
+      bootstrap_duration_ms: Date.now() - startedAtMs,
+      result: 'error',
+      bootstrap_mode: 'bootstrap',
+      error_code: error instanceof ApiError ? error.code : 'UNKNOWN_ERROR',
+      error_message: error instanceof Error ? error.message : String(error),
+      conflict_reason: error instanceof ApiError ? error.details?.conflictReason || error.details?.decisionReason || null : null,
+    }))}`);
+    throw error;
+  }
 });
 
 const streamCompactProtectedLessonAsset = asyncHandler(async (req, res) => {
@@ -681,6 +791,10 @@ const streamProtectedLesson = asyncHandler(async (req, res) => {
       code: 'PLAYBACK_CONTEXT_INVALID',
     });
   }
+
+  const requestContext = buildSecurePlaybackClientContext(req);
+
+  await assertActivePlaybackSession(payload, requestContext);
 
   if (isS3Provider(payload.storageProvider) && payload.assetKind === 'hls') {
     if (isHlsManifestPath(payload.storagePath)) {
@@ -828,12 +942,16 @@ const proxyProtectedDrmLicense = asyncHandler(async (req, res) => {
     });
   }
 
+  const requestContext = buildSecurePlaybackClientContext(req);
+
+  await assertActivePlaybackSession(payload, requestContext);
+
   const player = await coursesRepository.getProtectedLessonPlayback({
     userId: req.user?.id || payload.userId || null,
     user: req.user?.profile || null,
     courseId,
     lessonId,
-    requestContext: buildSecurePlaybackClientContext(req),
+    requestContext,
   });
 
   if (!player?.drmEnabled) {

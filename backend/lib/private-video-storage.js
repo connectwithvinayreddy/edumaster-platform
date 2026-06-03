@@ -6,6 +6,7 @@ const {
   PutObjectCommand,
   DeleteObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   ListObjectsV2Command,
 } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
@@ -217,6 +218,36 @@ const uploadPrivateStorageFile = async ({
   }));
 };
 
+const privateStorageObjectExists = async ({ storageProvider, storagePath }) => {
+  const provider = inferStorageProvider({ storageProvider, storagePath });
+  if (provider !== 's3' || !hasS3Credentials()) {
+    if (provider === 's3') {
+      throw new Error('Cloudflare R2 / S3-compatible object storage is not fully configured.');
+    }
+    const localVideoPath = resolvePrivateVideoPath(storagePath);
+    const localHlsPath = resolvePrivateHlsPath(storagePath);
+    return Boolean(
+      (localVideoPath && fs.existsSync(localVideoPath))
+      || (localHlsPath && fs.existsSync(localHlsPath)),
+    );
+  }
+
+  try {
+    await getS3Client().send(new HeadObjectCommand({
+      Bucket: appConfig.storageBucket,
+      Key: storagePath,
+    }));
+    return true;
+  } catch (error) {
+    const statusCode = Number(error?.$metadata?.httpStatusCode || error?.statusCode || 0);
+    const name = String(error?.name || error?.Code || '').toLowerCase();
+    if (statusCode === 404 || name === 'notfound' || name === 'nosuchkey') {
+      return false;
+    }
+    throw error;
+  }
+};
+
 const getPrivateStorageObjectBuffer = async ({ storageProvider, storagePath }) => {
   const provider = inferStorageProvider({ storageProvider, storagePath });
   if (provider !== 's3' || !hasS3Credentials()) {
@@ -359,6 +390,7 @@ module.exports = {
   deleteStoredPrivateVideo,
   deleteStoredPrivateVideoPrefix,
   uploadPrivateStorageFile,
+  privateStorageObjectExists,
   downloadPrivateStorageObjectToFile,
   getPrivateStorageObjectBuffer,
   getPrivateStorageObjectText,

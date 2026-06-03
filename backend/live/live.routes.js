@@ -12,12 +12,15 @@ const requireAuthFromQuery = async (req, res, next) => {
     : '';
   const token = headerToken || queryToken;
   if (!token) {
-    return res.status(401).json({ message: 'Authorization token required' });
+    return res.status(401).json({
+      message: 'Authorization token required',
+      code: 'AUTH_TOKEN_MISSING',
+    });
   }
 
-  const attached = await attachUserFromToken(req, token);
-  if (!attached) {
-    return res.status(401).json({ message: 'Invalid token' });
+  const failure = await attachUserFromToken(req, token);
+  if (failure) {
+    return res.status(401).json(failure);
   }
   return next();
 };

@@ -18,8 +18,25 @@ const { state, clone, nextId, nowIso } = require('./store.js');
 const { decryptVideoId, normalizeYouTubeVideoId, buildSecureYouTubeEmbedUrl } = require('./video-security.js');
 const { issuePlaybackToken, buildManifestBundleUrl, buildCompactAssetUrl } = require('./private-video.js');
 const { appConfig } = require('./config.js');
+const {
+  fetchRazorpayOrder,
+  fetchRazorpayPayment,
+  fetchRazorpayOrderPayments,
+  verifyRazorpayWebhookSignature,
+} = require('../payment/razorpay-client.js');
 const { getAiGenerationProviders } = require('./ai-content.js');
-const { assertProtectedPlaybackPlatformAllowed } = require('./secure-playback.js');
+const {
+  COURSE_VIDEO_TYPE,
+  EXPLANATION_VIDEO_TYPE,
+  EDITORIAL_VIDEO_TYPE,
+  normalizeVideoType,
+  getVideoWatchPolicy,
+  getDefaultVideoWatchState,
+  normalizeVideoWatchState,
+  applyPlaybackHeartbeat,
+  deriveProtectedReplayState,
+  buildVideoWatchStateSummary,
+} = require('./video-watch-limits.js');
 const liveKitService = require('../live/livekit.service.js');
 
 const normalizeEmail = (email) => String(email || '').trim().toLowerCase();
@@ -32,10 +49,20 @@ const normalizeMobileNumber = (value) => {
   if (!normalized) {
     return '';
   }
-  if (normalized.startsWith('+')) {
-    return `+${normalized.slice(1).replace(/\D/g, '')}`;
+  const digitsOnly = normalized.replace(/\D/g, '');
+  if (!digitsOnly) {
+    return '';
   }
-  return normalized.replace(/\D/g, '');
+  if (digitsOnly.length === 11 && digitsOnly.startsWith('0')) {
+    return digitsOnly.slice(-10);
+  }
+  if (digitsOnly.length === 12 && digitsOnly.startsWith('91')) {
+    return digitsOnly.slice(-10);
+  }
+  if (normalized.startsWith('+')) {
+    return `+${digitsOnly}`;
+  }
+  return digitsOnly;
 };
 const toNumber = (value, fallback = 0) => {
   const parsed = Number(value);
@@ -55,9 +82,21 @@ const replayRetentionMs = replayRetentionDays * 24 * 60 * 60 * 1000;
 const liveReplayRetentionDays = replayRetentionDays;
 const liveReplayMaxViews = replayMaxViews;
 const liveReplayRetentionMs = liveReplayRetentionDays * 24 * 60 * 60 * 1000;
+const videoWatchChunkSeconds = Math.max(1, Number(appConfig.videoWatchChunkSeconds || 10));
+const videoPlaybackReconnectGraceSeconds = Math.min(
+  60,
+  Math.max(30, Number(appConfig.videoPlaybackReconnectGraceSeconds || 60)),
+);
+const videoPlaybackSessionTtlSeconds = Math.max(
+  videoPlaybackReconnectGraceSeconds + 15,
+  Number(appConfig.videoPlaybackSessionTtlSeconds || 120),
+);
+const videoPlaybackHeartbeatGraceSeconds = Math.max(3, Number(appConfig.videoPlaybackHeartbeatGraceSeconds || 8));
+const videoPlaybackMaxHeartbeatGapSeconds = Math.max(45, Number(appConfig.videoPlaybackMaxHeartbeatGapSeconds || 90));
+const videoPlaybackMaxRate = Math.max(1, Number(appConfig.videoPlaybackMaxRate || 2));
 const platformReadyCacheTtlMs = Math.max(1_000, Number(appConfig.platformReadyCacheTtlMs || 60_000));
 const platformDataCacheTtlMs = Math.max(0, Number(appConfig.platformDataCacheTtlMs || 3_000));
-const activeEnrollmentSql = '(expires_at IS NULL OR expires_at > now())';
+const activeEnrollmentSql = "((access_status IS NULL OR access_status = 'enabled') AND (expires_at IS NULL OR expires_at > now()))";
 const addDaysIso = (days, baseMs = Date.now()) => new Date(baseMs + Math.max(1, Number(days || courseDefaultValidityDays)) * 24 * 60 * 60 * 1000).toISOString();
 const getPaymentStatusPriority = (status) => {
   switch (String(status || '').toLowerCase()) {
@@ -122,6 +161,21 @@ const getLessonConfiguredCompletionPercent = (lesson) => {
 
   return Math.min(Math.max(Number(appConfig.videoWatchCompletionThresholdPercent || 90), 50), 100);
 };
+const resolveEffectiveLessonWatchSettings = async ({
+  userId,
+  courseId,
+  lessonId,
+  lesson = null,
+}) => {
+  const override = userId && courseId && lessonId
+    ? await getStudentLessonWatchOverride({ studentId: userId, courseId, lessonId })
+    : null;
+  return {
+    override,
+    allowedFullWatches: override?.allowedFullWatches || getLessonConfiguredWatchLimit(lesson),
+    watchCompletionPercent: override?.watchCompletionPercent || getLessonConfiguredCompletionPercent(lesson),
+  };
+};
 const buildDrmLicenseServers = () => Object.fromEntries(
   Object.entries({
     'com.widevine.alpha': appConfig.privateVideoDrmWidevineLicenseUrl,
@@ -135,6 +189,9 @@ const buildProtectedPlaybackDrmConfig = ({
   lessonId,
   userId,
   sessionId,
+  playbackSessionId = null,
+  videoId = null,
+  videoType = COURSE_VIDEO_TYPE,
   playbackContext,
 }) => {
   if (!appConfig.privateVideoDrmEnabled) {
@@ -157,6 +214,9 @@ const buildProtectedPlaybackDrmConfig = ({
     sessionId: sessionId || null,
     courseId: String(courseId),
     lessonId: String(lessonId),
+    playbackSessionId: playbackSessionId || null,
+    videoId: videoId || String(lessonId),
+    videoType: normalizeVideoType(videoType),
     userAgentHash: playbackContext?.userAgentHash || null,
     deviceId: playbackContext?.deviceId || null,
     platform: playbackContext?.platform || null,
@@ -194,7 +254,7 @@ const buildProtectedPlaybackDrmConfig = ({
     ),
     fairplayCertificateUrl,
     preferredKeySystem: String(appConfig.privateVideoDrmPreferredKeySystem || '').trim() || null,
-    captureProtection: 'drm',
+    captureProtection: null,
   };
 };
 const assertLessonReleasedForPlayback = (lesson) => {
@@ -213,6 +273,10 @@ const isEnrollmentActive = (enrollment) => {
     return false;
   }
 
+  if (String(enrollment.accessStatus || 'enabled').toLowerCase() !== 'enabled') {
+    return false;
+  }
+
   if (!enrollment.expiresAt) {
     return true;
   }
@@ -221,6 +285,179 @@ const isEnrollmentActive = (enrollment) => {
   return Number.isFinite(expiresAt) && expiresAt > Date.now();
 };
 const filterActiveEnrollments = (enrollments) => (enrollments || []).filter(isEnrollmentActive);
+const normalizeCoursePaymentStatus = (status) => {
+  const normalized = String(status || '').trim().toLowerCase();
+  if (normalized === 'paid') return 'success';
+  if (normalized === 'manual') return 'manual';
+  if (normalized === 'failed') return 'failed';
+  if (normalized === 'pending') return 'pending';
+  if (normalized === 'refunded') return 'refunded';
+  return normalized || 'none';
+};
+const getLatestTimestampValue = (entry) => (
+  Date.parse(
+    entry?.updatedAt
+    || entry?.paidAt
+    || entry?.createdAt
+    || entry?.enrolledAt
+    || entry?.lastWatchedAt
+    || 0,
+  ) || 0
+);
+const getLatestEntry = (entries) => (
+  Array.isArray(entries) && entries.length > 0
+    ? [...entries].sort((left, right) => getLatestTimestampValue(right) - getLatestTimestampValue(left))[0]
+    : null
+);
+const getPaymentPriorityRank = (payment) => {
+  const meta = asObject(payment?.payment_meta || payment?.meta);
+  const decision = String(meta.verificationDecision || meta.verificationStatus || '').trim().toUpperCase();
+  const gatewayStatus = String(meta.gatewayStatus || meta.razorpayGatewayStatus || '').trim().toLowerCase();
+  const localStatus = String(payment?.status || '').trim().toLowerCase();
+  if (decision === 'VERIFIED_CAPTURED_ACTIVATED' && gatewayStatus === 'captured' && localStatus === 'paid') {
+    return 0;
+  }
+  if (localStatus === 'paid') {
+    return 1;
+  }
+  if (localStatus === 'pending') {
+    return 2;
+  }
+  if (localStatus === 'failed') {
+    return 3;
+  }
+  if (localStatus === 'refunded') {
+    return 4;
+  }
+  return 5;
+};
+const getBestPaymentEntry = (entries) => (
+  Array.isArray(entries) && entries.length > 0
+    ? [...entries].sort((left, right) => {
+      const rankDifference = getPaymentPriorityRank(left) - getPaymentPriorityRank(right);
+      if (rankDifference !== 0) {
+        return rankDifference;
+      }
+      return getLatestTimestampValue(right) - getLatestTimestampValue(left);
+    })[0]
+    : null
+);
+const getCourseAccessLabel = ({
+  canAccessCourse = false,
+  paymentStatus = 'none',
+  accessStatus = 'not_purchased',
+  verificationStatus = '',
+}) => {
+  if (canAccessCourse) {
+    return 'Continue Learning';
+  }
+
+  const normalizedPaymentStatus = String(paymentStatus || '').toLowerCase();
+  const normalizedAccessStatus = String(accessStatus || '').toLowerCase();
+  const normalizedVerificationStatus = normalizeRazorpayVerificationDecision(verificationStatus);
+  if (normalizedVerificationStatus === 'MANUAL_REVIEW_REQUIRED' || normalizedVerificationStatus === 'LOCAL_TRANSACTION_NOT_FOUND') {
+    return 'Payment Under Verification';
+  }
+  if (['AMOUNT_MISMATCH', 'ORDER_MISMATCH', 'USER_MISMATCH', 'COURSE_MISMATCH', 'REFUNDED_OR_CHARGEBACK'].includes(normalizedVerificationStatus)) {
+    return 'Contact Support';
+  }
+  if (normalizedAccessStatus === 'expired') {
+    return 'Renew Course';
+  }
+  if (normalizedAccessStatus === 'disabled') {
+    return 'Contact Support';
+  }
+  if (normalizedPaymentStatus === 'pending') {
+    return 'Payment Pending';
+  }
+  if (normalizedPaymentStatus === 'failed') {
+    return 'Payment Failed';
+  }
+  if (normalizedAccessStatus === 'pending_access') {
+    return 'Access Pending';
+  }
+  return 'Buy Course';
+};
+const getCourseVideoPlaybackAccess = ({ course, enrollment = null, payment = null, isAdmin = false }) => {
+  const paymentMeta = asObject(payment?.meta);
+  const paymentStatus = isAdmin
+    ? 'manual'
+    : payment
+      ? normalizeCoursePaymentStatus(payment.status)
+      : enrollment
+        ? 'manual'
+        : 'none';
+  const enrollmentAccessStatus = String(enrollment?.accessStatus || '').trim().toLowerCase();
+  const validityActive = isAdmin || isEnrollmentActive(enrollment);
+  const accessDisabled = Boolean(enrollment) && enrollmentAccessStatus !== '' && enrollmentAccessStatus !== 'enabled';
+  const hasSuccessfulPayment = ['success', 'manual'].includes(paymentStatus);
+  const hasPurchaseSignal = Boolean(enrollment) || hasSuccessfulPayment || ['pending', 'refunded'].includes(paymentStatus);
+  const verificationStatus = isAdmin
+    ? 'VERIFIED_CAPTURED_ACTIVATED'
+    : normalizeRazorpayVerificationDecision(paymentMeta.verificationStatus || paymentMeta.verificationDecision || '');
+  const verificationPresentation = getRazorpayVerificationPresentation(verificationStatus);
+  let accessStatus = 'not_purchased';
+  let accessBlockReason = 'Please purchase course to watch.';
+
+  if (isAdmin || validityActive) {
+    accessStatus = 'enabled';
+    accessBlockReason = null;
+  } else if (verificationPresentation.manualReviewRequired) {
+    accessStatus = 'pending_access';
+    accessBlockReason = paymentMeta.verificationReason || verificationPresentation.reason;
+  } else if (accessDisabled) {
+    accessStatus = 'disabled';
+    accessBlockReason = 'Access disabled. Contact support.';
+  } else if (enrollment && !validityActive) {
+    accessStatus = 'expired';
+    accessBlockReason = 'Course validity expired.';
+  } else if (hasSuccessfulPayment) {
+    accessStatus = 'pending_access';
+    accessBlockReason = 'Payment successful but course access is still being activated.';
+  } else if (paymentStatus === 'pending') {
+    accessStatus = 'pending_access';
+    accessBlockReason = 'Payment is pending confirmation.';
+  } else if (paymentStatus === 'refunded') {
+    accessStatus = 'disabled';
+    accessBlockReason = 'Payment was refunded. Contact support.';
+  }
+
+  return {
+    isPurchased: hasPurchaseSignal,
+    paymentStatus,
+    enrollmentStatus: validityActive
+      ? 'active'
+      : accessDisabled
+        ? 'disabled'
+        : enrollment
+          ? 'expired'
+          : 'missing',
+    accessStatus,
+    validUntil: enrollment?.expiresAt || null,
+    isExpired: accessStatus === 'expired',
+    canAccessCourse: accessStatus === 'enabled',
+    canPlayReleasedVideos: accessStatus === 'enabled',
+    accessBlockReason,
+    transactionId: payment?.providerPaymentId || payment?._id || null,
+    gatewayOrderId: payment?.providerOrderId || null,
+    gatewayPaymentId: payment?.providerPaymentId || null,
+    gatewayStatus: paymentMeta.gatewayStatus || null,
+    verificationStatus,
+    verificationReason: paymentMeta.verificationReason || verificationPresentation.reason,
+    expectedAmount: paymentMeta.expectedAmount ?? (payment?.amount ?? null),
+    receivedAmount: paymentMeta.receivedAmount ?? (payment?.amount ?? null),
+    currency: payment?.currency || paymentMeta.currency || 'INR',
+    manualReviewRequired: Boolean(verificationPresentation.manualReviewRequired),
+    accessSource: enrollment?.source || (payment ? payment.provider || 'payment' : null),
+    courseAccessLabel: getCourseAccessLabel({
+      canAccessCourse: accessStatus === 'enabled',
+      paymentStatus,
+      accessStatus,
+      verificationStatus,
+    }),
+    courseVideoAccessMode: getCourseVideoAccessMode(course),
+  };
+};
 const hasReplayViewLimit = () => replayViewLimitEnabled && replayMaxViews > 0;
 const toIso = (value) => {
   if (!value) {
@@ -345,6 +582,13 @@ const invalidateGlobalPlatformCaches = () => {
   ]);
 };
 
+const invalidateAllPlatformCachesForUser = (userId) => {
+  invalidateGlobalPlatformCaches();
+  if (userId) {
+    invalidateUserPlatformCaches(userId);
+  }
+};
+
 const invalidateUserPlatformCaches = (userId) => {
   if (!userId) {
     return;
@@ -354,6 +598,7 @@ const invalidateUserPlatformCaches = (userId) => {
     cacheKey('enrollments', `active:${userId}`),
     cacheKey('analytics', `user:${userId}`),
     cacheKey('notifications', `user:${userId}`),
+    cacheKey('notifications-count', `user:${userId}`),
     cacheKey('progress', String(userId)),
     cacheKey('user-session', String(userId)),
   ]);
@@ -630,6 +875,125 @@ const ensureDefaultAdminUser = async () => {
 const getModuleLessons = (module) => Array.isArray(module?.lessons) ? module.lessons : [];
 const getModuleChapters = (module) => Array.isArray(module?.chapters) ? module.chapters : [];
 const getChapterLessons = (chapter) => Array.isArray(chapter?.lessons) ? chapter.lessons : [];
+const ACCESS_SCOPE_ORDER = {
+  course: 1,
+  chapter: 2,
+  lesson: 3,
+};
+const ACCESS_BLOCK_MESSAGE = 'This content is locked by the admin.';
+const normalizeStudentScope = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized === 'student' ? 'student' : 'all_students';
+};
+const normalizeContentScope = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  return ['course', 'chapter', 'lesson'].includes(normalized) ? normalized : 'course';
+};
+const normalizeAccessMode = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized === 'allow' ? 'allow' : 'block';
+};
+const normalizeCourseContentAccessRuleRecord = (payload = {}) => ({
+  _id: String(payload._id || payload.id || createId('content_rule')),
+  courseId: String(payload.courseId || payload.course_id || ''),
+  studentScope: normalizeStudentScope(payload.studentScope || payload.student_scope),
+  studentId: payload.studentId || payload.student_id ? String(payload.studentId || payload.student_id) : null,
+  contentScope: normalizeContentScope(payload.contentScope || payload.content_scope),
+  moduleId: payload.moduleId || payload.module_id ? String(payload.moduleId || payload.module_id) : null,
+  chapterId: payload.chapterId || payload.chapter_id ? String(payload.chapterId || payload.chapter_id) : null,
+  lessonId: payload.lessonId || payload.lesson_id ? String(payload.lessonId || payload.lesson_id) : null,
+  access: normalizeAccessMode(payload.access),
+  adminNote: payload.adminNote || payload.admin_note ? String(payload.adminNote || payload.admin_note) : null,
+  createdBy: payload.createdBy || payload.created_by ? String(payload.createdBy || payload.created_by) : null,
+  updatedBy: payload.updatedBy || payload.updated_by ? String(payload.updatedBy || payload.updated_by) : null,
+  createdAt: payload.createdAt || payload.created_at || nowIso(),
+  updatedAt: payload.updatedAt || payload.updated_at || nowIso(),
+});
+const normalizeStudentLessonWatchOverrideRecord = (payload = {}) => ({
+  _id: String(payload._id || payload.id || createId('watch_override')),
+  courseId: String(payload.courseId || payload.course_id || ''),
+  studentId: String(payload.studentId || payload.student_id || ''),
+  moduleId: String(payload.moduleId || payload.module_id || ''),
+  chapterId: payload.chapterId || payload.chapter_id ? String(payload.chapterId || payload.chapter_id) : null,
+  lessonId: String(payload.lessonId || payload.lesson_id || ''),
+  allowedFullWatches: Math.max(1, Math.floor(Number(payload.allowedFullWatches ?? payload.allowed_full_watches ?? 1))),
+  watchCompletionPercent: payload.watchCompletionPercent === null || payload.watch_completion_percent === null
+    ? null
+    : Math.min(Math.max(Math.floor(Number(payload.watchCompletionPercent ?? payload.watch_completion_percent ?? appConfig.videoWatchCompletionThresholdPercent ?? 90)), 50), 100),
+  adminNote: payload.adminNote || payload.admin_note ? String(payload.adminNote || payload.admin_note) : null,
+  createdBy: payload.createdBy || payload.created_by ? String(payload.createdBy || payload.created_by) : null,
+  updatedBy: payload.updatedBy || payload.updated_by ? String(payload.updatedBy || payload.updated_by) : null,
+  createdAt: payload.createdAt || payload.created_at || nowIso(),
+  updatedAt: payload.updatedAt || payload.updated_at || nowIso(),
+});
+const findLessonContextInCourse = (course, lessonId) => {
+  for (const module of course?.modules || []) {
+    for (const lesson of getModuleLessons(module)) {
+      if (lesson.id === String(lessonId)) {
+        return {
+          moduleId: module.id,
+          moduleTitle: module.title,
+          chapterId: null,
+          chapterTitle: null,
+          lesson,
+        };
+      }
+    }
+    for (const chapter of getModuleChapters(module)) {
+      for (const lesson of getChapterLessons(chapter)) {
+        if (lesson.id === String(lessonId)) {
+          return {
+            moduleId: module.id,
+            moduleTitle: module.title,
+            chapterId: chapter.id,
+            chapterTitle: chapter.title,
+            lesson,
+          };
+        }
+      }
+    }
+  }
+  return null;
+};
+const matchesCourseContentRule = (rule, target = {}) => {
+  if (rule.contentScope === 'course') {
+    return true;
+  }
+  if (rule.contentScope === 'chapter') {
+    return Boolean(target.chapterId) && String(rule.chapterId || '') === String(target.chapterId || '');
+  }
+  if (rule.contentScope === 'lesson') {
+    return Boolean(target.lessonId) && String(rule.lessonId || '') === String(target.lessonId || '');
+  }
+  return false;
+};
+const getAccessRuleReason = (rule) => rule?.adminNote || ACCESS_BLOCK_MESSAGE;
+const summarizeMatchingAccessRules = (rules = []) => {
+  const matching = [...rules].sort((left, right) => {
+    const specificityDelta = (ACCESS_SCOPE_ORDER[right.contentScope] || 0) - (ACCESS_SCOPE_ORDER[left.contentScope] || 0);
+    if (specificityDelta !== 0) {
+      return specificityDelta;
+    }
+    return String(right.updatedAt || '').localeCompare(String(left.updatedAt || ''));
+  });
+  const allowRule = matching.find((rule) => rule.access === 'allow') || null;
+  const blockRule = matching.find((rule) => rule.access === 'block') || null;
+  return {
+    matching,
+    allowRule,
+    blockRule,
+    blocked: !allowRule && Boolean(blockRule),
+    reason: !allowRule && blockRule ? getAccessRuleReason(blockRule) : null,
+  };
+};
+const createCourseAccessEvaluator = ({ course, rules = [] } = {}) => {
+  const normalizedRules = (Array.isArray(rules) ? rules : [])
+    .map((entry) => normalizeCourseContentAccessRuleRecord(entry))
+    .filter((entry) => entry.courseId === String(course?._id || ''));
+  return (target = {}) => summarizeMatchingAccessRules(
+    normalizedRules.filter((rule) => matchesCourseContentRule(rule, target)),
+  );
+};
 
 const lessonListFromCourse = (course) =>
   (course.modules || []).flatMap((module) => ([
@@ -701,8 +1065,31 @@ const shouldRequireSequentialUnlockForLesson = (lesson, enforceSequentialUnlock 
     && shouldRequireEnrollmentForLesson(lesson, enforceEnrollment),
   );
 
-const sanitizeLessonForViewer = (lesson, hasFullAccess) => {
-  const isLocked = Boolean(lesson.premium) && !hasFullAccess;
+const normalizeCourseVideoAccessMode = (value, fallback = appConfig.courseVideoAccessMode) => {
+  const normalized = String(value || fallback || 'free_order').trim().toLowerCase();
+  return normalized === 'sequential' ? 'sequential' : 'free_order';
+};
+
+const getCourseVideoAccessMode = (course) => normalizeCourseVideoAccessMode(
+  course?.courseVideoAccessMode
+  || course?.videoAccessMode
+  || course?.settings?.courseVideoAccessMode
+  || appConfig.courseVideoAccessMode,
+);
+
+const shouldRequireSequentialUnlockForCourseLesson = ({
+  course,
+  lesson,
+  enforceSequentialUnlock = true,
+  enforceEnrollment = true,
+}) => (
+  shouldRequireSequentialUnlockForLesson(lesson, enforceSequentialUnlock, enforceEnrollment)
+  && getCourseVideoAccessMode(course) === 'sequential'
+);
+
+const sanitizeLessonForViewer = (lesson, hasFullAccess, options = {}) => {
+  const accessDecision = options.accessDecision || { blocked: false, reason: null };
+  const isLocked = (Boolean(lesson.premium) && !hasFullAccess) || Boolean(accessDecision.blocked);
   const isProtectedYoutube = lesson.type === 'youtube';
   const isPrivateVideo = lesson.type === 'private-video';
 
@@ -715,8 +1102,71 @@ const sanitizeLessonForViewer = (lesson, hasFullAccess) => {
     hlsManifestPath: undefined,
     hlsPlaybackPath: undefined,
     locked: isLocked,
+    accessBlockReason: accessDecision.blocked ? accessDecision.reason : null,
     requiresSecurePlayback: isProtectedYoutube || isPrivateVideo,
   };
+};
+
+const sanitizePdfAttachmentForViewer = (attachment, options = {}) => ({
+  id: attachment.id,
+  title: attachment.title,
+  fileName: attachment.fileName || null,
+  mimeType: attachment.mimeType || 'application/pdf',
+  fileSize: Number(attachment.fileSize || 0) || 0,
+  premium: Boolean(attachment.premium),
+  scope: attachment.scope || 'module',
+  locked: Boolean(options.blocked),
+  accessBlockReason: options.blocked ? options.reason || ACCESS_BLOCK_MESSAGE : null,
+  uploadedAt: attachment.uploadedAt || null,
+  uploadedBy: attachment.uploadedBy || null,
+});
+
+const sanitizePdfAttachmentsForViewer = (attachments, hasFullAccess, options = {}) =>
+  (Array.isArray(attachments) ? attachments : []).map((attachment) => {
+    const premiumLocked = Boolean(attachment?.premium) && !hasFullAccess;
+    const accessDecision = options.evaluateAttachmentAccess
+      ? options.evaluateAttachmentAccess(attachment)
+      : { blocked: false, reason: null };
+    return sanitizePdfAttachmentForViewer(attachment, {
+      blocked: premiumLocked || Boolean(accessDecision?.blocked),
+      reason: accessDecision?.blocked ? accessDecision.reason : null,
+    });
+  });
+
+const sanitizeEditorialVideoForViewer = (editorial, hasFullAccess, isAdmin = false) => ({
+  id: editorial.id,
+  title: editorial.title,
+  description: editorial.description || '',
+  weekLabel: editorial.weekLabel || null,
+  editorialDate: editorial.editorialDate || null,
+  durationMinutes: Number(editorial.durationMinutes || 0),
+  published: Boolean(editorial.published),
+  uploadedAt: editorial.uploadedAt || null,
+  uploadedBy: editorial.uploadedBy || null,
+  playbackReady: Boolean(editorial.storagePath),
+  hlsProcessingStatus: editorial.hlsProcessingStatus || 'ready',
+  watchLimit: 1,
+  watchCompletionPercent: Number(editorial.watchCompletionPercent || appConfig.videoWatchCompletionThresholdPercent || 90),
+  locked: !hasFullAccess && !isAdmin,
+});
+
+const sanitizeEditorialVideosForViewer = (editorials, hasFullAccess, isAdmin = false) =>
+  (Array.isArray(editorials) ? editorials : [])
+    .filter((editorial) => isAdmin || Boolean(editorial?.published))
+    .map((editorial) => sanitizeEditorialVideoForViewer(editorial, hasFullAccess, isAdmin));
+
+const getLessonReleaseStatus = (lesson) => {
+  const releaseAt = lesson?.releaseAt || lesson?.availableAt || lesson?.publishedAt || null;
+  if (!releaseAt) {
+    return 'released';
+  }
+
+  const releaseTimestamp = Date.parse(releaseAt);
+  if (Number.isFinite(releaseTimestamp) && releaseTimestamp > Date.now()) {
+    return 'unreleased';
+  }
+
+  return 'released';
 };
 
 const isCloudflareStreamUrl = (value) => {
@@ -765,6 +1215,9 @@ const isPrivateLessonStreamReady = (lesson) => {
 
   const provider = getPrivateLessonPlaybackProvider(lesson);
   const status = String(lesson.hlsProcessingStatus || '').toLowerCase();
+  const sourceReady = Boolean(lesson.storagePath);
+  const sourceFallbackAllowed = Boolean(lesson.sourceFallbackAllowed ?? appConfig.sourcePlaybackFallbackEnabled)
+    || ['queued', 'processing', 'failed'].includes(status);
   if (provider === 'cloudflare-stream') {
     return Boolean(
       lesson.playbackReady !== false
@@ -774,10 +1227,13 @@ const isPrivateLessonStreamReady = (lesson) => {
   }
 
   if (lesson.deliveryStrategy === 'hls') {
-    return Boolean(status === 'ready' && lesson.hlsPlaybackPath);
+    return Boolean(
+      (status === 'ready' && lesson.hlsPlaybackPath)
+      || (sourceReady && sourceFallbackAllowed),
+    );
   }
 
-  return Boolean(lesson.videoUrl || lesson.storagePath);
+  return Boolean(lesson.videoUrl || sourceReady);
 };
 
 const filterLessonsForViewer = (lessons, isAdmin) =>
@@ -949,22 +1405,42 @@ const updateLessonInModules = (modules, lessonId, updater) => {
 
 const redactCourseForViewer = (course, hasFullAccess, options = {}) => {
   const isAdmin = Boolean(options.isAdmin);
+  const evaluateAccess = options.evaluateAccess || (() => ({ blocked: false, reason: null }));
   return {
   ...clone(course),
   modules: (course.modules || []).map((module) => ({
     ...clone(module),
+    attachments: sanitizePdfAttachmentsForViewer(module.attachments, hasFullAccess, {
+      evaluateAttachmentAccess: () => evaluateAccess({ moduleId: module.id }),
+    }),
     lessons: filterLessonsForViewer(getModuleLessons(module), isAdmin).map((lesson) => ({
-      ...sanitizeLessonForViewer(lesson, hasFullAccess),
+      ...sanitizeLessonForViewer(lesson, hasFullAccess, {
+        accessDecision: evaluateAccess({ moduleId: module.id, lessonId: lesson.id }),
+      }),
       notesUrl: Boolean(lesson.premium) && !hasFullAccess ? null : lesson.notesUrl,
+      attachments: sanitizePdfAttachmentsForViewer(lesson.attachments, hasFullAccess, {
+        evaluateAttachmentAccess: () => evaluateAccess({ moduleId: module.id, lessonId: lesson.id }),
+      }),
     })),
     chapters: getModuleChapters(module).map((chapter) => ({
       ...clone(chapter),
+      locked: Boolean(evaluateAccess({ moduleId: module.id, chapterId: chapter.id }).blocked),
+      accessBlockReason: evaluateAccess({ moduleId: module.id, chapterId: chapter.id }).reason,
+      attachments: sanitizePdfAttachmentsForViewer(chapter.attachments, hasFullAccess, {
+        evaluateAttachmentAccess: () => evaluateAccess({ moduleId: module.id, chapterId: chapter.id }),
+      }),
       lessons: filterLessonsForViewer(getChapterLessons(chapter), isAdmin).map((lesson) => ({
-        ...sanitizeLessonForViewer(lesson, hasFullAccess),
+        ...sanitizeLessonForViewer(lesson, hasFullAccess, {
+          accessDecision: evaluateAccess({ moduleId: module.id, chapterId: chapter.id, lessonId: lesson.id }),
+        }),
         notesUrl: Boolean(lesson.premium) && !hasFullAccess ? null : lesson.notesUrl,
+        attachments: sanitizePdfAttachmentsForViewer(lesson.attachments, hasFullAccess, {
+          evaluateAttachmentAccess: () => evaluateAccess({ moduleId: module.id, chapterId: chapter.id, lessonId: lesson.id }),
+        }),
       })),
     })),
   })),
+  editorials: sanitizeEditorialVideosForViewer(course.editorials, hasFullAccess, isAdmin),
   };
 };
 
@@ -1030,16 +1506,10 @@ const canAccessLinkedTestWithCourseIds = (test, enrolledCourseIds, userRole = 'g
 };
 
 const assertLinkedCourseForMockTest = async (payload) => {
-  const normalizedType = String(payload?.type || '').toLowerCase();
   const linkedCourseId = String(payload?.course || '').trim();
-  const requiresLinkedCourse = normalizedType.includes('full') || normalizedType.includes('mock');
-
-  if (!requiresLinkedCourse) {
-    return;
-  }
 
   if (!linkedCourseId) {
-    throw new ApiError(400, 'Full mock tests must be linked to a course.', {
+    throw new ApiError(400, 'Mock tests must be linked to a course.', {
       code: 'TEST_COURSE_REQUIRED',
     });
   }
@@ -1610,6 +2080,45 @@ const buildAnalyticsTrend = (data, userId) => {
   return [...testPoints, ...quizPoints];
 };
 
+const buildUserAnalyticsFromData = (data, userId) => {
+  const quizInsights = computeQuizInsights(data, userId);
+  const testInsights = computeTestInsights(data, userId);
+  const seriesPerformance = buildTestSeriesPerformance(data, userId);
+  const weakTopics = new Set(
+    seriesPerformance.length > 0
+      ? seriesPerformance.flatMap((series) => series.focusConcepts.map((concept) => concept.topic)).slice(0, 8)
+      : (testInsights.latestAttempt?.weakTopics || []),
+  );
+  const strongTopics = new Set(
+    seriesPerformance.length > 0
+      ? seriesPerformance.flatMap((series) => series.healthyConcepts.map((concept) => concept.topic)).slice(0, 8)
+      : (testInsights.latestAttempt?.strongTopics || []),
+  );
+
+  const accuracyValues = [quizInsights.accuracy, testInsights.accuracy].filter((value) => value > 0);
+  const accuracy = accuracyValues.length === 0
+    ? 0
+    : Number((accuracyValues.reduce((sum, value) => sum + value, 0) / accuracyValues.length).toFixed(2));
+
+  const speed = testInsights.attempts.length === 0
+    ? quizInsights.attempts === 0 ? 0 : 1.1
+    : Number((testInsights.attempts.length / Math.max(testInsights.attempts.length, 1)).toFixed(2));
+
+  const attempts = quizInsights.attempts + testInsights.attempts.length;
+
+  return {
+    accuracy,
+    speed,
+    attempts,
+    weakTopics: Array.from(weakTopics),
+    strongTopics: Array.from(strongTopics),
+    suggestions: [buildAiRecommendation({ accuracy, weakTopics: Array.from(weakTopics), attempts })].filter(Boolean),
+    trend: buildAnalyticsTrend(data, userId),
+    adaptivePlan: computeAdaptivePlan({ accuracy, attempts }),
+    seriesPerformance,
+  };
+};
+
 const buildAiRecommendation = (analytics) => {
   const weakTopic = (analytics.weakTopics || [])[0];
   if (weakTopic) {
@@ -1650,12 +2159,17 @@ const mapUserRow = (row) => {
     mobileNumber: row.mobile_number || null,
     password: row.password_hash,
     role: row.role,
+    accountStatus: row.account_status || 'active',
+    statusNote: row.status_note || null,
     device: row.device || null,
     session: row.active_session_id || null,
     streak: Number(row.streak_days || 0),
     points: Number(row.reward_points || 0),
     badges: asArray(row.badges),
     referral_code: row.referral_code || null,
+    lastLoginAt: toIso(row.last_login_at) || null,
+    disabledAt: toIso(row.disabled_at) || null,
+    blockedAt: toIso(row.blocked_at) || null,
     created_at: toIso(row.created_at) || nowIso(),
     updated_at: toIso(row.updated_at) || nowIso(),
   };
@@ -1680,6 +2194,7 @@ const mapCourseRow = (row) => {
     thumbnailUrl: row.thumbnail_url || null,
     instructor: row.instructor_name || 'VARONENGLISH Faculty',
     officialChannelUrl: row.official_channel_url || null,
+    editorials: asArray(row.editorials),
     modules: asArray(row.modules),
     createdBy: row.created_by || null,
     created_at: toIso(row.created_at) || nowIso(),
@@ -1839,6 +2354,8 @@ const mapNotificationRow = (row) => ({
   actionUrl: row.action_url || null,
   actionLabel: row.action_label || null,
   payload: asObject(row.payload),
+  isRead: Boolean(row.is_read),
+  readAt: toIso(row.read_at) || null,
   createdAt: toIso(row.created_at) || nowIso(),
 });
 
@@ -1856,9 +2373,45 @@ const mapEnrollmentRow = (row) => ({
   courseId: row.course_id,
   accessType: row.access_type || 'course',
   source: row.source || 'payment',
+  accessStatus: row.access_status || 'enabled',
+  adminNote: row.admin_note || null,
   enrolledAt: toIso(row.enrolled_at) || nowIso(),
   expiresAt: toIso(row.expires_at),
   viewCount: Number(row.view_count || 0),
+  updatedAt: toIso(row.updated_at) || nowIso(),
+});
+
+const mapCourseContentAccessRuleRow = (row) => normalizeCourseContentAccessRuleRecord({
+  _id: row.id,
+  courseId: row.course_id,
+  studentScope: row.student_scope,
+  studentId: row.student_id,
+  contentScope: row.content_scope,
+  moduleId: row.module_id,
+  chapterId: row.chapter_id,
+  lessonId: row.lesson_id,
+  access: row.access,
+  adminNote: row.admin_note,
+  createdBy: row.created_by,
+  updatedBy: row.updated_by,
+  createdAt: toIso(row.created_at) || nowIso(),
+  updatedAt: toIso(row.updated_at) || nowIso(),
+});
+
+const mapStudentLessonWatchOverrideRow = (row) => normalizeStudentLessonWatchOverrideRecord({
+  _id: row.id,
+  courseId: row.course_id,
+  studentId: row.student_id,
+  moduleId: row.module_id,
+  chapterId: row.chapter_id,
+  lessonId: row.lesson_id,
+  allowedFullWatches: row.allowed_full_watches,
+  watchCompletionPercent: row.watch_completion_percent,
+  adminNote: row.admin_note,
+  createdBy: row.created_by,
+  updatedBy: row.updated_by,
+  createdAt: toIso(row.created_at) || nowIso(),
+  updatedAt: toIso(row.updated_at) || nowIso(),
 });
 
 const mapVideoAccessGrantRow = (row) => ({
@@ -1913,6 +2466,75 @@ const mapWatchHistoryRow = (row) => ({
   lastWatchedAt: toIso(row.last_watched_at) || toIso(row.updated_at) || nowIso(),
   updatedAt: toIso(row.updated_at) || nowIso(),
 });
+
+const mapVideoWatchStateRow = (row) => normalizeVideoWatchState({
+  _id: row.id,
+  userId: row.user_id,
+  courseId: row.course_id,
+  lessonId: row.lesson_id || null,
+  videoId: row.video_id,
+  videoType: row.video_type || COURSE_VIDEO_TYPE,
+  videoDurationSeconds: Number(row.video_duration_seconds || 0),
+  allowedFullWatches: Number(row.allowed_full_watches || 0),
+  completedFullWatches: Number(row.completed_full_watches || 0),
+  fullWatchThresholdPercentage: toNumber(row.full_watch_threshold_percentage),
+  watchedSegments: asArray(row.watched_segments),
+  currentCycleUniqueWatchedSeconds: toNumber(row.current_cycle_unique_watched_seconds),
+  totalUniqueWatchedSeconds: toNumber(row.total_unique_watched_seconds),
+  repeatWatchedSeconds: toNumber(row.repeat_watched_seconds),
+  revisionBufferSeconds: toNumber(row.revision_buffer_seconds),
+  revisionBufferUsedSeconds: toNumber(row.revision_buffer_used_seconds),
+  stableEndWindowWatchedSeconds: toNumber(row.stable_end_window_watched_seconds),
+  completionProofSatisfiedAt: toIso(row.completion_proof_satisfied_at) || null,
+  lastPositionSeconds: toNumber(row.last_position_seconds),
+  playbackSessionId: row.playback_session_id || null,
+  activeSessionStatus: row.active_session_status || 'idle',
+  deviceId: row.device_id || null,
+  ipAddress: row.ip_address || null,
+  userAgent: row.user_agent || null,
+  lastHeartbeatAt: toIso(row.last_heartbeat_at) || null,
+  isLocked: Boolean(row.is_locked),
+  lockedAt: toIso(row.locked_at) || null,
+  createdAt: toIso(row.created_at) || nowIso(),
+  updatedAt: toIso(row.updated_at) || nowIso(),
+}, {
+  chunkSeconds: videoWatchChunkSeconds,
+});
+
+const resolveProtectedLessonResumeSeconds = ({
+  watchState = null,
+  lessonProgress = null,
+  durationSeconds = 0,
+}) => {
+  const safeDurationSeconds = Math.max(
+    Number(watchState?.videoDurationSeconds || 0),
+    Number(durationSeconds || 0),
+    Number(lessonProgress?.progressSeconds || 0),
+    0,
+  );
+  const clampResume = (value) => {
+    const safeValue = Math.max(Number(value || 0), 0);
+    if (safeDurationSeconds <= 0) {
+      return safeValue;
+    }
+    return Math.min(safeValue, safeDurationSeconds);
+  };
+
+  if (watchState) {
+    const replayState = deriveProtectedReplayState(watchState);
+    if (replayState === 'resume_current_cycle' || replayState === 'grace_cycle') {
+      return clampResume(watchState.lastPositionSeconds);
+    }
+
+    return 0;
+  }
+
+  if (Number(lessonProgress?.videoWatchCount || 0) > 0) {
+    return 0;
+  }
+
+  return clampResume(lessonProgress?.progressSeconds || 0);
+};
 
 const mapPaymentRow = (row) => ({
   _id: row.id,
@@ -2003,12 +2625,17 @@ const upsertPgUser = async (payload, client = null) => {
     mobileNumber: payload.mobileNumber || null,
     password: payload.password,
     role: payload.role || 'student',
+    accountStatus: payload.accountStatus || 'active',
+    statusNote: payload.statusNote || null,
     device: payload.device || null,
     session: payload.session || null,
     streak: payload.streak ?? 0,
     points: payload.points ?? 0,
     badges: asArray(payload.badges),
     referral_code: payload.referral_code || null,
+    lastLoginAt: payload.lastLoginAt || null,
+    disabledAt: payload.disabledAt || null,
+    blockedAt: payload.blockedAt || null,
     created_at: payload.created_at || nowIso(),
     updated_at: payload.updated_at || nowIso(),
   };
@@ -2016,21 +2643,27 @@ const upsertPgUser = async (payload, client = null) => {
   await pgExec(
     `
       INSERT INTO users (
-        id, full_name, email, mobile_number, password_hash, role, device, active_session_id,
-        streak_days, reward_points, badges, referral_code, created_at, updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11::jsonb, $12, $13, $14)
+        id, full_name, email, mobile_number, password_hash, role, account_status, status_note,
+        device, active_session_id, streak_days, reward_points, badges, referral_code,
+        last_login_at, disabled_at, blocked_at, created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13::jsonb, $14, $15, $16, $17, $18, $19)
       ON CONFLICT (id) DO UPDATE SET
         full_name = EXCLUDED.full_name,
         email = EXCLUDED.email,
         mobile_number = EXCLUDED.mobile_number,
         password_hash = EXCLUDED.password_hash,
         role = EXCLUDED.role,
+        account_status = EXCLUDED.account_status,
+        status_note = EXCLUDED.status_note,
         device = EXCLUDED.device,
         active_session_id = EXCLUDED.active_session_id,
         streak_days = EXCLUDED.streak_days,
         reward_points = EXCLUDED.reward_points,
         badges = EXCLUDED.badges,
         referral_code = EXCLUDED.referral_code,
+        last_login_at = EXCLUDED.last_login_at,
+        disabled_at = EXCLUDED.disabled_at,
+        blocked_at = EXCLUDED.blocked_at,
         updated_at = EXCLUDED.updated_at
     `,
     [
@@ -2040,12 +2673,17 @@ const upsertPgUser = async (payload, client = null) => {
       user.mobileNumber,
       user.password,
       user.role,
+      user.accountStatus,
+      user.statusNote,
       JSON.stringify(user.device),
       user.session,
       Number(user.streak || 0),
       Number(user.points || 0),
       JSON.stringify(user.badges || []),
       user.referral_code,
+      user.lastLoginAt,
+      user.disabledAt,
+      user.blockedAt,
       user.created_at,
       user.updated_at,
     ],
@@ -2070,6 +2708,7 @@ const upsertPgCourse = async (payload, client = null) => {
     thumbnailUrl: payload.thumbnailUrl || null,
     instructor: payload.instructor || 'VARONENGLISH Faculty',
     officialChannelUrl: payload.officialChannelUrl || null,
+    editorials: asArray(payload.editorials),
     modules: asArray(payload.modules),
     createdBy: payload.createdBy || null,
     created_at: payload.created_at || nowIso(),
@@ -2080,8 +2719,8 @@ const upsertPgCourse = async (payload, client = null) => {
       INSERT INTO courses (
         id, title, description, category, exam, subject, level, price_inr, offer_percentage,
         validity_days, thumbnail_url, instructor_name, official_channel_url,
-        modules, created_by, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15, $16)
+        editorials, modules, created_by, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb, $15::jsonb, $16, $17)
       ON CONFLICT (id) DO UPDATE SET
         title = EXCLUDED.title,
         description = EXCLUDED.description,
@@ -2095,6 +2734,7 @@ const upsertPgCourse = async (payload, client = null) => {
         thumbnail_url = EXCLUDED.thumbnail_url,
         instructor_name = EXCLUDED.instructor_name,
         official_channel_url = EXCLUDED.official_channel_url,
+        editorials = EXCLUDED.editorials,
         modules = EXCLUDED.modules,
         created_by = EXCLUDED.created_by
     `,
@@ -2112,6 +2752,7 @@ const upsertPgCourse = async (payload, client = null) => {
       course.thumbnailUrl,
       course.instructor,
       course.officialChannelUrl,
+      JSON.stringify(course.editorials || []),
       JSON.stringify(course.modules || []),
       course.createdBy,
       course.created_at,
@@ -2248,15 +2889,17 @@ const insertPgNotification = async (payload, client = null) => {
     actionUrl: payload.actionUrl || null,
     actionLabel: payload.actionLabel || null,
     payload: asObject(payload.payload),
+    isRead: Boolean(payload.isRead),
+    readAt: payload.readAt || null,
     createdAt: payload.createdAt || nowIso(),
   };
 
   await pgExec(
     `
       INSERT INTO notifications (
-        id, user_id, title, message, notification_type, entity_id, action_url, action_label, payload, created_at
+        id, user_id, title, message, notification_type, entity_id, action_url, action_label, payload, is_read, read_at, created_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12)
       ON CONFLICT (id) DO UPDATE SET
         title = EXCLUDED.title,
         message = EXCLUDED.message,
@@ -2264,7 +2907,9 @@ const insertPgNotification = async (payload, client = null) => {
         entity_id = EXCLUDED.entity_id,
         action_url = EXCLUDED.action_url,
         action_label = EXCLUDED.action_label,
-        payload = EXCLUDED.payload
+        payload = EXCLUDED.payload,
+        is_read = EXCLUDED.is_read,
+        read_at = EXCLUDED.read_at
     `,
     [
       notification._id,
@@ -2276,6 +2921,8 @@ const insertPgNotification = async (payload, client = null) => {
       notification.actionUrl,
       notification.actionLabel,
       JSON.stringify(notification.payload),
+      notification.isRead,
+      notification.readAt,
       notification.createdAt,
     ],
     client,
@@ -2291,21 +2938,27 @@ const insertPgEnrollment = async (payload, client = null) => {
     courseId: String(payload.courseId),
     accessType: payload.accessType || 'course',
     source: payload.source || 'payment',
+    accessStatus: payload.accessStatus || 'enabled',
+    adminNote: payload.adminNote || null,
     enrolledAt: payload.enrolledAt || nowIso(),
     expiresAt: payload.expiresAt || addDaysIso(payload.validityDays),
     viewCount: Number(payload.viewCount || 0),
+    updatedAt: payload.updatedAt || nowIso(),
   };
 
   const saved = await pgOne(
     `
-      INSERT INTO enrollments (id, user_id, course_id, access_type, source, enrolled_at, expires_at, view_count)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      INSERT INTO enrollments (id, user_id, course_id, access_type, source, access_status, admin_note, enrolled_at, expires_at, view_count, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
       ON CONFLICT (user_id, course_id) DO UPDATE SET
         access_type = EXCLUDED.access_type,
         source = EXCLUDED.source,
+        access_status = EXCLUDED.access_status,
+        admin_note = EXCLUDED.admin_note,
         enrolled_at = enrollments.enrolled_at,
         expires_at = EXCLUDED.expires_at,
-        view_count = enrollments.view_count
+        view_count = enrollments.view_count,
+        updated_at = EXCLUDED.updated_at
       RETURNING *
     `,
     [
@@ -2314,9 +2967,12 @@ const insertPgEnrollment = async (payload, client = null) => {
       enrollment.courseId,
       enrollment.accessType,
       enrollment.source,
+      enrollment.accessStatus,
+      enrollment.adminNote,
       enrollment.enrolledAt,
       enrollment.expiresAt,
       enrollment.viewCount,
+      enrollment.updatedAt,
     ],
     mapEnrollmentRow,
     client,
@@ -2865,23 +3521,21 @@ const consumeReplayGrant = async ({
   }
 
   const requireEnrollment = shouldRequireEnrollmentForLesson(lesson, enforceEnrollment);
-  const requireSequentialUnlock = shouldRequireSequentialUnlockForLesson(lesson, enforceSequentialUnlock, enforceEnrollment);
+  const requireSequentialUnlock = shouldRequireSequentialUnlockForCourseLesson({
+    course,
+    lesson,
+    enforceSequentialUnlock,
+    enforceEnrollment,
+  });
 
   if (requireEnrollment && !isAdmin) {
-    if (isPostgresMode()) {
-      enrollment = await pgOne(
-        `SELECT * FROM enrollments WHERE user_id = $1 AND course_id = $2 AND ${activeEnrollmentSql}`,
-        [String(userId), String(courseId)],
-        mapEnrollmentRow,
-      );
-    } else {
-      enrollment = state.enrollments.find(
-        (entry) => entry.userId === String(userId) && entry.courseId === String(courseId) && isEnrollmentActive(entry),
-      ) || null;
+    enrollment = await getEnrollmentForCourse(userId, courseId);
+    if (!enrollment) {
+      throw new ApiError(403, 'Please purchase course to watch.', { code: 'COURSE_ACCESS_REQUIRED' });
     }
 
-    if (!enrollment) {
-      throw new ApiError(403, 'Course enrollment is required to access this lesson', { code: 'COURSE_ACCESS_REQUIRED' });
+    if (!isEnrollmentActive(enrollment)) {
+      throw new ApiError(403, 'Course validity expired.', { code: 'COURSE_VALIDITY_EXPIRED' });
     }
   }
 
@@ -3032,6 +3686,124 @@ const upsertPgWatchHistory = async (payload, client = null) => {
     client,
   );
   return saved || record;
+};
+
+const upsertPgVideoWatchState = async (payload, client = null) => {
+  const stateRecord = normalizeVideoWatchState({
+    _id: payload._id || createPersistentId('video_watch_state'),
+    userId: payload.userId,
+    courseId: payload.courseId,
+    lessonId: payload.lessonId || null,
+    videoId: payload.videoId,
+    videoType: payload.videoType || COURSE_VIDEO_TYPE,
+    videoDurationSeconds: payload.videoDurationSeconds,
+    allowedFullWatches: payload.allowedFullWatches,
+    completedFullWatches: payload.completedFullWatches,
+    fullWatchThresholdPercentage: payload.fullWatchThresholdPercentage,
+    watchedSegments: payload.watchedSegments,
+    currentCycleUniqueWatchedSeconds: payload.currentCycleUniqueWatchedSeconds,
+    totalUniqueWatchedSeconds: payload.totalUniqueWatchedSeconds,
+    repeatWatchedSeconds: payload.repeatWatchedSeconds,
+    revisionBufferSeconds: payload.revisionBufferSeconds,
+    revisionBufferUsedSeconds: payload.revisionBufferUsedSeconds,
+    stableEndWindowWatchedSeconds: payload.stableEndWindowWatchedSeconds,
+    completionProofSatisfiedAt: payload.completionProofSatisfiedAt || null,
+    lastPositionSeconds: payload.lastPositionSeconds,
+    playbackSessionId: payload.playbackSessionId || null,
+    activeSessionStatus: payload.activeSessionStatus || 'idle',
+    deviceId: payload.deviceId || null,
+    ipAddress: payload.ipAddress || null,
+    userAgent: payload.userAgent || null,
+    lastHeartbeatAt: payload.lastHeartbeatAt || null,
+    isLocked: payload.isLocked,
+    lockedAt: payload.lockedAt || null,
+    createdAt: payload.createdAt || nowIso(),
+    updatedAt: payload.updatedAt || nowIso(),
+  }, {
+    chunkSeconds: videoWatchChunkSeconds,
+  });
+
+  const saved = await pgOne(
+    `
+      INSERT INTO video_watch_states (
+        id, user_id, course_id, lesson_id, video_id, video_type, video_duration_seconds,
+        allowed_full_watches, completed_full_watches, full_watch_threshold_percentage,
+        watched_segments, current_cycle_unique_watched_seconds, total_unique_watched_seconds,
+        repeat_watched_seconds, revision_buffer_seconds, revision_buffer_used_seconds,
+        stable_end_window_watched_seconds, completion_proof_satisfied_at,
+        last_position_seconds, playback_session_id, active_session_status, device_id,
+        ip_address, user_agent, last_heartbeat_at, is_locked, locked_at, created_at, updated_at
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7,
+        $8, $9, $10,
+        $11::jsonb, $12, $13,
+        $14, $15, $16,
+        COALESCE($17, 0), $18,
+        $19, $20, $21, $22,
+        $23, $24, $25, $26, $27, $28, $29
+      )
+      ON CONFLICT (user_id, course_id, video_id, video_type) DO UPDATE SET
+        lesson_id = EXCLUDED.lesson_id,
+        video_duration_seconds = EXCLUDED.video_duration_seconds,
+        allowed_full_watches = EXCLUDED.allowed_full_watches,
+        completed_full_watches = EXCLUDED.completed_full_watches,
+        full_watch_threshold_percentage = EXCLUDED.full_watch_threshold_percentage,
+        watched_segments = EXCLUDED.watched_segments,
+        current_cycle_unique_watched_seconds = EXCLUDED.current_cycle_unique_watched_seconds,
+        total_unique_watched_seconds = EXCLUDED.total_unique_watched_seconds,
+        repeat_watched_seconds = EXCLUDED.repeat_watched_seconds,
+        revision_buffer_seconds = EXCLUDED.revision_buffer_seconds,
+        revision_buffer_used_seconds = EXCLUDED.revision_buffer_used_seconds,
+        stable_end_window_watched_seconds = EXCLUDED.stable_end_window_watched_seconds,
+        completion_proof_satisfied_at = EXCLUDED.completion_proof_satisfied_at,
+        last_position_seconds = EXCLUDED.last_position_seconds,
+        playback_session_id = EXCLUDED.playback_session_id,
+        active_session_status = EXCLUDED.active_session_status,
+        device_id = EXCLUDED.device_id,
+        ip_address = EXCLUDED.ip_address,
+        user_agent = EXCLUDED.user_agent,
+        last_heartbeat_at = EXCLUDED.last_heartbeat_at,
+        is_locked = EXCLUDED.is_locked,
+        locked_at = EXCLUDED.locked_at,
+        updated_at = EXCLUDED.updated_at
+      RETURNING *
+    `,
+    [
+      stateRecord._id,
+      stateRecord.userId,
+      stateRecord.courseId,
+      stateRecord.lessonId,
+      stateRecord.videoId,
+      stateRecord.videoType,
+      stateRecord.videoDurationSeconds,
+      stateRecord.allowedFullWatches,
+      stateRecord.completedFullWatches,
+      stateRecord.fullWatchThresholdPercentage,
+      JSON.stringify(stateRecord.watchedSegments || []),
+      stateRecord.currentCycleUniqueWatchedSeconds,
+      stateRecord.totalUniqueWatchedSeconds,
+      stateRecord.repeatWatchedSeconds,
+      stateRecord.revisionBufferSeconds,
+      stateRecord.revisionBufferUsedSeconds,
+      stateRecord.stableEndWindowWatchedSeconds ?? 0,
+      stateRecord.completionProofSatisfiedAt,
+      stateRecord.lastPositionSeconds,
+      stateRecord.playbackSessionId,
+      stateRecord.activeSessionStatus,
+      stateRecord.deviceId,
+      stateRecord.ipAddress,
+      stateRecord.userAgent,
+      stateRecord.lastHeartbeatAt,
+      stateRecord.isLocked,
+      stateRecord.lockedAt,
+      stateRecord.createdAt,
+      stateRecord.updatedAt,
+    ],
+    mapVideoWatchStateRow,
+    client,
+  );
+
+  return saved || stateRecord;
 };
 
 const insertPgLiveClass = async (payload, client = null) => {
@@ -3499,6 +4271,309 @@ const insertPgWebhook = async (payload, client = null) => {
   return webhook;
 };
 
+const insertAdminAuditLogEntry = async (payload, client = null) => {
+  const entry = {
+    _id: payload._id || createPersistentId('audit'),
+    adminUserId: String(payload.adminUserId || 'system'),
+    actionType: String(payload.actionType || 'payment_reconciled'),
+    targetUserId: payload.targetUserId ? String(payload.targetUserId) : null,
+    courseId: payload.courseId ? String(payload.courseId) : null,
+    transactionId: payload.transactionId ? String(payload.transactionId) : null,
+    oldValue: asObject(payload.oldValue),
+    newValue: asObject(payload.newValue),
+    reason: payload.reason ? String(payload.reason) : null,
+    ipAddress: payload.ipAddress || null,
+    userAgent: payload.userAgent || null,
+    createdAt: payload.createdAt || nowIso(),
+  };
+
+  if (isPostgresMode()) {
+    await pgExec(
+      `
+        INSERT INTO admin_audit_logs (
+          id, admin_user_id, action_type, target_user_id, course_id, transaction_id,
+          old_value, new_value, reason, ip_address, user_agent, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10, $11, $12)
+      `,
+      [
+        entry._id,
+        entry.adminUserId,
+        entry.actionType,
+        entry.targetUserId,
+        entry.courseId,
+        entry.transactionId,
+        JSON.stringify(entry.oldValue),
+        JSON.stringify(entry.newValue),
+        entry.reason,
+        entry.ipAddress,
+        entry.userAgent,
+        entry.createdAt,
+      ],
+      client,
+    );
+    return entry;
+  }
+
+  state.adminAuditLogs.unshift({
+    _id: entry._id,
+    adminUserId: entry.adminUserId,
+    actionType: entry.actionType,
+    targetUserId: entry.targetUserId,
+    courseId: entry.courseId,
+    transactionId: entry.transactionId,
+    oldValue: clone(entry.oldValue),
+    newValue: clone(entry.newValue),
+    reason: entry.reason,
+    ipAddress: entry.ipAddress,
+    userAgent: entry.userAgent,
+    createdAt: entry.createdAt,
+  });
+  state.adminAuditLogs = state.adminAuditLogs.slice(0, 5000);
+  return entry;
+};
+
+const toUnixTimestampIso = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? new Date(parsed * 1000).toISOString() : null;
+};
+
+const mapRazorpayStatusToLocalPaymentStatus = (status) => {
+  const normalized = String(status || '').trim().toLowerCase();
+  if (normalized === 'captured') return 'paid';
+  if (normalized === 'refunded') return 'refunded';
+  if (normalized === 'failed') return 'failed';
+  if (normalized === 'authorized') return 'pending';
+  return 'pending';
+};
+
+const getRazorpayAcquirerReference = (remotePayment) => {
+  const acquirerData = asObject(remotePayment?.acquirer_data);
+  return String(
+    acquirerData.rrn
+    || acquirerData.upi_transaction_id
+    || acquirerData.reference16
+    || acquirerData.reference1
+    || '',
+  ).trim() || null;
+};
+
+const normalizeRazorpayVerificationDecision = (value) => {
+  const normalized = String(value || '').trim().toUpperCase();
+  return normalized || 'MANUAL_REVIEW_REQUIRED';
+};
+
+const isRazorpayVerificationActivated = (decision) =>
+  normalizeRazorpayVerificationDecision(decision) === 'VERIFIED_CAPTURED_ACTIVATED';
+
+const getRazorpayVerificationPresentation = (decision) => {
+  switch (normalizeRazorpayVerificationDecision(decision)) {
+    case 'VERIFIED_CAPTURED_ACTIVATED':
+      return {
+        paymentStatus: 'success',
+        label: 'Continue Learning',
+        reason: 'Payment verified and access activated.',
+        manualReviewRequired: false,
+      };
+    case 'GATEWAY_PENDING':
+      return {
+        paymentStatus: 'pending',
+        label: 'Payment Pending',
+        reason: 'Payment is still pending at Razorpay.',
+        manualReviewRequired: false,
+      };
+    case 'GATEWAY_FAILED':
+      return {
+        paymentStatus: 'failed',
+        label: 'Payment Failed',
+        reason: 'Razorpay marked this payment as failed.',
+        manualReviewRequired: false,
+      };
+    case 'REFUNDED_OR_CHARGEBACK':
+      return {
+        paymentStatus: 'refunded',
+        label: 'Contact Support',
+        reason: 'Payment was refunded, disputed, or charged back.',
+        manualReviewRequired: true,
+      };
+    case 'AMOUNT_MISMATCH':
+      return {
+        paymentStatus: 'pending',
+        label: 'Payment Under Verification',
+        reason: 'Received amount does not match the expected course amount.',
+        manualReviewRequired: true,
+      };
+    case 'ORDER_MISMATCH':
+      return {
+        paymentStatus: 'pending',
+        label: 'Payment Under Verification',
+        reason: 'Gateway payment does not belong to the expected Razorpay order.',
+        manualReviewRequired: true,
+      };
+    case 'USER_MISMATCH':
+      return {
+        paymentStatus: 'pending',
+        label: 'Contact Support',
+        reason: 'Gateway payment details do not safely match the expected student.',
+        manualReviewRequired: true,
+      };
+    case 'COURSE_MISMATCH':
+      return {
+        paymentStatus: 'pending',
+        label: 'Contact Support',
+        reason: 'Gateway payment details do not safely match the expected course.',
+        manualReviewRequired: true,
+      };
+    case 'LOCAL_TRANSACTION_NOT_FOUND':
+      return {
+        paymentStatus: 'pending',
+        label: 'Payment Under Verification',
+        reason: 'No safe local transaction could be matched to this gateway payment.',
+        manualReviewRequired: true,
+      };
+    default:
+      return {
+        paymentStatus: 'pending',
+        label: 'Payment Under Verification',
+        reason: 'Manual review is required before access can be activated.',
+        manualReviewRequired: true,
+      };
+  }
+};
+
+const selectBestRazorpayPayment = (payments, providerPaymentId = '') => {
+  const normalizedProviderPaymentId = String(providerPaymentId || '').trim();
+  const items = Array.isArray(payments) ? payments.filter(Boolean) : [];
+  if (normalizedProviderPaymentId) {
+    const exactMatch = items.find((entry) => String(entry.id || '').trim() === normalizedProviderPaymentId);
+    if (exactMatch) {
+      return exactMatch;
+    }
+  }
+
+  const captured = items
+    .filter((entry) => String(entry.status || '').toLowerCase() === 'captured')
+    .sort((left, right) => Number(right?.created_at || 0) - Number(left?.created_at || 0));
+  if (captured[0]) {
+    return captured[0];
+  }
+
+  const authorized = items
+    .filter((entry) => String(entry.status || '').toLowerCase() === 'authorized')
+    .sort((left, right) => Number(right?.created_at || 0) - Number(left?.created_at || 0));
+  if (authorized[0]) {
+    return authorized[0];
+  }
+
+  return items.sort((left, right) => Number(right?.created_at || 0) - Number(left?.created_at || 0))[0] || null;
+};
+
+const buildRazorpayPaymentMeta = ({ payment, remotePayment, previousMeta = {}, syncSource = 'system' }) => {
+  const method = String(remotePayment?.method || '').trim() || null;
+  const gatewayStatus = String(remotePayment?.status || '').trim().toLowerCase() || null;
+  const gatewayCapturedAt = toUnixTimestampIso(remotePayment?.captured_at || remotePayment?.created_at);
+  const paymentMeta = {
+    ...asObject(previousMeta),
+    gatewayStatus,
+    razorpayGatewayStatus: gatewayStatus,
+    paymentMethod: method,
+    bankRrn: getRazorpayAcquirerReference(remotePayment),
+    gatewayReference: getRazorpayAcquirerReference(remotePayment),
+    gatewayEmail: remotePayment?.email || null,
+    gatewayContact: remotePayment?.contact || null,
+    gatewayBank: remotePayment?.bank || null,
+    gatewayVpa: remotePayment?.vpa || remotePayment?.upi?.vpa || null,
+    gatewayCaptured: Boolean(remotePayment?.captured),
+    gatewayCapturedAt,
+    gatewayCreatedAt: toUnixTimestampIso(remotePayment?.created_at),
+    razorpayOrderId: String(remotePayment?.order_id || payment?.providerOrderId || '').trim() || null,
+    razorpayPaymentId: String(remotePayment?.id || payment?.providerPaymentId || '').trim() || null,
+    razorpaySignature: payment?.providerSignature || previousMeta?.razorpaySignature || null,
+    gatewayWebhookReceivedAt: previousMeta?.gatewayWebhookReceivedAt || null,
+    syncedFrom: syncSource,
+    syncCheckedAt: nowIso(),
+  };
+
+  if (payment?.courseId) {
+    paymentMeta.courseId = payment.courseId;
+  }
+  if (payment?.userId) {
+    paymentMeta.userId = payment.userId;
+  }
+
+  return paymentMeta;
+};
+
+const buildRazorpayVerificationMeta = ({
+  payment,
+  course = null,
+  user = null,
+  remoteOrder = null,
+  remotePayment = null,
+  previousMeta = {},
+  syncSource = 'system',
+  verificationDecision = 'MANUAL_REVIEW_REQUIRED',
+  verificationReason = '',
+  verificationNotes = [],
+  callbackSignatureVerified = false,
+  webhookSignatureVerified = false,
+}) => {
+  const normalizedDecision = normalizeRazorpayVerificationDecision(verificationDecision);
+  const expectedAmountPaise = course ? getCoursePayableAmountPaise(course) : Number(previousMeta.expectedAmountPaise || 0);
+  const receivedAmountPaise = Number(remotePayment?.amount || 0) || Number(previousMeta.receivedAmountPaise || 0);
+  const currency = String(remotePayment?.currency || remoteOrder?.currency || payment?.currency || previousMeta.currency || 'INR').trim().toUpperCase() || 'INR';
+  const remoteOrderNotes = asObject(remoteOrder?.notes);
+  const remotePaymentNotes = asObject(remotePayment?.notes);
+  const presentation = getRazorpayVerificationPresentation(normalizedDecision);
+
+  return {
+    ...buildRazorpayPaymentMeta({
+      payment,
+      remotePayment: remotePayment || {
+        id: payment?.providerPaymentId || null,
+        order_id: payment?.providerOrderId || null,
+        status: previousMeta.gatewayStatus || null,
+      },
+      previousMeta,
+      syncSource,
+    }),
+    verificationStatus: normalizedDecision,
+    verificationDecision: normalizedDecision,
+    verificationReason: verificationReason || presentation.reason,
+    verificationNotes: Array.isArray(verificationNotes) ? verificationNotes.filter(Boolean) : [],
+    manualReviewRequired: Boolean(presentation.manualReviewRequired),
+    callbackSignatureVerified: Boolean(callbackSignatureVerified || previousMeta.callbackSignatureVerified),
+    webhookSignatureVerified: Boolean(webhookSignatureVerified || previousMeta.webhookSignatureVerified),
+    signatureVerified: Boolean(
+      callbackSignatureVerified
+      || webhookSignatureVerified
+      || previousMeta.signatureVerified
+      || payment?.providerSignature,
+    ),
+    expectedAmountPaise,
+    expectedAmount: expectedAmountPaise > 0 ? Number((expectedAmountPaise / 100).toFixed(2)) : null,
+    receivedAmountPaise,
+    receivedAmount: receivedAmountPaise > 0 ? Number((receivedAmountPaise / 100).toFixed(2)) : null,
+    currency,
+    refundStatus: remotePayment?.refund_status || previousMeta.refundStatus || null,
+    amountRefundedPaise: Number(remotePayment?.amount_refunded || 0) || Number(previousMeta.amountRefundedPaise || 0),
+    amountRefunded: Number(remotePayment?.amount_refunded || 0) > 0
+      ? Number((Number(remotePayment.amount_refunded) / 100).toFixed(2))
+      : (previousMeta.amountRefunded || 0),
+    disputeStatus: remotePayment?.disputed ? 'disputed' : (previousMeta.disputeStatus || null),
+    suspiciousPayment: Boolean(remotePayment?.disputed || previousMeta.suspiciousPayment),
+    remoteOrderStatus: String(remoteOrder?.status || previousMeta.remoteOrderStatus || '').trim().toLowerCase() || null,
+    remoteOrderNotes,
+    remotePaymentNotes,
+    localTransactionId: payment?._id || previousMeta.localTransactionId || null,
+    localUserId: payment?.userId || previousMeta.localUserId || null,
+    localCourseId: payment?.courseId || previousMeta.localCourseId || null,
+    localUserEmail: user?.email || previousMeta.localUserEmail || null,
+    localUserMobile: user?.mobileNumber || previousMeta.localUserMobile || null,
+    localCourseTitle: course?.title || previousMeta.localCourseTitle || null,
+    lastSyncedAt: nowIso(),
+  };
+};
+
 const insertPgUpload = async (payload, client = null) => {
   const upload = {
     _id: payload._id || createPersistentId('upload'),
@@ -3654,6 +4729,847 @@ const queueBestEffortDeviceActivity = ({ userId, sessionId = null, device = null
   state.deviceActivities = state.deviceActivities.slice(0, 200);
 };
 
+const buildVideoWatchStateRecordIdentity = ({ userId, courseId, videoId, videoType }) => ({
+  userId: String(userId),
+  courseId: String(courseId),
+  videoId: String(videoId),
+  videoType: normalizeVideoType(videoType),
+});
+
+const buildActivePlaybackSessionKey = (userId) => cacheKey('video-playback-active', String(userId));
+
+const getPlaybackSessionAgeSeconds = (session) => {
+  if (!session) {
+    return null;
+  }
+
+  const lastActivityMs = Number(new Date(session.lastHeartbeatAt || session.updatedAt || session.issuedAt || 0).getTime() || 0);
+  if (!lastActivityMs) {
+    return null;
+  }
+
+  return Math.max(0, Math.floor((Date.now() - lastActivityMs) / 1000));
+};
+
+const isFreshActivePlaybackSession = (session) => {
+  const ageSeconds = getPlaybackSessionAgeSeconds(session);
+  if (ageSeconds === null) {
+    return false;
+  }
+
+  return ageSeconds <= videoPlaybackReconnectGraceSeconds;
+};
+
+const buildPlaybackDeviceMeta = ({
+  requestContext = null,
+  userAgent = null,
+  ipAddress = null,
+}) => ({
+  id: requestContext?.deviceId || null,
+  platform: requestContext?.platform || null,
+  browser: requestContext?.browser || null,
+  app: requestContext?.appMode || null,
+  userAgent: userAgent || requestContext?.userAgent || null,
+  ipAddress: ipAddress || null,
+});
+
+const matchesPlaybackClientContext = ({
+  activeSession,
+  authSessionId = null,
+  requestContext = null,
+}) => {
+  if (!activeSession || !requestContext) {
+    return false;
+  }
+
+  const nextTabId = String(requestContext.playbackTabId || '').trim();
+  const nextDeviceId = String(requestContext.deviceId || '').trim();
+  const nextUserAgentHash = String(requestContext.userAgentHash || '').trim();
+  const activeTabId = String(activeSession.clientSessionId || '').trim();
+  const activeDeviceId = String(activeSession.deviceId || '').trim();
+  const activeUserAgentHash = String(activeSession.userAgentHash || '').trim();
+  const authMatches = !authSessionId || String(activeSession.authSessionId || '') === String(authSessionId || '');
+
+  if (nextTabId && activeTabId && nextTabId === activeTabId) {
+    return true;
+  }
+
+  if (nextDeviceId && activeDeviceId && nextDeviceId === activeDeviceId) {
+    if (!nextTabId || !activeTabId) {
+      return true;
+    }
+
+    if (authMatches && (!nextUserAgentHash || !activeUserAgentHash || nextUserAgentHash === activeUserAgentHash)) {
+      return true;
+    }
+  }
+
+  return false;
+};
+
+const describePlaybackSessionDecision = ({
+  activeSession,
+  authSessionId = null,
+  requestContext = null,
+  courseId = null,
+  lessonId = null,
+  videoId = null,
+  videoType = null,
+}) => {
+  if (!activeSession) {
+    return {
+      decision: 'allow',
+      reason: 'no_existing_active_session',
+      existingAgeSeconds: null,
+      isStale: false,
+      isSameVideo: false,
+      replaceExisting: false,
+      reuseExistingSession: false,
+    };
+  }
+
+  const existingAgeSeconds = getPlaybackSessionAgeSeconds(activeSession);
+  const nextTabId = String(requestContext?.playbackTabId || '').trim();
+  const nextDeviceId = String(requestContext?.deviceId || '').trim();
+  const nextUserAgentHash = String(requestContext?.userAgentHash || '').trim();
+  const activeTabId = String(activeSession.clientSessionId || '').trim();
+  const activeDeviceId = String(activeSession.deviceId || '').trim();
+  const activeUserAgentHash = String(activeSession.userAgentHash || '').trim();
+  const authMatches = !authSessionId || String(activeSession.authSessionId || '') === String(authSessionId || '');
+  const sameVideoByAuthSession = Boolean(
+    authMatches
+    && String(activeSession.videoId || '') === String(videoId || '')
+    && normalizeVideoType(activeSession.videoType) === normalizeVideoType(videoType)
+    && String(activeSession.courseId || '') === String(courseId || ''),
+  );
+  const missingDeviceIdentity = !nextDeviceId || !activeDeviceId;
+  const matchingUserAgentIdentity = Boolean(
+    authMatches
+    && nextUserAgentHash
+    && activeUserAgentHash
+    && nextUserAgentHash === activeUserAgentHash,
+  );
+  const sameTrustedDeviceSession = Boolean(
+    nextDeviceId
+    && activeDeviceId
+    && nextDeviceId === activeDeviceId
+    && authMatches
+    && (!nextUserAgentHash || !activeUserAgentHash || nextUserAgentHash === activeUserAgentHash),
+  );
+  const sameClient = matchesPlaybackClientContext({ activeSession, authSessionId, requestContext });
+  const sameVideo = sameClient && sameVideoByAuthSession;
+  const sameDeviceReconnect = Boolean(
+    sameVideoByAuthSession
+    && sameTrustedDeviceSession
+    && (
+      !nextTabId
+      || !activeTabId
+      || nextTabId !== activeTabId
+      || String(activeSession.status || '').trim().toLowerCase() !== 'active'
+    )
+  );
+
+  if (!isFreshActivePlaybackSession(activeSession)) {
+    return {
+      decision: 'expire',
+      reason: 'reconnect_grace_expired',
+      existingAgeSeconds,
+      isStale: true,
+      isSameVideo: false,
+      replaceExisting: false,
+      reuseExistingSession: false,
+    };
+  }
+
+  if (sameVideo) {
+    return {
+      decision: 'allow',
+      reason: sameDeviceReconnect
+        ? 'same_device_same_video_reconnect_allowed'
+        : 'same_tab_same_video_retry_allowed',
+      existingAgeSeconds,
+      isStale: false,
+      isSameVideo: true,
+      replaceExisting: false,
+      reuseExistingSession: true,
+    };
+  }
+
+  if (sameVideoByAuthSession && missingDeviceIdentity && matchingUserAgentIdentity) {
+    return {
+      decision: 'allow',
+      reason: 'same_auth_same_video_missing_device_identity_allowed',
+      existingAgeSeconds,
+      isStale: false,
+      isSameVideo: true,
+      replaceExisting: false,
+      reuseExistingSession: true,
+    };
+  }
+
+  if (sameClient) {
+    return {
+      decision: 'replace',
+      reason: sameTrustedDeviceSession ? 'same_device_session_lesson_switch_replaced' : 'same_tab_lesson_switch_replaced',
+      existingAgeSeconds,
+      isStale: false,
+      isSameVideo: false,
+      replaceExisting: true,
+      reuseExistingSession: false,
+    };
+  }
+
+  if (nextDeviceId && activeDeviceId && nextDeviceId !== activeDeviceId) {
+    return {
+      decision: 'reject_409',
+      reason: 'real_different_device_active',
+      existingAgeSeconds,
+      isStale: false,
+      isSameVideo: false,
+      replaceExisting: false,
+      reuseExistingSession: false,
+    };
+  }
+
+  if (nextTabId && activeTabId && nextTabId !== activeTabId && !sameTrustedDeviceSession) {
+    return {
+      decision: 'reject_409',
+      reason: 'real_different_tab_active',
+      existingAgeSeconds,
+      isStale: false,
+      isSameVideo: false,
+      replaceExisting: false,
+      reuseExistingSession: false,
+    };
+  }
+
+  if (nextDeviceId && activeDeviceId && nextDeviceId === activeDeviceId) {
+    if (!nextTabId || !activeTabId || !authMatches || (nextUserAgentHash && activeUserAgentHash && nextUserAgentHash === activeUserAgentHash)) {
+      return {
+        decision: 'replace',
+        reason: sameTrustedDeviceSession ? 'same_device_same_auth_allowed' : 'missing_tab_same_device_allowed',
+        existingAgeSeconds,
+        isStale: false,
+        isSameVideo: false,
+        replaceExisting: true,
+        reuseExistingSession: false,
+      };
+    }
+  }
+
+  if (!nextDeviceId || !activeDeviceId) {
+    return {
+      decision: 'replace',
+      reason: 'invalid_or_missing_device_id',
+      existingAgeSeconds,
+      isStale: false,
+      isSameVideo: false,
+      replaceExisting: true,
+      reuseExistingSession: false,
+    };
+  }
+
+  return {
+    decision: 'reject_409',
+    reason: 'unknown_conflict',
+    existingAgeSeconds,
+    isStale: false,
+    isSameVideo: false,
+    replaceExisting: false,
+    reuseExistingSession: false,
+  };
+};
+
+const logPlaybackSessionDecision = ({
+  userId,
+  courseId,
+  lessonId = null,
+  videoId,
+  authSessionId = null,
+  requestContext = null,
+  activeSession,
+  playbackSessionId = null,
+  decision,
+  reason,
+  playbackUrlGenerated = false,
+}) => {
+  const payload = JSON.stringify({
+    user_id: userId ? String(userId) : null,
+    current_course_id: courseId ? String(courseId) : null,
+    current_lesson_id: lessonId ? String(lessonId) : null,
+    current_video_id: videoId ? String(videoId) : null,
+    current_device_id: requestContext?.deviceId || null,
+    current_browser_tab_id: requestContext?.playbackTabId || null,
+    current_browser_tab_id_missing: !String(requestContext?.playbackTabId || '').trim(),
+    current_auth_session_id: authSessionId || null,
+    current_playback_session_id: playbackSessionId || null,
+    request_source: requestContext?.appMode || requestContext?.browser || 'unknown',
+    existing_active_session_id: activeSession?.playbackSessionId || null,
+    existing_video_id: activeSession?.videoId || null,
+    existing_lesson_id: activeSession?.lessonId || null,
+    existing_device_id: activeSession?.deviceId || null,
+    existing_browser_tab_id: activeSession?.clientSessionId || null,
+    existing_auth_session_id: activeSession?.authSessionId || null,
+    existing_last_heartbeat_at: activeSession?.lastHeartbeatAt || null,
+    existing_age_seconds: getPlaybackSessionAgeSeconds(activeSession),
+    stale_timeout_seconds: videoPlaybackSessionTtlSeconds,
+    reconnect_grace_seconds: videoPlaybackReconnectGraceSeconds,
+    conflict_reason: reason,
+    decision,
+    playback_url_generated: Boolean(playbackUrlGenerated),
+  });
+  const level = decision === 'reject_409' ? 'warn' : 'info';
+  console[level](`[video-playback-session] ${payload}`);
+};
+
+const findMemoryVideoWatchState = ({ userId, courseId, videoId, videoType }) =>
+  state.videoWatchStates.find((entry) =>
+    entry.userId === String(userId)
+    && entry.courseId === String(courseId)
+    && entry.videoId === String(videoId)
+    && normalizeVideoType(entry.videoType) === normalizeVideoType(videoType)
+  ) || null;
+
+const upsertMemoryVideoWatchState = (payload) => {
+  const normalized = normalizeVideoWatchState({
+    ...payload,
+    updatedAt: payload.updatedAt || nowIso(),
+    createdAt: payload.createdAt || nowIso(),
+  }, {
+    chunkSeconds: videoWatchChunkSeconds,
+  });
+  const existingIndex = state.videoWatchStates.findIndex((entry) =>
+    entry.userId === String(normalized.userId)
+    && entry.courseId === String(normalized.courseId)
+    && entry.videoId === String(normalized.videoId)
+    && normalizeVideoType(entry.videoType) === normalizeVideoType(normalized.videoType)
+  );
+
+  if (existingIndex >= 0) {
+    state.videoWatchStates[existingIndex] = normalized;
+  } else {
+    state.videoWatchStates.push(normalized);
+  }
+
+  return clone(normalized);
+};
+
+const videoPlaybackRepository = {
+  async getWatchState({
+    userId,
+    courseId,
+    lessonId = null,
+    videoId,
+    videoType = COURSE_VIDEO_TYPE,
+    videoDurationSeconds = 0,
+  }, client = null) {
+    const identity = buildVideoWatchStateRecordIdentity({ userId, courseId, videoId, videoType });
+    let effectiveWatchSettings = null;
+    if (lessonId && courseId && userId) {
+      const course = await coursesRepository.findById(courseId).catch(() => null);
+      const lesson = course ? findLessonInCourse(course, lessonId) : null;
+      effectiveWatchSettings = await resolveEffectiveLessonWatchSettings({
+        userId,
+        courseId,
+        lessonId,
+        lesson,
+      });
+    }
+    const normalizeStateWithEffectivePolicy = (stateRecord) => normalizeVideoWatchState(stateRecord, {
+      chunkSeconds: videoWatchChunkSeconds,
+      allowedFullWatches: effectiveWatchSettings?.allowedFullWatches,
+      fullWatchThresholdPercentage: effectiveWatchSettings?.watchCompletionPercent,
+    });
+
+    if (isPostgresMode()) {
+      const existing = await pgOne(
+        `
+          SELECT * FROM video_watch_states
+          WHERE user_id = $1 AND course_id = $2 AND video_id = $3 AND video_type = $4
+        `,
+        [identity.userId, identity.courseId, identity.videoId, identity.videoType],
+        mapVideoWatchStateRow,
+        client,
+      );
+      if (existing) {
+        return normalizeStateWithEffectivePolicy({
+          ...existing,
+          lessonId: lessonId || existing.lessonId || null,
+          videoDurationSeconds: Math.max(Number(existing.videoDurationSeconds || 0), Number(videoDurationSeconds || 0)),
+        });
+      }
+    } else {
+      const existing = findMemoryVideoWatchState(identity);
+      if (existing) {
+        return normalizeStateWithEffectivePolicy({
+          ...existing,
+          lessonId: lessonId || existing.lessonId || null,
+          videoDurationSeconds: Math.max(Number(existing.videoDurationSeconds || 0), Number(videoDurationSeconds || 0)),
+        });
+      }
+    }
+
+    return normalizeStateWithEffectivePolicy(getDefaultVideoWatchState({
+      userId,
+      courseId,
+      lessonId,
+      videoId,
+      videoType,
+      videoDurationSeconds,
+      chunkSeconds: videoWatchChunkSeconds,
+      allowedFullWatches: effectiveWatchSettings?.allowedFullWatches,
+      fullWatchThresholdPercentage: effectiveWatchSettings?.watchCompletionPercent,
+    }));
+  },
+
+  async saveWatchState(stateRecord, client = null) {
+    if (isPostgresMode()) {
+      return upsertPgVideoWatchState(stateRecord, client);
+    }
+
+    return upsertMemoryVideoWatchState(stateRecord);
+  },
+
+  async getActivePlaybackSession(userId) {
+    const active = await getRedisJson(buildActivePlaybackSessionKey(userId));
+    if (!active) {
+      return null;
+    }
+    if (!isFreshActivePlaybackSession(active)) {
+      await deleteRedisKey(buildActivePlaybackSessionKey(userId));
+      return null;
+    }
+    return active;
+  },
+
+  async validatePlaybackSession({
+    userId,
+    playbackSessionId,
+    authSessionId = null,
+    courseId = null,
+    videoId = null,
+    videoType = null,
+    requestContext = null,
+  }) {
+    const active = await videoPlaybackRepository.getActivePlaybackSession(userId);
+    if (!active) {
+      return null;
+    }
+
+    const sessionMatches = String(active.playbackSessionId || '') === String(playbackSessionId || '');
+    const authMatches = !authSessionId || String(active.authSessionId || '') === String(authSessionId || '');
+    const courseMatches = !courseId || String(active.courseId || '') === String(courseId || '');
+    const videoMatches = !videoId || String(active.videoId || '') === String(videoId || '');
+    const videoTypeMatches = !videoType || normalizeVideoType(active.videoType) === normalizeVideoType(videoType);
+    const requestedUserAgentHash = String(requestContext?.userAgentHash || '').trim();
+    const activeUserAgentHash = String(active.userAgentHash || '').trim();
+    const missingDeviceIdentity = !String(requestContext?.deviceId || '').trim() || !String(active.deviceId || '').trim();
+    const matchingUserAgentIdentity = Boolean(
+      authMatches
+      && requestedUserAgentHash
+      && activeUserAgentHash
+      && requestedUserAgentHash === activeUserAgentHash,
+    );
+
+    if (sessionMatches && authMatches && courseMatches && videoMatches && videoTypeMatches) {
+      return active;
+    }
+
+    const sameClient = matchesPlaybackClientContext({
+      activeSession: active,
+      authSessionId,
+      requestContext,
+    });
+
+    if (!sessionMatches && authMatches && courseMatches && videoMatches && videoTypeMatches && sameClient) {
+      console.info(`[video-playback-validate] ${JSON.stringify({
+        user_id: userId ? String(userId) : null,
+        requested_playback_session_id: playbackSessionId ? String(playbackSessionId) : null,
+        active_playback_session_id: active.playbackSessionId || null,
+        course_id: courseId ? String(courseId) : null,
+        video_id: videoId ? String(videoId) : null,
+        video_type: normalizeVideoType(videoType),
+        auth_session_id: authSessionId || null,
+        current_device_id: requestContext?.deviceId || null,
+        current_browser_tab_id: requestContext?.playbackTabId || null,
+        active_device_id: active.deviceId || null,
+        active_browser_tab_id: active.clientSessionId || null,
+        validation_reason: 'same_client_same_video_session_rollover_allowed',
+      })}`);
+      return {
+        ...active,
+        validationReason: 'same_client_same_video_session_rollover_allowed',
+        requestedPlaybackSessionId: playbackSessionId ? String(playbackSessionId) : null,
+      };
+    }
+
+    if (!sessionMatches && authMatches && courseMatches && videoMatches && videoTypeMatches && missingDeviceIdentity && matchingUserAgentIdentity) {
+      console.info(`[video-playback-validate] ${JSON.stringify({
+        user_id: userId ? String(userId) : null,
+        requested_playback_session_id: playbackSessionId ? String(playbackSessionId) : null,
+        active_playback_session_id: active.playbackSessionId || null,
+        course_id: courseId ? String(courseId) : null,
+        video_id: videoId ? String(videoId) : null,
+        video_type: normalizeVideoType(videoType),
+        auth_session_id: authSessionId || null,
+        current_device_id: requestContext?.deviceId || null,
+        current_browser_tab_id: requestContext?.playbackTabId || null,
+        active_device_id: active.deviceId || null,
+        active_browser_tab_id: active.clientSessionId || null,
+        validation_reason: 'same_auth_same_video_missing_device_identity_allowed',
+      })}`);
+      return {
+        ...active,
+        validationReason: 'same_auth_same_video_missing_device_identity_allowed',
+        requestedPlaybackSessionId: playbackSessionId ? String(playbackSessionId) : null,
+      };
+    }
+
+    return null;
+  },
+
+  async setActivePlaybackSession(userId, session, { ttlSeconds = videoPlaybackSessionTtlSeconds } = {}) {
+    await setRedisJson(buildActivePlaybackSessionKey(userId), session, { ttlSeconds });
+    return session;
+  },
+
+  async clearActivePlaybackSession(userId) {
+    await deleteRedisKey(buildActivePlaybackSessionKey(userId));
+  },
+
+  async startPlaybackSession({
+    userId,
+    courseId,
+    lessonId = null,
+    videoId,
+    videoType = COURSE_VIDEO_TYPE,
+    videoDurationSeconds = 0,
+    authSessionId = null,
+    requestContext = null,
+    ipAddress = null,
+    userAgent = null,
+  }) {
+    const watchState = await videoPlaybackRepository.getWatchState({
+      userId,
+      courseId,
+      lessonId,
+      videoId,
+      videoType,
+      videoDurationSeconds,
+    });
+
+    if (watchState.isLocked) {
+      throw new ApiError(403, 'Video watch limit reached', {
+        code: 'VIDEO_WATCH_LIMIT_REACHED',
+        details: {
+          watchState: buildVideoWatchStateSummary(watchState),
+        },
+      });
+    }
+
+    const activePlaybackSessionKey = buildActivePlaybackSessionKey(userId);
+    const rawActiveSession = await getRedisJson(activePlaybackSessionKey);
+    const sessionDecision = describePlaybackSessionDecision({
+      activeSession: rawActiveSession,
+      authSessionId,
+      requestContext,
+      courseId,
+      lessonId,
+      videoId,
+      videoType,
+    });
+    const activeSession = sessionDecision.decision === 'expire' ? null : rawActiveSession;
+
+    if (sessionDecision.decision === 'expire') {
+      await deleteRedisKey(activePlaybackSessionKey);
+      logPlaybackSessionDecision({
+        userId,
+        courseId,
+        lessonId,
+        videoId,
+        authSessionId,
+        requestContext,
+        activeSession: rawActiveSession,
+        decision: sessionDecision.decision,
+        reason: sessionDecision.reason,
+      });
+    }
+
+    if ((sessionDecision.replaceExisting || sessionDecision.reuseExistingSession) && rawActiveSession?.playbackSessionId) {
+      await deleteRedisKey(activePlaybackSessionKey);
+    }
+
+    if (sessionDecision.decision === 'reject_409') {
+      queueBestEffortDeviceActivity({
+        userId,
+        sessionId: authSessionId || null,
+        device: buildPlaybackDeviceMeta({ requestContext, userAgent, ipAddress }),
+        eventType: 'video_playback_session_blocked',
+        meta: {
+          activePlaybackSessionId: rawActiveSession?.playbackSessionId || null,
+          requestedVideoId: String(videoId),
+          requestedVideoType: normalizeVideoType(videoType),
+          requestedCourseId: String(courseId),
+          conflictReason: sessionDecision.reason,
+        },
+      });
+      logPlaybackSessionDecision({
+        userId,
+        courseId,
+        lessonId,
+        videoId,
+        authSessionId,
+        requestContext,
+        activeSession: rawActiveSession,
+        decision: sessionDecision.decision,
+        reason: sessionDecision.reason,
+      });
+      throw new ApiError(409, 'Another active video session is already running for this account', {
+        code: 'PLAYBACK_SESSION_CONFLICT',
+        details: {
+          activeVideoId: rawActiveSession?.videoId || null,
+          activeVideoType: rawActiveSession?.videoType || null,
+          conflictReason: sessionDecision.reason,
+        },
+      });
+    }
+
+    const playbackSessionId = sessionDecision.reuseExistingSession && activeSession?.playbackSessionId
+      ? String(activeSession.playbackSessionId)
+      : createPersistentId('playback_session');
+    const issuedAt = nowIso();
+    const preserveClientIdentity = sessionDecision.reuseExistingSession || sessionDecision.replaceExisting;
+    const preservedClientSessionId = preserveClientIdentity
+      ? activeSession?.clientSessionId || null
+      : null;
+    const preservedDeviceId = preserveClientIdentity
+      ? activeSession?.deviceId || null
+      : null;
+    const preservedUserAgentHash = preserveClientIdentity
+      ? activeSession?.userAgentHash || null
+      : null;
+    const preservedUserAgent = preserveClientIdentity
+      ? activeSession?.userAgent || null
+      : null;
+    const preservedIpAddress = preserveClientIdentity
+      ? activeSession?.ipAddress || null
+      : null;
+    const nextSession = {
+      playbackSessionId,
+      userId: String(userId),
+      authSessionId: authSessionId || null,
+      courseId: String(courseId),
+      lessonId: lessonId ? String(lessonId) : null,
+      videoId: String(videoId),
+      videoType: normalizeVideoType(videoType),
+      clientSessionId: requestContext?.playbackTabId || preservedClientSessionId,
+      deviceId: requestContext?.deviceId || preservedDeviceId,
+      userAgentHash: requestContext?.userAgentHash || preservedUserAgentHash,
+      userAgent: userAgent || requestContext?.userAgent || preservedUserAgent,
+      ipAddress: ipAddress || requestContext?.ipAddress || preservedIpAddress,
+      issuedAt: sessionDecision.reuseExistingSession ? activeSession?.issuedAt || issuedAt : issuedAt,
+      lastHeartbeatAt: sessionDecision.reuseExistingSession ? activeSession?.lastHeartbeatAt || null : null,
+      updatedAt: issuedAt,
+      status: watchState.isLocked ? 'locked' : 'active',
+    };
+
+    await videoPlaybackRepository.setActivePlaybackSession(userId, nextSession);
+    const savedState = await videoPlaybackRepository.saveWatchState({
+      ...watchState,
+      lessonId: lessonId || watchState.lessonId || null,
+      playbackSessionId,
+      activeSessionStatus: nextSession.status,
+      deviceId: nextSession.deviceId || watchState.deviceId || null,
+      ipAddress: nextSession.ipAddress || watchState.ipAddress || null,
+      userAgent: nextSession.userAgent || watchState.userAgent || null,
+      updatedAt: issuedAt,
+      createdAt: watchState.createdAt || issuedAt,
+    });
+    logPlaybackSessionDecision({
+      userId,
+      courseId,
+      lessonId,
+      videoId,
+      authSessionId,
+      requestContext,
+      activeSession: rawActiveSession,
+      playbackSessionId,
+      decision: sessionDecision.decision,
+      reason: sessionDecision.reason,
+    });
+
+    return {
+      playbackSession: nextSession,
+      watchState: savedState,
+    };
+  },
+
+  async recordHeartbeat({
+    userId,
+    courseId,
+    lessonId = null,
+    videoId,
+    videoType = COURSE_VIDEO_TYPE,
+    videoDurationSeconds = 0,
+    playbackSessionId,
+    authSessionId = null,
+    requestContext = null,
+    ipAddress = null,
+    userAgent = null,
+    heartbeatPayload,
+  }) {
+    const activeSession = await videoPlaybackRepository.validatePlaybackSession({
+      userId,
+      playbackSessionId,
+      authSessionId,
+      courseId,
+      videoId,
+      videoType,
+      requestContext,
+    });
+
+    if (!activeSession) {
+      throw new ApiError(409, 'Playback session is no longer valid', {
+        code: 'PLAYBACK_SESSION_INVALID',
+      });
+    }
+
+    const effectivePlaybackSessionId = String(activeSession.playbackSessionId || playbackSessionId || '');
+
+    const existingState = await videoPlaybackRepository.getWatchState({
+      userId,
+      courseId,
+      lessonId,
+      videoId,
+      videoType,
+      videoDurationSeconds,
+    });
+
+    const serverNowMs = Date.now();
+    const { state: nextStateRaw, outcome, heartbeat } = applyPlaybackHeartbeat(existingState, {
+      ...heartbeatPayload,
+      videoId,
+      videoType,
+      playbackSessionId: effectivePlaybackSessionId,
+      deviceId: requestContext?.deviceId || heartbeatPayload?.deviceId || null,
+      userAgent: userAgent || requestContext?.userAgent || heartbeatPayload?.userAgent || null,
+      ipAddress: ipAddress || heartbeatPayload?.ipAddress || null,
+    }, {
+      chunkSeconds: videoWatchChunkSeconds,
+      maxPlaybackRate: videoPlaybackMaxRate,
+      heartbeatGraceSeconds: videoPlaybackHeartbeatGraceSeconds,
+      maxHeartbeatGapSeconds: videoPlaybackMaxHeartbeatGapSeconds,
+      serverNowMs,
+      videoDurationSeconds,
+    });
+
+    const nextState = await videoPlaybackRepository.saveWatchState({
+      ...nextStateRaw,
+      lessonId: lessonId || nextStateRaw.lessonId || null,
+    });
+
+    const nextActiveSession = {
+      ...activeSession,
+      courseId: String(courseId),
+      lessonId: lessonId ? String(lessonId) : null,
+      videoId: String(videoId),
+      videoType: normalizeVideoType(videoType),
+      lastHeartbeatAt: nextState.lastHeartbeatAt || nowIso(),
+      updatedAt: nextState.updatedAt || nowIso(),
+      ipAddress: ipAddress || activeSession.ipAddress || null,
+      userAgent: userAgent || activeSession.userAgent || null,
+      deviceId: requestContext?.deviceId || activeSession.deviceId || null,
+      status: nextState.isLocked ? 'locked' : 'active',
+    };
+    await videoPlaybackRepository.setActivePlaybackSession(userId, nextActiveSession);
+
+    if (outcome.suspiciousReasons.length > 0) {
+      queueBestEffortDeviceActivity({
+        userId,
+        sessionId: authSessionId || null,
+        device: buildPlaybackDeviceMeta({ requestContext, userAgent, ipAddress }),
+        eventType: 'video_playback_suspicious',
+        meta: {
+          courseId: String(courseId),
+          lessonId: lessonId ? String(lessonId) : null,
+          videoId: String(videoId),
+          videoType: normalizeVideoType(videoType),
+          reasons: outcome.suspiciousReasons,
+          previousPositionSeconds: heartbeat.previousPositionSeconds,
+          currentPositionSeconds: heartbeat.currentPositionSeconds,
+          playbackRate: heartbeat.playbackRate,
+          requestedPlaybackSessionId: playbackSessionId || null,
+          effectivePlaybackSessionId: effectivePlaybackSessionId || null,
+        },
+      });
+    }
+
+    if (
+      outcome.accepted
+      || outcome.completedFullWatch
+      || outcome.suspiciousReasons.length > 0
+      || ['seek-backward', 'seek-forward', 'no-progress'].includes(String(outcome.reason || ''))
+    ) {
+      queueBestEffortDeviceActivity({
+        userId,
+        sessionId: authSessionId || null,
+        device: buildPlaybackDeviceMeta({ requestContext, userAgent, ipAddress }),
+        eventType: 'video_playback_heartbeat',
+        meta: {
+          courseId: String(courseId),
+          lessonId: lessonId ? String(lessonId) : null,
+          videoId: String(videoId),
+          videoType: normalizeVideoType(videoType),
+          playbackSessionId: effectivePlaybackSessionId || null,
+          requestedPlaybackSessionId: playbackSessionId || null,
+          previousPositionSeconds: heartbeat.previousPositionSeconds,
+          currentPositionSeconds: heartbeat.currentPositionSeconds,
+          durationSeconds: heartbeat.durationSeconds,
+          playbackRate: heartbeat.playbackRate,
+          accepted: Boolean(outcome.accepted),
+          reason: outcome.reason,
+          countableSeconds: outcome.countableSeconds,
+          uniqueSecondsAdded: outcome.uniqueSecondsAdded,
+          repeatSecondsAdded: outcome.repeatSecondsAdded,
+          completedFullWatch: Boolean(outcome.completedFullWatch),
+          completedFullWatches: nextState.completedFullWatches,
+          currentCycleUniqueWatchedSeconds: nextState.currentCycleUniqueWatchedSeconds,
+          totalUniqueWatchedSeconds: nextState.totalUniqueWatchedSeconds,
+          stableEndWindowWatchedSeconds: nextState.stableEndWindowWatchedSeconds || 0,
+          endStabilitySatisfied: Boolean(outcome.endStabilitySatisfied),
+          completionProofSatisfied: Boolean(outcome.completionProofSatisfied),
+          completionThresholdPercentage: nextState.fullWatchThresholdPercentage,
+          suspiciousReasons: outcome.suspiciousReasons,
+        },
+      });
+    }
+
+    if (nextState.isLocked) {
+      queueBestEffortDeviceActivity({
+        userId,
+        sessionId: authSessionId || null,
+        device: buildPlaybackDeviceMeta({ requestContext, userAgent, ipAddress }),
+        eventType: 'video_watch_locked',
+        meta: {
+          courseId: String(courseId),
+          lessonId: lessonId ? String(lessonId) : null,
+          videoId: String(videoId),
+          videoType: normalizeVideoType(videoType),
+          completedFullWatches: nextState.completedFullWatches,
+          revisionBufferUsedSeconds: nextState.revisionBufferUsedSeconds,
+        },
+      });
+    }
+
+    return {
+      watchState: nextState,
+      watchSummary: buildVideoWatchStateSummary(nextState),
+      playbackSession: nextActiveSession,
+      outcome,
+    };
+  },
+};
+
 const getPgUsers = async (client = null) => pgMany('SELECT * FROM users ORDER BY created_at ASC', [], mapUserRow, client);
 const getPgCourses = async (client = null) => pgMany('SELECT * FROM courses ORDER BY created_at ASC', [], mapCourseRow, client);
 const getPgTests = async (client = null) => pgMany('SELECT * FROM tests ORDER BY created_at ASC', [], mapTestRow, client);
@@ -3680,14 +5596,26 @@ const getPgQuizzes = async (client = null) => {
   }));
 };
 const getPgEnrollments = async (client = null) => pgMany('SELECT * FROM enrollments ORDER BY enrolled_at ASC', [], mapEnrollmentRow, client);
+const getPgCourseContentAccessRules = async (client = null) => pgMany(
+  'SELECT * FROM course_content_access_rules ORDER BY updated_at DESC, created_at DESC',
+  [],
+  mapCourseContentAccessRuleRow,
+  client,
+);
+const getPgStudentLessonWatchOverrides = async (client = null) => pgMany(
+  'SELECT * FROM student_lesson_watch_overrides ORDER BY updated_at DESC, created_at DESC',
+  [],
+  mapStudentLessonWatchOverrideRow,
+  client,
+);
 const getPgWatchHistory = async (client = null) => pgMany('SELECT * FROM watch_history ORDER BY updated_at DESC', [], mapWatchHistoryRow, client);
 const getPgLiveClasses = async (client = null) => pgMany('SELECT * FROM live_classes ORDER BY scheduled_start_at ASC', [], mapLiveClassRow, client);
 const getPgLiveChatMessages = async (client = null) => pgMany('SELECT * FROM live_chat_messages ORDER BY created_at ASC', [], mapLiveChatRow, client);
 const getPgPlans = async (client = null) => pgMany('SELECT * FROM subscription_plans ORDER BY created_at ASC', [], mapPlanRow, client);
 const getPgUserSubscriptions = async (client = null) => pgMany('SELECT * FROM subscriptions ORDER BY started_at DESC', [], mapSubscriptionRow, client);
 const getPgAiMessages = async (client = null) => pgMany('SELECT * FROM ai_messages ORDER BY created_at DESC', [], mapAiMessageRow, client);
-const getPgSessions = async (client = null) => pgMany('SELECT * FROM user_sessions ORDER BY created_at DESC', [], mapSessionRow, client);
-const getPgDeviceActivities = async (client = null) => pgMany('SELECT * FROM device_activity ORDER BY created_at DESC', [], mapDeviceActivityRow, client);
+const getPgSessions = async (client = null) => pgMany('SELECT * FROM user_sessions ORDER BY created_at DESC LIMIT 200', [], mapSessionRow, client);
+const getPgDeviceActivities = async (client = null) => pgMany('SELECT * FROM device_activity ORDER BY created_at DESC LIMIT 200', [], mapDeviceActivityRow, client);
 const getPgNotifications = async (client = null) => pgMany('SELECT * FROM notifications ORDER BY created_at DESC', [], mapNotificationRow, client);
 const getPgNotificationCount = async (client = null) => pgOne(
   'SELECT count(*)::int AS count FROM notifications',
@@ -3711,6 +5639,57 @@ const getUserProgressCacheKey = (userId) => cacheKey('progress', String(userId))
 const getViewerCourseListCacheKey = (userId) => cacheKey('courses-viewer', String(userId || 'guest'));
 const getViewerCourseCacheKey = (userId, courseId) => cacheKey('course-viewer', `${String(userId || 'guest')}:${String(courseId)}`);
 const getViewerLessonsCacheKey = (userId, courseId) => cacheKey('course-lessons-viewer', `${String(userId || 'guest')}:${String(courseId)}`);
+const getCourseAccessRulesCacheKey = (courseId, userId) => cacheKey('course-access-rules', `${String(courseId)}:${String(userId || 'guest')}`);
+const getStudentLessonWatchOverrideCacheKey = (studentId, courseId, lessonId) => cacheKey('student-watch-override', `${String(studentId)}:${String(courseId)}:${String(lessonId)}`);
+
+const listCourseContentAccessRulesForCourseUser = async (courseId, userId, client = null) => {
+  const normalizedCourseId = String(courseId || '');
+  const normalizedUserId = userId ? String(userId) : null;
+
+  if (isPostgresMode()) {
+    const params = [normalizedCourseId];
+    let sql = 'SELECT * FROM course_content_access_rules WHERE course_id = $1';
+    if (normalizedUserId) {
+      params.push(normalizedUserId);
+      sql += ' AND (student_scope = \'all_students\' OR (student_scope = \'student\' AND student_id = $2))';
+    } else {
+      sql += ' AND student_scope = \'all_students\'';
+    }
+    sql += ' ORDER BY updated_at DESC, created_at DESC';
+    return pgMany(sql, params, mapCourseContentAccessRuleRow, client);
+  }
+
+  return state.courseContentAccessRules
+    .map((entry) => normalizeCourseContentAccessRuleRecord(entry))
+    .filter((entry) => entry.courseId === normalizedCourseId)
+    .filter((entry) => entry.studentScope === 'all_students' || (normalizedUserId && entry.studentScope === 'student' && entry.studentId === normalizedUserId))
+    .sort((left, right) => String(right.updatedAt || '').localeCompare(String(left.updatedAt || '')));
+};
+
+const getStudentLessonWatchOverride = async ({ studentId, courseId, lessonId }, client = null) => {
+  const normalizedStudentId = String(studentId || '');
+  const normalizedCourseId = String(courseId || '');
+  const normalizedLessonId = String(lessonId || '');
+  const overrideCacheKey = getStudentLessonWatchOverrideCacheKey(normalizedStudentId, normalizedCourseId, normalizedLessonId);
+
+  return getCachedJsonValue(overrideCacheKey, async () => {
+    if (isPostgresMode()) {
+      return pgOne(
+        'SELECT * FROM student_lesson_watch_overrides WHERE student_id = $1 AND course_id = $2 AND lesson_id = $3',
+        [normalizedStudentId, normalizedCourseId, normalizedLessonId],
+        mapStudentLessonWatchOverrideRow,
+        client,
+      );
+    }
+
+    const match = state.studentLessonWatchOverrides.find((entry) =>
+      String(entry.studentId || '') === normalizedStudentId
+      && String(entry.courseId || '') === normalizedCourseId
+      && String(entry.lessonId || '') === normalizedLessonId
+    );
+    return match ? normalizeStudentLessonWatchOverrideRecord(match) : null;
+  }, redisJsonTtl);
+};
 
 const getActiveEnrollmentsForUser = async (userId) => {
   await ensurePlatformReady();
@@ -3744,6 +5723,30 @@ const hasActiveEnrollmentForCourse = async (userId, courseId) => {
 
   const enrollments = await getActiveEnrollmentsForUser(userId);
   return enrollments.some((entry) => entry.courseId === String(courseId));
+};
+
+const getEnrollmentForCourse = async (userId, courseId, client = null) => {
+  if (!userId || !courseId) {
+    return null;
+  }
+
+  if (isPostgresMode()) {
+    return pgOne(
+      `
+        SELECT * FROM enrollments
+        WHERE user_id = $1 AND course_id = $2
+        ORDER BY enrolled_at DESC
+        LIMIT 1
+      `,
+      [String(userId), String(courseId)],
+      mapEnrollmentRow,
+      client,
+    );
+  }
+
+  return state.enrollments.find(
+    (entry) => entry.userId === String(userId) && entry.courseId === String(courseId),
+  ) || null;
 };
 
 const getActiveEnrollmentCourseIds = async (userId) => {
@@ -3791,6 +5794,8 @@ const loadPlatformData = async () => {
         const testAttempts = await getPgAttempts(client);
         const quizzes = await getPgQuizzes(client);
         const enrollments = await getPgEnrollments(client);
+        const courseContentAccessRules = await getPgCourseContentAccessRules(client);
+        const studentLessonWatchOverrides = await getPgStudentLessonWatchOverrides(client);
         const watchHistory = await getPgWatchHistory(client);
         const liveClasses = await getPgLiveClasses(client);
         const liveChatMessages = await getPgLiveChatMessages(client);
@@ -3812,6 +5817,8 @@ const loadPlatformData = async () => {
           testAttempts,
           quizzes,
           enrollments,
+          courseContentAccessRules,
+          studentLessonWatchOverrides,
           watchHistory,
           liveClasses,
           liveChatMessages,
@@ -3905,6 +5912,74 @@ const getRecentDeviceActivity = (data, userId) =>
 
 const getUserByIdFromData = (data, userId) => data.users.find((user) => user._id === String(userId)) || null;
 
+const reconcilePgActiveSessionState = async (userId) => {
+  const normalizedUserId = String(userId);
+  const [user, activeSessions] = await Promise.all([
+    pgOne('SELECT active_session_id FROM users WHERE id = $1', [normalizedUserId], (row) => row),
+    pgMany(
+      `
+        SELECT *
+        FROM user_sessions
+        WHERE user_id = $1 AND status = 'active'
+        ORDER BY last_seen_at DESC, created_at DESC
+      `,
+      [normalizedUserId],
+      mapSessionRow,
+    ),
+  ]);
+
+  const persistedActiveSessionId = user?.active_session_id || null;
+
+  if (!activeSessions.length) {
+    if (persistedActiveSessionId) {
+      await pgExec(
+        'UPDATE users SET active_session_id = NULL, updated_at = now() WHERE id = $1',
+        [normalizedUserId],
+      );
+    }
+    await deleteRedisKey(cacheKey('user-session', normalizedUserId));
+    return null;
+  }
+
+  let chosenSession = activeSessions[0];
+  if (persistedActiveSessionId) {
+    const matchedSession = activeSessions.find((entry) => String(entry.sessionId) === String(persistedActiveSessionId));
+    if (matchedSession) {
+      chosenSession = matchedSession;
+    }
+  }
+
+  const duplicateSessions = activeSessions.filter((entry) => entry._id !== chosenSession._id);
+  if (duplicateSessions.length) {
+    await pgExec(
+      `
+        UPDATE user_sessions
+        SET status = 'ended',
+            reason = 'repair_replaced_duplicate',
+            ended_at = now(),
+            last_seen_at = now()
+        WHERE user_id = $1
+          AND status = 'active'
+          AND jwt_session_id <> $2
+      `,
+      [normalizedUserId, String(chosenSession.sessionId)],
+    );
+  }
+
+  if (String(persistedActiveSessionId || '') !== String(chosenSession.sessionId)) {
+    await pgExec(
+      'UPDATE users SET active_session_id = $2, updated_at = now() WHERE id = $1',
+      [normalizedUserId, String(chosenSession.sessionId)],
+    );
+  }
+
+  await setRedisValue(cacheKey('user-session', normalizedUserId), String(chosenSession.sessionId), {
+    ttlSeconds: 7 * 24 * 60 * 60,
+  });
+
+  return String(chosenSession.sessionId);
+};
+
 const sessionRepository = {
   async getActiveSessionId(userId, fallback = null) {
     const cached = await getRedisValue(cacheKey('user-session', String(userId)));
@@ -3913,8 +5988,8 @@ const sessionRepository = {
     }
 
     if (isPostgresMode()) {
-      const user = await pgOne('SELECT active_session_id FROM users WHERE id = $1', [String(userId)], (row) => row);
-      return user?.active_session_id || fallback || null;
+      const reconciled = await reconcilePgActiveSessionState(userId);
+      return reconciled || fallback || null;
     }
 
     return fallback || null;
@@ -3937,6 +6012,11 @@ const sessionRepository = {
           client,
         );
         await insertPgSession({ userId, sessionId, device, status: 'active' }, client);
+        await pgExec(
+          'UPDATE users SET active_session_id = $2, updated_at = now() WHERE id = $1',
+          [String(userId), String(sessionId)],
+          client,
+        );
         await insertPgDeviceActivity({
           userId,
           sessionId,
@@ -3982,6 +6062,27 @@ const sessionRepository = {
     if (isPostgresMode()) {
       await runInTransaction(async (client) => {
         await closePgSession({ userId, sessionId, reason }, client);
+        if (sessionId) {
+          await pgExec(
+            `
+              UPDATE users
+              SET active_session_id = CASE
+                WHEN active_session_id = $2 THEN NULL
+                ELSE active_session_id
+              END,
+              updated_at = now()
+              WHERE id = $1
+            `,
+            [String(userId), String(sessionId)],
+            client,
+          );
+        } else {
+          await pgExec(
+            'UPDATE users SET active_session_id = NULL, updated_at = now() WHERE id = $1',
+            [String(userId)],
+            client,
+          );
+        }
         await insertPgDeviceActivity({
           userId,
           sessionId,
@@ -3991,6 +6092,7 @@ const sessionRepository = {
         }, client);
       });
       await sessionRepository.clearActiveSession(userId);
+      await videoPlaybackRepository.clearActivePlaybackSession(userId);
       invalidateUserPlatformCaches(userId);
       return;
     }
@@ -4019,6 +6121,7 @@ const sessionRepository = {
     });
     state.deviceActivities = state.deviceActivities.slice(0, 200);
     await sessionRepository.clearActiveSession(userId);
+    await videoPlaybackRepository.clearActivePlaybackSession(userId);
     invalidateUserPlatformCaches(userId);
   },
 
@@ -4149,12 +6252,17 @@ const usersRepository = {
       mobileNumber: normalizeMobileNumber(payload.mobileNumber) || null,
       password: payload.password,
       role: payload.role || 'student',
+      accountStatus: payload.accountStatus || 'active',
+      statusNote: payload.statusNote || null,
       device: payload.device || null,
       session: payload.session || null,
       streak: payload.streak ?? 0,
       points: payload.points ?? 0,
       badges: Array.isArray(payload.badges) ? clone(payload.badges) : [],
       referral_code: payload.referral_code || null,
+      lastLoginAt: payload.lastLoginAt || null,
+      disabledAt: payload.disabledAt || null,
+      blockedAt: payload.blockedAt || null,
       created_at: payload.created_at || nowIso(),
       updated_at: payload.updated_at || nowIso(),
     };
@@ -4214,6 +6322,22 @@ const usersRepository = {
   },
 };
 
+const buildViewerCourseRedactionOptions = async ({ course, userId, isAdmin = false } = {}) => {
+  if (isAdmin || !course?._id || !userId) {
+    return {
+      evaluateAccess: () => ({ blocked: false, reason: null }),
+      rules: [],
+    };
+  }
+
+  const rules = await listCourseContentAccessRulesForCourseUser(course._id, userId);
+  const evaluateAccess = createCourseAccessEvaluator({ course, rules });
+  return {
+    evaluateAccess,
+    rules,
+  };
+};
+
 const coursesRepository = {
   async list() {
     await ensurePlatformReady();
@@ -4253,18 +6377,49 @@ const coursesRepository = {
   async listForViewer(userId) {
     const viewerCacheKey = getViewerCourseListCacheKey(userId);
     return getCachedJsonValue(viewerCacheKey, async () => {
-      const courses = await coursesRepository.list();
+      if (userId) {
+        await paymentRepository.syncPendingRazorpayPaymentsForUser(userId, { maxRecords: 20 }).catch(() => undefined);
+      }
+      const data = await loadPlatformData();
+      const courses = data.courses.map((course) => clone(course));
       let enrollments = [];
+      let userEnrollments = [];
+      let userPayments = [];
       let isAdmin = false;
 
       if (userId) {
         const user = await usersRepository.findSafeById(userId);
         isAdmin = user?.role === 'admin';
-        enrollments = await getActiveEnrollmentsForUser(userId);
+        userEnrollments = data.enrollments.filter((entry) => entry.userId === String(userId));
+        enrollments = filterActiveEnrollments(userEnrollments);
+        userPayments = data.payments.filter((entry) => entry.userId === String(userId));
       }
 
       const enrolledCourseIds = new Set(enrollments.map((entry) => entry.courseId));
-      return courses.map((course) => redactCourseForViewer(course, isAdmin || enrolledCourseIds.has(course._id), { isAdmin }));
+      return Promise.all(courses.map(async (course) => {
+        const latestEnrollment = getLatestEntry(userEnrollments.filter((entry) => entry.courseId === course._id));
+        const latestPayment = getBestPaymentEntry(userPayments.filter((entry) => entry.courseId === course._id));
+        const access = getCourseVideoPlaybackAccess({
+          course,
+          enrollment: latestEnrollment,
+          payment: latestPayment,
+          isAdmin,
+        });
+        const hasFullCourseAccess = isAdmin || enrolledCourseIds.has(course._id) || Boolean(access.canAccessCourse);
+        const redactionOptions = await buildViewerCourseRedactionOptions({
+          course,
+          userId,
+          isAdmin,
+        });
+        return {
+          ...redactCourseForViewer(course, hasFullCourseAccess, {
+            isAdmin,
+            evaluateAccess: redactionOptions.evaluateAccess,
+          }),
+          enrolled: hasFullCourseAccess,
+          ...access,
+        };
+      }));
     }, VIEWER_COURSE_LOOKUP_CACHE_TTL_SECONDS);
   },
 
@@ -4290,6 +6445,9 @@ const coursesRepository = {
   async findVisibleById(id, userId) {
     const viewerCacheKey = getViewerCourseCacheKey(userId, id);
     return getCachedJsonValue(viewerCacheKey, async () => {
+      if (userId) {
+        await paymentRepository.syncPendingRazorpayPaymentsForUser(userId, { maxRecords: 20 }).catch(() => undefined);
+      }
       const course = await coursesRepository.findById(id);
       if (!course) {
         return null;
@@ -4297,13 +6455,50 @@ const coursesRepository = {
 
       let isEnrolled = false;
       let isAdmin = false;
+      let latestEnrollment = null;
+      let latestPayment = null;
       if (userId) {
         const user = await usersRepository.findSafeById(userId);
         isAdmin = user?.role === 'admin';
-        isEnrolled = await hasActiveEnrollmentForCourse(userId, id);
+        latestEnrollment = await getEnrollmentForCourse(userId, id);
+        if (isPostgresMode()) {
+          const payments = await pgMany(
+            `
+              SELECT * FROM payments
+              WHERE user_id = $1 AND course_id = $2
+              ORDER BY COALESCE(paid_at, updated_at, created_at) DESC
+            `,
+            [String(userId), String(id)],
+            mapPaymentRow,
+          );
+          latestPayment = getBestPaymentEntry(payments);
+        } else {
+          latestPayment = getBestPaymentEntry(state.payments.filter((entry) => entry.userId === String(userId) && entry.courseId === String(id)));
+        }
+        isEnrolled = Boolean(isAdmin || isEnrollmentActive(latestEnrollment));
       }
 
-      return redactCourseForViewer(course, isAdmin || isEnrolled, { isAdmin });
+      const access = getCourseVideoPlaybackAccess({
+        course,
+        enrollment: latestEnrollment,
+        payment: latestPayment,
+        isAdmin,
+      });
+
+      const redactionOptions = await buildViewerCourseRedactionOptions({
+        course,
+        userId,
+        isAdmin,
+      });
+
+      return {
+        ...redactCourseForViewer(course, isAdmin || isEnrolled || Boolean(access.canAccessCourse), {
+          isAdmin,
+          evaluateAccess: redactionOptions.evaluateAccess,
+        }),
+        enrolled: isAdmin || isEnrolled || Boolean(access.canAccessCourse),
+        ...access,
+      };
     }, VIEWER_COURSE_LOOKUP_CACHE_TTL_SECONDS);
   },
 
@@ -4365,8 +6560,483 @@ const coursesRepository = {
         isEnrolled = await hasActiveEnrollmentForCourse(userId, courseId);
       }
 
-      return lessonListFromCourse(redactCourseForViewer(course, isAdmin || isEnrolled, { isAdmin }));
+      const redactionOptions = await buildViewerCourseRedactionOptions({
+        course,
+        userId,
+        isAdmin,
+      });
+      return lessonListFromCourse(redactCourseForViewer(course, isAdmin || isEnrolled, {
+        isAdmin,
+        evaluateAccess: redactionOptions.evaluateAccess,
+      }));
     }, VIEWER_COURSE_LOOKUP_CACHE_TTL_SECONDS);
+  },
+
+  async listContentAccessRules({ courseId = '', studentId = '', studentScope = '', contentScope = '' } = {}) {
+    await ensurePlatformReady();
+    const normalizedCourseId = String(courseId || '').trim();
+    const normalizedStudentId = String(studentId || '').trim();
+    const normalizedStudentScope = String(studentScope || '').trim().toLowerCase();
+    const normalizedContentScope = String(contentScope || '').trim().toLowerCase();
+
+    if (isPostgresMode()) {
+      const params = [];
+      const clauses = [];
+      if (normalizedCourseId) {
+        params.push(normalizedCourseId);
+        clauses.push(`course_id = $${params.length}`);
+      }
+      if (normalizedStudentId) {
+        params.push(normalizedStudentId);
+        clauses.push(`student_id = $${params.length}`);
+      }
+      if (normalizedStudentScope) {
+        params.push(normalizedStudentScope);
+        clauses.push(`student_scope = $${params.length}`);
+      }
+      if (normalizedContentScope) {
+        params.push(normalizedContentScope);
+        clauses.push(`content_scope = $${params.length}`);
+      }
+      const whereClause = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+      return pgMany(
+        `SELECT * FROM course_content_access_rules ${whereClause} ORDER BY updated_at DESC, created_at DESC`,
+        params,
+        mapCourseContentAccessRuleRow,
+      );
+    }
+
+    return state.courseContentAccessRules
+      .map((entry) => normalizeCourseContentAccessRuleRecord(entry))
+      .filter((entry) => !normalizedCourseId || entry.courseId === normalizedCourseId)
+      .filter((entry) => !normalizedStudentId || entry.studentId === normalizedStudentId)
+      .filter((entry) => !normalizedStudentScope || entry.studentScope === normalizedStudentScope)
+      .filter((entry) => !normalizedContentScope || entry.contentScope === normalizedContentScope)
+      .sort((left, right) => String(right.updatedAt || '').localeCompare(String(left.updatedAt || '')));
+  },
+
+  async upsertContentAccessRule(payload) {
+    await ensurePlatformReady();
+    const normalized = normalizeCourseContentAccessRuleRecord(payload);
+
+    if (isPostgresMode()) {
+      const existing = await pgOne(
+        `
+          SELECT * FROM course_content_access_rules
+          WHERE course_id = $1
+            AND student_scope = $2
+            AND COALESCE(student_id, '') = COALESCE($3, '')
+            AND content_scope = $4
+            AND COALESCE(module_id, '') = COALESCE($5, '')
+            AND COALESCE(chapter_id, '') = COALESCE($6, '')
+            AND COALESCE(lesson_id, '') = COALESCE($7, '')
+        `,
+        [
+          normalized.courseId,
+          normalized.studentScope,
+          normalized.studentId,
+          normalized.contentScope,
+          normalized.moduleId,
+          normalized.chapterId,
+          normalized.lessonId,
+        ],
+        mapCourseContentAccessRuleRow,
+      );
+      const record = {
+        ...normalized,
+        _id: existing?._id || normalized._id,
+        createdAt: existing?.createdAt || normalized.createdAt,
+      };
+      await pgExec(
+        `
+          INSERT INTO course_content_access_rules (
+            id, course_id, student_scope, student_id, content_scope, module_id, chapter_id, lesson_id,
+            access, admin_note, created_by, updated_by, created_at, updated_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+          ON CONFLICT (id) DO UPDATE SET
+            access = EXCLUDED.access,
+            admin_note = EXCLUDED.admin_note,
+            created_by = EXCLUDED.created_by,
+            updated_by = EXCLUDED.updated_by,
+            updated_at = EXCLUDED.updated_at
+        `,
+        [
+          record._id,
+          record.courseId,
+          record.studentScope,
+          record.studentId,
+          record.contentScope,
+          record.moduleId,
+          record.chapterId,
+          record.lessonId,
+          record.access,
+          record.adminNote,
+          record.createdBy,
+          record.updatedBy,
+          record.createdAt,
+          record.updatedAt,
+        ],
+      );
+      invalidateGlobalPlatformCaches();
+      if (record.studentId) {
+        invalidateUserPlatformCaches(record.studentId);
+        await deleteRedisKey(getViewerCourseCacheKey(record.studentId, record.courseId)).catch(() => undefined);
+        await deleteRedisKey(getViewerLessonsCacheKey(record.studentId, record.courseId)).catch(() => undefined);
+      }
+      await deleteRedisKey(getCourseAccessRulesCacheKey(record.courseId, record.studentId || 'guest')).catch(() => undefined);
+      return record;
+    }
+
+    const existingIndex = state.courseContentAccessRules.findIndex((entry) =>
+      String(entry.courseId || '') === normalized.courseId
+      && normalizeStudentScope(entry.studentScope) === normalized.studentScope
+      && String(entry.studentId || '') === String(normalized.studentId || '')
+      && normalizeContentScope(entry.contentScope) === normalized.contentScope
+      && String(entry.moduleId || '') === String(normalized.moduleId || '')
+      && String(entry.chapterId || '') === String(normalized.chapterId || '')
+      && String(entry.lessonId || '') === String(normalized.lessonId || '')
+    );
+    const record = {
+      ...(existingIndex >= 0 ? normalizeCourseContentAccessRuleRecord(state.courseContentAccessRules[existingIndex]) : normalized),
+      ...normalized,
+      createdAt: existingIndex >= 0 ? state.courseContentAccessRules[existingIndex].createdAt : normalized.createdAt,
+    };
+    if (existingIndex >= 0) {
+      state.courseContentAccessRules[existingIndex] = record;
+    } else {
+      state.courseContentAccessRules.unshift(record);
+    }
+    invalidateGlobalPlatformCaches();
+    if (record.studentId) {
+      invalidateUserPlatformCaches(record.studentId);
+      await deleteRedisKey(getViewerCourseCacheKey(record.studentId, record.courseId)).catch(() => undefined);
+      await deleteRedisKey(getViewerLessonsCacheKey(record.studentId, record.courseId)).catch(() => undefined);
+    }
+    return clone(record);
+  },
+
+  async deleteContentAccessRule(ruleId) {
+    await ensurePlatformReady();
+    const normalizedRuleId = String(ruleId || '');
+
+    if (isPostgresMode()) {
+      const existing = await pgOne(
+        'SELECT * FROM course_content_access_rules WHERE id = $1',
+        [normalizedRuleId],
+        mapCourseContentAccessRuleRow,
+      );
+      if (!existing) {
+        return null;
+      }
+      await pgExec('DELETE FROM course_content_access_rules WHERE id = $1', [normalizedRuleId]);
+      invalidateGlobalPlatformCaches();
+      if (existing.studentId) {
+        invalidateUserPlatformCaches(existing.studentId);
+        await deleteRedisKey(getViewerCourseCacheKey(existing.studentId, existing.courseId)).catch(() => undefined);
+        await deleteRedisKey(getViewerLessonsCacheKey(existing.studentId, existing.courseId)).catch(() => undefined);
+      }
+      return existing;
+    }
+
+    const existingIndex = state.courseContentAccessRules.findIndex((entry) => String(entry._id || '') === normalizedRuleId);
+    if (existingIndex === -1) {
+      return null;
+    }
+    const [removed] = state.courseContentAccessRules.splice(existingIndex, 1);
+    invalidateGlobalPlatformCaches();
+    if (removed.studentId) {
+      invalidateUserPlatformCaches(removed.studentId);
+      await deleteRedisKey(getViewerCourseCacheKey(removed.studentId, removed.courseId)).catch(() => undefined);
+      await deleteRedisKey(getViewerLessonsCacheKey(removed.studentId, removed.courseId)).catch(() => undefined);
+    }
+    return clone(removed);
+  },
+
+  async listStudentLessonWatchOverrides({ courseId = '', studentId = '', lessonId = '' } = {}) {
+    await ensurePlatformReady();
+    const normalizedCourseId = String(courseId || '').trim();
+    const normalizedStudentId = String(studentId || '').trim();
+    const normalizedLessonId = String(lessonId || '').trim();
+
+    if (isPostgresMode()) {
+      const params = [];
+      const clauses = [];
+      if (normalizedCourseId) {
+        params.push(normalizedCourseId);
+        clauses.push(`course_id = $${params.length}`);
+      }
+      if (normalizedStudentId) {
+        params.push(normalizedStudentId);
+        clauses.push(`student_id = $${params.length}`);
+      }
+      if (normalizedLessonId) {
+        params.push(normalizedLessonId);
+        clauses.push(`lesson_id = $${params.length}`);
+      }
+      const whereClause = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+      return pgMany(
+        `SELECT * FROM student_lesson_watch_overrides ${whereClause} ORDER BY updated_at DESC, created_at DESC`,
+        params,
+        mapStudentLessonWatchOverrideRow,
+      );
+    }
+
+    return state.studentLessonWatchOverrides
+      .map((entry) => normalizeStudentLessonWatchOverrideRecord(entry))
+      .filter((entry) => !normalizedCourseId || entry.courseId === normalizedCourseId)
+      .filter((entry) => !normalizedStudentId || entry.studentId === normalizedStudentId)
+      .filter((entry) => !normalizedLessonId || entry.lessonId === normalizedLessonId)
+      .sort((left, right) => String(right.updatedAt || '').localeCompare(String(left.updatedAt || '')));
+  },
+
+  async upsertStudentLessonWatchOverride(payload) {
+    await ensurePlatformReady();
+    const normalized = normalizeStudentLessonWatchOverrideRecord(payload);
+
+    if (isPostgresMode()) {
+      await pgExec(
+        `
+          INSERT INTO student_lesson_watch_overrides (
+            id, course_id, student_id, module_id, chapter_id, lesson_id, allowed_full_watches,
+            watch_completion_percent, admin_note, created_by, updated_by, created_at, updated_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+          ON CONFLICT (course_id, student_id, lesson_id) DO UPDATE SET
+            module_id = EXCLUDED.module_id,
+            chapter_id = EXCLUDED.chapter_id,
+            allowed_full_watches = EXCLUDED.allowed_full_watches,
+            watch_completion_percent = EXCLUDED.watch_completion_percent,
+            admin_note = EXCLUDED.admin_note,
+            updated_by = EXCLUDED.updated_by,
+            updated_at = EXCLUDED.updated_at
+        `,
+        [
+          normalized._id,
+          normalized.courseId,
+          normalized.studentId,
+          normalized.moduleId,
+          normalized.chapterId,
+          normalized.lessonId,
+          normalized.allowedFullWatches,
+          normalized.watchCompletionPercent,
+          normalized.adminNote,
+          normalized.createdBy,
+          normalized.updatedBy,
+          normalized.createdAt,
+          normalized.updatedAt,
+        ],
+      );
+      const saved = await getStudentLessonWatchOverride({
+        studentId: normalized.studentId,
+        courseId: normalized.courseId,
+        lessonId: normalized.lessonId,
+      });
+      invalidateUserPlatformCaches(normalized.studentId);
+      await deleteRedisKey(getViewerCourseCacheKey(normalized.studentId, normalized.courseId)).catch(() => undefined);
+      await deleteRedisKey(getViewerLessonsCacheKey(normalized.studentId, normalized.courseId)).catch(() => undefined);
+      await deleteRedisKey(getStudentLessonWatchOverrideCacheKey(normalized.studentId, normalized.courseId, normalized.lessonId)).catch(() => undefined);
+      return saved || normalized;
+    }
+
+    const existingIndex = state.studentLessonWatchOverrides.findIndex((entry) =>
+      String(entry.studentId || '') === normalized.studentId
+      && String(entry.courseId || '') === normalized.courseId
+      && String(entry.lessonId || '') === normalized.lessonId
+    );
+    const record = {
+      ...(existingIndex >= 0 ? normalizeStudentLessonWatchOverrideRecord(state.studentLessonWatchOverrides[existingIndex]) : normalized),
+      ...normalized,
+      createdAt: existingIndex >= 0 ? state.studentLessonWatchOverrides[existingIndex].createdAt : normalized.createdAt,
+    };
+    if (existingIndex >= 0) {
+      state.studentLessonWatchOverrides[existingIndex] = record;
+    } else {
+      state.studentLessonWatchOverrides.unshift(record);
+    }
+    invalidateUserPlatformCaches(record.studentId);
+    await deleteRedisKey(getViewerCourseCacheKey(record.studentId, record.courseId)).catch(() => undefined);
+    await deleteRedisKey(getViewerLessonsCacheKey(record.studentId, record.courseId)).catch(() => undefined);
+    return clone(record);
+  },
+
+  async deleteStudentLessonWatchOverride(overrideId) {
+    await ensurePlatformReady();
+    const normalizedOverrideId = String(overrideId || '');
+
+    if (isPostgresMode()) {
+      const existing = await pgOne(
+        'SELECT * FROM student_lesson_watch_overrides WHERE id = $1',
+        [normalizedOverrideId],
+        mapStudentLessonWatchOverrideRow,
+      );
+      if (!existing) {
+        return null;
+      }
+      await pgExec('DELETE FROM student_lesson_watch_overrides WHERE id = $1', [normalizedOverrideId]);
+      invalidateUserPlatformCaches(existing.studentId);
+      await deleteRedisKey(getViewerCourseCacheKey(existing.studentId, existing.courseId)).catch(() => undefined);
+      await deleteRedisKey(getViewerLessonsCacheKey(existing.studentId, existing.courseId)).catch(() => undefined);
+      await deleteRedisKey(getStudentLessonWatchOverrideCacheKey(existing.studentId, existing.courseId, existing.lessonId)).catch(() => undefined);
+      return existing;
+    }
+
+    const existingIndex = state.studentLessonWatchOverrides.findIndex((entry) => String(entry._id || '') === normalizedOverrideId);
+    if (existingIndex === -1) {
+      return null;
+    }
+    const [removed] = state.studentLessonWatchOverrides.splice(existingIndex, 1);
+    invalidateUserPlatformCaches(removed.studentId);
+    await deleteRedisKey(getViewerCourseCacheKey(removed.studentId, removed.courseId)).catch(() => undefined);
+    await deleteRedisKey(getViewerLessonsCacheKey(removed.studentId, removed.courseId)).catch(() => undefined);
+    return clone(removed);
+  },
+
+  async addEditorialVideo(courseId, editorial) {
+    return withCourseMutationLock(courseId, async () => {
+      const course = await coursesRepository.findById(courseId);
+      if (!course) {
+        throw new ApiError(404, 'Course not found', { code: 'COURSE_NOT_FOUND' });
+      }
+
+      const nextEditorial = {
+        ...clone(editorial),
+        id: editorial.id || createPersistentId('editorial'),
+        type: 'private-video',
+        videoType: EDITORIAL_VIDEO_TYPE,
+        watchLimit: 1,
+        watchCompletionPercent: Math.max(Number(editorial.watchCompletionPercent || appConfig.videoWatchCompletionThresholdPercent || 90), 50),
+        published: editorial.published !== false,
+        uploadedAt: editorial.uploadedAt || nowIso(),
+      };
+      course.editorials = [nextEditorial, ...asArray(course.editorials).filter((entry) => String(entry.id) !== String(nextEditorial.id))];
+      course.updated_at = nowIso();
+      await coursesRepository.updateCourseModule(courseId, course);
+      return sanitizeEditorialVideoForViewer(nextEditorial, true, true);
+    });
+  },
+
+  async deleteEditorialVideo(courseId, editorialId) {
+    return withCourseMutationLock(courseId, async () => {
+      const course = await coursesRepository.findById(courseId);
+      if (!course) {
+        throw new ApiError(404, 'Course not found', { code: 'COURSE_NOT_FOUND' });
+      }
+
+      const editorials = asArray(course.editorials);
+      const target = editorials.find((entry) => String(entry.id) === String(editorialId));
+      if (!target) {
+        throw new ApiError(404, 'Editorial video not found', { code: 'EDITORIAL_NOT_FOUND' });
+      }
+
+      if (target.storagePath) {
+        const { deleteStoredPrivateVideo } = require('./private-video-storage.js');
+        await deleteStoredPrivateVideo({
+          storageProvider: target.storageProvider,
+          storagePath: target.storagePath,
+        }).catch(() => undefined);
+      }
+      if (target.hlsManifestPath) {
+        const { deleteProcessedHlsAssets } = require('./video-processing.js');
+        await deleteProcessedHlsAssets(target.hlsManifestPath, target.hlsStorageProvider || null).catch(() => undefined);
+      }
+
+      course.editorials = editorials.filter((entry) => String(entry.id) !== String(editorialId));
+      course.updated_at = nowIso();
+      await coursesRepository.updateCourseModule(courseId, course);
+      return true;
+    });
+  },
+
+  async getProtectedEditorialPlayback({
+    userId,
+    courseId,
+    editorialId,
+    user = null,
+    requestContext = null,
+  }) {
+    const course = await coursesRepository.findById(courseId);
+    if (!course) {
+      throw new ApiError(404, 'Course not found', { code: 'COURSE_NOT_FOUND' });
+    }
+
+    const editorial = asArray(course.editorials).find((entry) => String(entry.id) === String(editorialId));
+    if (!editorial || !editorial.storagePath || editorial.published === false) {
+      throw new ApiError(404, 'Editorial video not found', { code: 'EDITORIAL_NOT_FOUND' });
+    }
+
+    const resolvedUser = user || (userId ? await usersRepository.findSafeById(userId) : null);
+    if (!resolvedUser) {
+      throw new ApiError(401, 'Authorization token required', { code: 'AUTH_REQUIRED' });
+    }
+
+    if (resolvedUser.role !== 'admin') {
+      const hasAccess = await hasActiveEnrollmentForCourse(String(resolvedUser._id || userId), courseId);
+      if (!hasAccess) {
+        throw new ApiError(403, 'Course enrollment is required to access this editorial video', {
+          code: 'EDITORIAL_ENROLLMENT_REQUIRED',
+          details: { courseId, editorialId },
+        });
+      }
+    }
+
+    const durationSeconds = Math.max(Number(editorial.durationMinutes || 0) * 60, 1);
+    const { playbackSession, watchState } = await videoPlaybackRepository.startPlaybackSession({
+      userId: String(resolvedUser._id || userId),
+      courseId: String(courseId),
+      lessonId: null,
+      videoId: String(editorial.id),
+      videoType: EDITORIAL_VIDEO_TYPE,
+      videoDurationSeconds: durationSeconds,
+      authSessionId: resolvedUser.session || null,
+      requestContext,
+      ipAddress: requestContext?.ipAddress || null,
+      userAgent: requestContext?.userAgent || null,
+    });
+
+    const issuedToken = issuePlaybackToken({
+      userId: String(resolvedUser._id || userId),
+      sessionId: resolvedUser.session || null,
+      courseId: String(courseId),
+      editorialId: String(editorial.id),
+      videoId: String(editorial.id),
+      videoType: EDITORIAL_VIDEO_TYPE,
+      playbackSessionId: playbackSession.playbackSessionId,
+      userAgentHash: requestContext?.userAgentHash || null,
+      storageProvider: editorial.storageProvider || 'local',
+      storagePath: String(editorial.storagePath),
+      mimeType: editorial.mimeType || 'video/mp4',
+      assetKind: 'source',
+    });
+
+    return {
+      playerType: 'private-video',
+      embedUrl: null,
+      streamUrl: `/backend/api/courses/stream/${issuedToken.token}`,
+      drmConfig: null,
+      fallbackStreamUrl: null,
+      fallbackStreamFormat: null,
+      fallbackReason: null,
+      streamFormat: 'source',
+      playbackStatus: 'ready',
+      deliveryProfile: editorial.deliveryProfile || 'private-source',
+      availableQualities: [],
+      statusMessage: 'Protected editorial video ready.',
+      watermarkText: buildPlaybackWatermarkText(resolvedUser),
+      resumeSeconds: resolveProtectedLessonResumeSeconds({
+        watchState,
+        lessonProgress: null,
+        durationSeconds,
+      }),
+      completed: false,
+      tokenExpiresAt: issuedToken.expiresAt,
+      drmEnabled: false,
+      courseId: String(courseId),
+      videoId: String(editorial.id),
+      playbackSessionId: playbackSession.playbackSessionId,
+      videoType: EDITORIAL_VIDEO_TYPE,
+      watchLimit: watchState.allowedFullWatches,
+      watchCompletionPercent: watchState.fullWatchThresholdPercentage,
+      watchState: buildVideoWatchStateSummary(watchState),
+    };
   },
 
   async getProtectedLessonBootstrap({
@@ -4429,6 +7099,7 @@ const coursesRepository = {
           thumbnailUrl: updatedCourse.thumbnailUrl,
           instructor: updatedCourse.instructor,
           officialChannelUrl: updatedCourse.officialChannelUrl,
+          editorials: Array.isArray(updatedCourse.editorials) ? updatedCourse.editorials : [],
           modules: updatedCourse.modules,
           createdBy: updatedCourse.createdBy || null,
           created_at: updatedCourse.created_at,
@@ -4449,6 +7120,7 @@ const coursesRepository = {
       ...clone(updatedCourse),
       _id: state.courses[courseIndex]._id,
       modules: clone(updatedCourse.modules || []),
+      editorials: clone(updatedCourse.editorials || []),
       updated_at: nowIso(),
     };
     invalidateGlobalPlatformCaches();
@@ -4461,11 +7133,76 @@ const coursesRepository = {
 
   async delete(courseId) {
     if (isPostgresMode()) {
-      await pgExec('DELETE FROM courses WHERE id = $1', [String(courseId)]);
+      const normalizedCourseId = String(courseId);
+      const affectedUserIds = await pgMany(
+        `
+          SELECT DISTINCT user_id
+          FROM (
+            SELECT user_id FROM enrollments WHERE course_id = $1
+            UNION
+            SELECT user_id FROM watch_history WHERE course_id = $1
+            UNION
+            SELECT user_id FROM payments WHERE course_id = $1
+          ) affected
+        `,
+        [normalizedCourseId],
+        (row) => String(row.user_id || ''),
+      );
+
+      await runInTransaction(async (client) => {
+        await pgExec(
+          `
+            UPDATE tests
+            SET course_id = NULL
+            WHERE course_id = $1
+          `,
+          [normalizedCourseId],
+          client,
+        );
+        await pgExec(
+          `
+            UPDATE live_classes
+            SET course_id = NULL
+            WHERE course_id = $1
+          `,
+          [normalizedCourseId],
+          client,
+        );
+        await pgExec(
+          `
+            UPDATE live_classes
+            SET replay_course_id = NULL
+            WHERE replay_course_id = $1
+          `,
+          [normalizedCourseId],
+          client,
+        );
+        await pgExec(
+          `
+            UPDATE payments
+            SET course_id = NULL,
+                updated_at = now()
+            WHERE course_id = $1
+          `,
+          [normalizedCourseId],
+          client,
+        );
+        await pgExec(
+          `
+            UPDATE admin_uploads
+            SET course_id = NULL
+            WHERE course_id = $1
+          `,
+          [normalizedCourseId],
+          client,
+        );
+        await pgExec('DELETE FROM courses WHERE id = $1', [normalizedCourseId], client);
+      });
       invalidateGlobalPlatformCaches();
       try {
-        await deleteRedisKey(cacheKey('course', String(courseId)));
+        await deleteRedisKey(cacheKey('course', normalizedCourseId));
       } catch (error) {}
+      affectedUserIds.filter(Boolean).forEach((userId) => invalidateUserPlatformCaches(userId));
       return true;
     }
 
@@ -4475,14 +7212,46 @@ const coursesRepository = {
       return true;
     }
 
-    const courseIndex = state.courses.findIndex((course) => course._id === String(courseId));
+    const normalizedCourseId = String(courseId);
+    const affectedUserIds = new Set([
+      ...state.enrollments.filter((entry) => entry.courseId === normalizedCourseId).map((entry) => String(entry.userId || '')),
+      ...state.watchHistory.filter((entry) => entry.courseId === normalizedCourseId).map((entry) => String(entry.userId || '')),
+      ...state.payments.filter((entry) => entry.courseId === normalizedCourseId).map((entry) => String(entry.userId || '')),
+    ].filter(Boolean));
+    const courseIndex = state.courses.findIndex((course) => course._id === normalizedCourseId);
     if (courseIndex >= 0) {
       state.courses.splice(courseIndex, 1);
     }
+    state.enrollments = state.enrollments.filter((entry) => entry.courseId !== normalizedCourseId);
+    state.watchHistory = state.watchHistory.filter((entry) => entry.courseId !== normalizedCourseId);
+    state.videoWatchStates = state.videoWatchStates.filter((entry) => entry.courseId !== normalizedCourseId);
+    state.videoAccessGrants = state.videoAccessGrants.filter((entry) => entry.courseId !== normalizedCourseId);
+    state.liveReplayAccessGrants = state.liveReplayAccessGrants.filter((entry) => entry.courseId !== normalizedCourseId);
+    state.payments = state.payments.map((entry) => (
+      entry.courseId === normalizedCourseId
+        ? { ...entry, courseId: null }
+        : entry
+    ));
+    state.tests = state.tests.map((entry) => (
+      entry.courseId === normalizedCourseId
+        ? { ...entry, courseId: null }
+        : entry
+    ));
+    state.liveClasses = state.liveClasses.map((entry) => ({
+      ...entry,
+      courseId: entry.courseId === normalizedCourseId ? null : entry.courseId,
+      replayCourseId: entry.replayCourseId === normalizedCourseId ? null : entry.replayCourseId,
+    }));
+    state.uploads = state.uploads.map((entry) => (
+      entry.courseId === normalizedCourseId
+        ? { ...entry, courseId: null }
+        : entry
+    ));
     invalidateGlobalPlatformCaches();
     try {
-      await deleteRedisKey(cacheKey('course', String(courseId)));
+      await deleteRedisKey(cacheKey('course', normalizedCourseId));
     } catch (error) {}
+    affectedUserIds.forEach((userId) => invalidateUserPlatformCaches(userId));
     return courseIndex >= 0;
   },
 
@@ -4514,45 +7283,134 @@ const coursesRepository = {
     enforceEnrollment = true,
     enforceSequentialUnlock = true,
   }) {
-    const course = await coursesRepository.findById(courseId);
-    if (!course) {
-      throw new ApiError(404, 'Course not found', { code: 'COURSE_NOT_FOUND' });
-    }
+    const startedAtMs = Date.now();
+    const accessDecision = {
+      request_id: requestContext?.requestId || null,
+      replica: requestContext?.replica || String(process.env.REPLICA_NAME || process.env.HOSTNAME || process.env.SERVICE_NAME || `pid:${process.pid}`),
+      user_id: userId ? String(userId) : null,
+      course_id: String(courseId),
+      lesson_id: String(lessonId),
+      video_id: String(lessonId),
+      course_access_status: 'unknown',
+      course_validity_status: 'unknown',
+      video_release_status: 'unknown',
+      video_watch_limit_status: 'not_checked',
+      course_video_access_mode: 'free_order',
+      blocked_reason: null,
+      playback_session_id: null,
+      device_id: requestContext?.deviceId || null,
+      browser_tab_id: requestContext?.playbackTabId || null,
+      playback_url_generated: false,
+      bootstrap_duration_ms: null,
+      conflict_reason: null,
+      failure_code: null,
+    };
+    const logPlaybackAccessDecision = (level = 'info') => {
+      accessDecision.bootstrap_duration_ms = Date.now() - startedAtMs;
+      const payload = JSON.stringify(accessDecision);
+      if (level === 'warn') {
+        console.warn(`[course-video-access] ${payload}`);
+        return;
+      }
+      console.info(`[course-video-access] ${payload}`);
+    };
+    const finalizePlayer = (player) => {
+      accessDecision.video_id = String(player?.videoId || accessDecision.video_id || lessonId);
+      accessDecision.playback_session_id = player?.playbackSessionId || null;
+      accessDecision.playback_url_generated = Boolean(player?.streamUrl || player?.embedUrl);
+      logPlaybackAccessDecision('info');
+      return player;
+    };
 
-    const resolvedUser = user || await usersRepository.findSafeById(userId);
-    if (!resolvedUser) {
-      throw new ApiError(401, 'Authorization token required', { code: 'AUTH_REQUIRED' });
-    }
+    try {
+      const course = await coursesRepository.findById(courseId);
+      if (!course) {
+        throw new ApiError(404, 'Course not found', { code: 'COURSE_NOT_FOUND' });
+      }
 
-    const isAdmin = resolvedUser.role === 'admin';
-    const lesson = findLessonInCourse(course, lessonId);
-    if (!lesson) {
-      throw new ApiError(404, 'Lesson not found', { code: 'LESSON_NOT_FOUND' });
-    }
+      accessDecision.course_video_access_mode = getCourseVideoAccessMode(course);
 
-    const requireEnrollment = shouldRequireEnrollmentForLesson(lesson, enforceEnrollment);
-    const requireSequentialUnlock = shouldRequireSequentialUnlockForLesson(lesson, enforceSequentialUnlock, enforceEnrollment);
-    let isEnrolled = isAdmin || !requireEnrollment;
+      const resolvedUser = user || await usersRepository.findSafeById(userId);
+      if (!resolvedUser) {
+        throw new ApiError(401, 'Authorization token required', { code: 'AUTH_REQUIRED' });
+      }
 
-    if (!isEnrolled) {
-      isEnrolled = await hasActiveEnrollmentForCourse(userId, courseId);
-    }
+      const isAdmin = resolvedUser.role === 'admin';
+      const lesson = findLessonInCourse(course, lessonId);
+      if (!lesson) {
+        throw new ApiError(404, 'Lesson not found', { code: 'LESSON_NOT_FOUND' });
+      }
+      const lessonContext = findLessonContextInCourse(course, lessonId);
+      if (!lessonContext) {
+        throw new ApiError(404, 'Lesson not found', { code: 'LESSON_NOT_FOUND' });
+      }
 
-    if (!isEnrolled) {
-      throw new ApiError(403, 'Course enrollment is required to access this lesson', { code: 'COURSE_ACCESS_REQUIRED' });
-    }
+      accessDecision.video_id = String(lesson._id || lesson.id || lessonId);
 
-    const watchHistory = isPostgresMode()
-      ? await getPgWatchHistoryForCourseUser(userId, courseId)
-      : (await loadPlatformData()).watchHistory;
-    const progressMap = buildLessonProgressMap(watchHistory, userId, courseId);
+      const requireEnrollment = shouldRequireEnrollmentForLesson(lesson, enforceEnrollment);
+      const requireSequentialUnlock = shouldRequireSequentialUnlockForCourseLesson({
+        course,
+        lesson,
+        enforceSequentialUnlock,
+        enforceEnrollment,
+      });
+      let enrollment = null;
 
-    if (requireSequentialUnlock && !isAdmin && !isLessonSequentiallyUnlockedForProgressMap(course, lessonId, progressMap)) {
-      throw new ApiError(403, 'Finish the previous topic to unlock this lesson', { code: 'SEQUENTIAL_LOCKED' });
-    }
+      if (isAdmin || !requireEnrollment) {
+        accessDecision.course_access_status = isAdmin ? 'admin_override' : 'not_required';
+        accessDecision.course_validity_status = isAdmin ? 'admin_override' : 'not_required';
+      } else {
+        enrollment = await getEnrollmentForCourse(userId, courseId);
+        if (!enrollment) {
+          accessDecision.course_access_status = 'not_purchased';
+          accessDecision.course_validity_status = 'not_found';
+          throw new ApiError(403, 'Please purchase course to watch.', { code: 'COURSE_ACCESS_REQUIRED' });
+        }
 
-    const lessonProgress = progressMap.get(String(lessonId));
-    assertLessonReleasedForPlayback(lesson);
+        if (!isEnrollmentActive(enrollment)) {
+          accessDecision.course_access_status = 'expired';
+          accessDecision.course_validity_status = 'expired';
+          throw new ApiError(403, 'Course validity expired.', { code: 'COURSE_VALIDITY_EXPIRED' });
+        }
+
+        accessDecision.course_access_status = 'purchased_active';
+        accessDecision.course_validity_status = 'active';
+      }
+
+      if (!isAdmin) {
+        const redactionOptions = await buildViewerCourseRedactionOptions({
+          course,
+          userId,
+          isAdmin,
+        });
+        const contentAccessDecision = redactionOptions.evaluateAccess({
+          moduleId: lessonContext.moduleId,
+          chapterId: lessonContext.chapterId,
+          lessonId: lessonContext.lesson.id,
+        });
+        if (contentAccessDecision.blocked) {
+          accessDecision.blocked_reason = 'CONTENT_ACCESS_RULE_BLOCKED';
+          accessDecision.failure_code = 'LESSON_ACCESS_RULE_BLOCKED';
+          throw new ApiError(403, contentAccessDecision.reason || ACCESS_BLOCK_MESSAGE, {
+            code: 'LESSON_ACCESS_RULE_BLOCKED',
+          });
+        }
+      }
+
+      const watchHistory = isPostgresMode()
+        ? await getPgWatchHistoryForCourseUser(userId, courseId)
+        : (await loadPlatformData()).watchHistory;
+      const progressMap = buildLessonProgressMap(watchHistory, userId, courseId);
+
+      if (requireSequentialUnlock && !isAdmin && !isLessonSequentiallyUnlockedForProgressMap(course, lessonId, progressMap)) {
+        accessDecision.blocked_reason = 'SEQUENTIAL_LOCKED';
+        throw new ApiError(403, 'Finish the previous topic to unlock this lesson', { code: 'SEQUENTIAL_LOCKED' });
+      }
+
+      const lessonProgress = progressMap.get(String(lessonId));
+      const protectedLessonDurationSeconds = Math.max(Number(lesson.durationMinutes || 0) * 60, 0);
+      accessDecision.video_release_status = getLessonReleaseStatus(lesson);
+      assertLessonReleasedForPlayback(lesson);
 
     if (lesson.type === 'youtube') {
       const decryptedId = decryptVideoId(lesson.youtubeVideoIdCiphertext) || normalizeYouTubeVideoId(lesson.videoUrl);
@@ -4564,7 +7422,8 @@ const coursesRepository = {
         throw new ApiError(500, 'Protected lesson could not be prepared for playback', { code: 'EMBED_BUILD_FAILED' });
       }
 
-      return {
+      accessDecision.video_watch_limit_status = 'not_applicable';
+      return finalizePlayer({
         playerType: 'youtube',
         embedUrl,
         streamUrl: null,
@@ -4573,20 +7432,11 @@ const coursesRepository = {
         completed: Boolean(lessonProgress?.completed),
         tokenExpiresAt: null,
         drmEnabled: false,
-      };
+        courseVideoAccessMode: accessDecision.course_video_access_mode,
+      });
     }
 
     if (lesson.type === 'private-video') {
-      if (requireEnrollment && !isAdmin && requestContext) {
-        try {
-          assertProtectedPlaybackPlatformAllowed(requestContext);
-        } catch (error) {
-          throw new ApiError(error.statusCode || 403, error.message, {
-            code: error.code || 'PROTECTED_PLAYBACK_PLATFORM_UNSUPPORTED',
-          });
-        }
-      }
-
       const resolvedPlaybackProvider = getPrivateLessonPlaybackProvider(lesson);
       const isCloudflareStreamLesson = resolvedPlaybackProvider === 'cloudflare-stream';
       const cloudflareStreamReady = isCloudflareStreamLesson
@@ -4601,11 +7451,9 @@ const coursesRepository = {
         && lesson.hlsPlaybackPath;
       const sourceReady = Boolean(lesson.storagePath);
       const hlsProcessingStatus = String(lesson.hlsProcessingStatus || '').toLowerCase();
-      const paidProtectedPlayback = Boolean(requireEnrollment || lesson.premium);
-      const sourceFallbackAllowed = !paidProtectedPlayback && !appConfig.privateVideoDrmEnabled && (
-        Boolean(lesson.sourceFallbackAllowed ?? appConfig.sourcePlaybackFallbackEnabled)
-        || ['queued', 'processing', 'failed'].includes(hlsProcessingStatus)
-      );
+      const sourceFallbackAllowed = Boolean(lesson.sourceFallbackAllowed)
+        || Boolean(appConfig.sourcePlaybackFallbackEnabled)
+        || ['queued', 'processing', 'failed'].includes(hlsProcessingStatus);
 
       if (!hlsReady && !sourceReady && !isCloudflareStreamLesson) {
         throw new ApiError(isAdmin ? 500 : 404, isAdmin
@@ -4616,20 +7464,18 @@ const coursesRepository = {
       }
 
       if (!hlsReady) {
-        if (!isAdmin) {
-          throw new ApiError(404, 'Lesson video is not available yet.', {
-            code: 'LESSON_VIDEO_NOT_AVAILABLE',
-          });
-        }
-
         if (sourceReady && sourceFallbackAllowed) {
-          const grant = await consumeReplayGrant({
+          const { playbackSession, watchState } = await videoPlaybackRepository.startPlaybackSession({
             userId,
             courseId,
             lessonId,
-            sessionId: resolvedUser.session || null,
-            enforceEnrollment: requireEnrollment,
-            enforceSequentialUnlock: requireSequentialUnlock,
+            videoId: lesson._id || lesson.id || lessonId,
+            videoType: COURSE_VIDEO_TYPE,
+            videoDurationSeconds: Number(lesson.durationMinutes || 0) * 60,
+            authSessionId: resolvedUser.session || null,
+            requestContext,
+            ipAddress: requestContext?.ipAddress || null,
+            userAgent: requestContext?.userAgent || null,
           });
           const issuedToken = issuePlaybackToken({
             kind: 'course-private-source',
@@ -4637,6 +7483,9 @@ const coursesRepository = {
             sessionId: resolvedUser.session || null,
             courseId: String(courseId),
             lessonId: String(lessonId),
+            videoId: String(lesson._id || lesson.id || lessonId),
+            videoType: COURSE_VIDEO_TYPE,
+            playbackSessionId: playbackSession.playbackSessionId,
             userAgentHash: requestContext?.userAgentHash || null,
             storageProvider: lesson.storageProvider || 'local',
             storagePath: String(lesson.storagePath),
@@ -4644,17 +7493,22 @@ const coursesRepository = {
             assetKind: 'source',
           });
 
-          return {
+          accessDecision.video_watch_limit_status = watchState.isLocked ? 'reached' : 'within_limit';
+          return finalizePlayer({
             playerType: 'private-video',
             embedUrl: null,
             streamUrl: `/backend/api/courses/stream/${issuedToken.token}`,
             drmConfig: null,
             fallbackStreamUrl: null,
             fallbackStreamFormat: null,
-            fallbackReason: null,
+            fallbackReason: hlsProcessingStatus === 'queued' || hlsProcessingStatus === 'processing'
+              ? 'Protected source playback is active while adaptive HLS packaging finishes.'
+              : hlsProcessingStatus === 'failed' || lesson.hlsProcessingError
+                ? 'Protected source playback is active because adaptive HLS is temporarily unavailable.'
+                : 'Protected source playback is active for this lesson.',
             streamFormat: 'source',
             playbackStatus: lesson.hlsProcessingStatus || 'ready',
-            deliveryProfile: lesson.deliveryProfile || 'private-source',
+            deliveryProfile: lesson.deliveryProfile || 'r2-private-hls',
             availableQualities: Array.isArray(lesson.targetQualities) ? lesson.targetQualities : [],
             statusMessage: hlsProcessingStatus === 'queued' || hlsProcessingStatus === 'processing'
               ? 'Adaptive HLS processing is running. Protected source playback is temporarily available.'
@@ -4662,17 +7516,25 @@ const coursesRepository = {
                 ? 'Adaptive HLS processing failed. Protected source playback is temporarily available.'
                 : 'Protected lesson video ready.',
             watermarkText: buildPlaybackWatermarkText(resolvedUser),
-            resumeSeconds: Number(lessonProgress?.progressSeconds || 0),
+            resumeSeconds: resolveProtectedLessonResumeSeconds({
+              watchState,
+              lessonProgress,
+              durationSeconds: protectedLessonDurationSeconds,
+            }),
             completed: Boolean(lessonProgress?.completed),
             tokenExpiresAt: issuedToken.expiresAt,
             drmEnabled: false,
-            watchLimit: Number(grant.maxViews || getLessonConfiguredWatchLimit(lesson)),
-            watchCompletionPercent: getLessonConfiguredCompletionPercent(lesson),
-            playbackGrantExpiresAt: grant.expiresAt || null,
-            playbackGrantRemainingViews: hasReplayViewLimit()
-              ? Number(grant.maxViews || replayMaxViews) - Number(grant.usedViews || 0)
-              : null,
-          };
+            courseId: String(courseId),
+            videoId: String(lesson._id || lesson.id || lessonId),
+            playbackSessionId: playbackSession.playbackSessionId,
+            videoType: COURSE_VIDEO_TYPE,
+            watchLimit: watchState.allowedFullWatches,
+            watchCompletionPercent: watchState.fullWatchThresholdPercentage,
+            watchState: buildVideoWatchStateSummary(watchState),
+            playbackGrantExpiresAt: null,
+            playbackGrantRemainingViews: null,
+            courseVideoAccessMode: accessDecision.course_video_access_mode,
+          });
         }
 
         if (hlsProcessingStatus === 'queued' || hlsProcessingStatus === 'processing') {
@@ -4683,7 +7545,8 @@ const coursesRepository = {
             console.error('[video-processing] failed to requeue stale course lesson', error);
           }
 
-          return {
+          accessDecision.video_watch_limit_status = 'not_checked';
+          return finalizePlayer({
             playerType: 'private-video',
             embedUrl: null,
             streamUrl: null,
@@ -4693,7 +7556,10 @@ const coursesRepository = {
             availableQualities: Array.isArray(lesson.targetQualities) ? lesson.targetQualities : [],
             statusMessage: 'Adaptive stream is still preparing. Playback will unlock automatically after HLS packaging completes.',
             watermarkText: buildPlaybackWatermarkText(resolvedUser),
-            resumeSeconds: Number(lessonProgress?.progressSeconds || 0),
+            resumeSeconds: resolveProtectedLessonResumeSeconds({
+              lessonProgress,
+              durationSeconds: protectedLessonDurationSeconds,
+            }),
             completed: Boolean(lessonProgress?.completed),
             tokenExpiresAt: null,
             drmEnabled: Boolean(appConfig.privateVideoDrmEnabled),
@@ -4701,14 +7567,16 @@ const coursesRepository = {
             watchCompletionPercent: getLessonConfiguredCompletionPercent(lesson),
             playbackGrantExpiresAt: null,
             playbackGrantRemainingViews: null,
-          };
+            courseVideoAccessMode: accessDecision.course_video_access_mode,
+          });
         }
 
         try {
           const { maybeRecoverStaleCourseVideoProcessingJob } = require('./video-processing.js');
           const requeued = await maybeRecoverStaleCourseVideoProcessingJob({ courseId, lesson });
           if (requeued) {
-            return {
+            accessDecision.video_watch_limit_status = 'not_checked';
+            return finalizePlayer({
               playerType: 'private-video',
               embedUrl: null,
               streamUrl: null,
@@ -4718,7 +7586,10 @@ const coursesRepository = {
               availableQualities: Array.isArray(lesson.targetQualities) ? lesson.targetQualities : [],
               statusMessage: 'Adaptive stream is being prepared again. Playback will unlock automatically after HLS packaging completes.',
               watermarkText: buildPlaybackWatermarkText(resolvedUser),
-              resumeSeconds: Number(lessonProgress?.progressSeconds || 0),
+              resumeSeconds: resolveProtectedLessonResumeSeconds({
+                lessonProgress,
+                durationSeconds: protectedLessonDurationSeconds,
+              }),
               completed: Boolean(lessonProgress?.completed),
               tokenExpiresAt: null,
               drmEnabled: Boolean(appConfig.privateVideoDrmEnabled),
@@ -4726,7 +7597,8 @@ const coursesRepository = {
               watchCompletionPercent: getLessonConfiguredCompletionPercent(lesson),
               playbackGrantExpiresAt: null,
               playbackGrantRemainingViews: null,
-            };
+              courseVideoAccessMode: accessDecision.course_video_access_mode,
+            });
           }
         } catch (error) {
           console.error('[video-processing] failed to requeue failed course lesson', error);
@@ -4736,13 +7608,17 @@ const coursesRepository = {
           code: 'PRIVATE_VIDEO_HLS_NOT_READY',
         });
       }
-      const grant = await consumeReplayGrant({
+      const { playbackSession, watchState } = await videoPlaybackRepository.startPlaybackSession({
         userId,
         courseId,
         lessonId,
-        sessionId: resolvedUser.session || null,
-        enforceEnrollment: requireEnrollment,
-        enforceSequentialUnlock: requireSequentialUnlock,
+        videoId: lesson._id || lesson.id || lessonId,
+        videoType: COURSE_VIDEO_TYPE,
+        videoDurationSeconds: Number(lesson.durationMinutes || 0) * 60,
+        authSessionId: resolvedUser.session || null,
+        requestContext,
+        ipAddress: requestContext?.ipAddress || null,
+        userAgent: requestContext?.userAgent || null,
       });
       const playbackPath = hlsReady ? String(lesson.hlsPlaybackPath) : String(lesson.storagePath);
       const playbackMimeType = hlsReady ? 'application/vnd.apple.mpegurl' : (lesson.mimeType || 'video/mp4');
@@ -4758,21 +7634,13 @@ const coursesRepository = {
         lessonId,
         userId,
         sessionId: resolvedUser.session || null,
+        playbackSessionId: playbackSession.playbackSessionId,
+        videoId: String(lesson._id || lesson.id || lessonId),
+        videoType: COURSE_VIDEO_TYPE,
         playbackContext: requestContext,
       });
 
-      if (
-        paidProtectedPlayback
-        && appConfig.privateVideoRequireDrmForPaidPlayback
-        && !cloudflarePlayback
-        && !drmConfig
-      ) {
-        throw new ApiError(503, 'DRM playback is required for this paid lesson but DRM is not fully configured yet.', {
-          code: 'DRM_REQUIRED_FOR_PAID_PLAYBACK',
-        });
-      }
-
-      const issuedToken = hlsReady
+        const issuedToken = hlsReady
         ? (
           cloudflarePlayback
             ? {
@@ -4799,6 +7667,9 @@ const coursesRepository = {
           sessionId: resolvedUser.session || null,
           courseId: String(courseId),
           lessonId: String(lessonId),
+          videoId: String(lesson._id || lesson.id || lessonId),
+          videoType: COURSE_VIDEO_TYPE,
+          playbackSessionId: playbackSession.playbackSessionId,
           userAgentHash: requestContext?.userAgentHash || null,
           storageProvider: playbackProvider,
           storagePath: playbackPath,
@@ -4806,34 +7677,108 @@ const coursesRepository = {
           assetKind: 'source',
         });
 
-      return {
+      accessDecision.video_watch_limit_status = watchState.isLocked ? 'reached' : 'within_limit';
+      const sourceIssuedToken = sourceReady && sourceFallbackAllowed
+        ? issuePlaybackToken({
+          kind: 'course-private-source',
+          userId: String(userId),
+          sessionId: resolvedUser.session || null,
+          courseId: String(courseId),
+          lessonId: String(lessonId),
+          videoId: String(lesson._id || lesson.id || lessonId),
+          videoType: COURSE_VIDEO_TYPE,
+          playbackSessionId: playbackSession.playbackSessionId,
+          userAgentHash: requestContext?.userAgentHash || null,
+          storageProvider: lesson.storageProvider || 'local',
+          storagePath: String(lesson.storagePath),
+          mimeType: lesson.mimeType || 'video/mp4',
+          assetKind: 'source',
+        })
+        : null;
+
+      return finalizePlayer({
         playerType: 'private-video',
         embedUrl: null,
         streamUrl: issuedToken.url,
         drmConfig,
-        fallbackStreamUrl: null,
-        fallbackStreamFormat: null,
-        fallbackReason: null,
+        fallbackStreamUrl: sourceIssuedToken ? `/backend/api/courses/stream/${sourceIssuedToken.token}` : null,
+        fallbackStreamFormat: sourceIssuedToken ? 'source' : null,
+        fallbackReason: sourceIssuedToken
+          ? 'Protected source playback is available if adaptive HLS needs to recover.'
+          : null,
         streamFormat: 'hls',
         playbackStatus: 'ready',
         deliveryProfile: lesson.deliveryProfile || (cloudflarePlayback ? 'cloudflare-stream' : 'r2-private-hls'),
         availableQualities: Array.isArray(lesson.targetQualities) ? lesson.targetQualities : [],
         statusMessage: 'Adaptive HLS stream ready.',
         watermarkText: buildPlaybackWatermarkText(resolvedUser),
-        resumeSeconds: Number(lessonProgress?.progressSeconds || 0),
+        resumeSeconds: resolveProtectedLessonResumeSeconds({
+          watchState,
+          lessonProgress,
+          durationSeconds: protectedLessonDurationSeconds,
+        }),
         completed: Boolean(lessonProgress?.completed),
         tokenExpiresAt: issuedToken.expiresAt,
         drmEnabled: Boolean(drmConfig),
-        watchLimit: Number(grant.maxViews || getLessonConfiguredWatchLimit(lesson)),
-        watchCompletionPercent: getLessonConfiguredCompletionPercent(lesson),
-        playbackGrantExpiresAt: grant.expiresAt || null,
-        playbackGrantRemainingViews: hasReplayViewLimit()
-          ? Number(grant.maxViews || replayMaxViews) - Number(grant.usedViews || 0)
-          : null,
-      };
+        courseId: String(courseId),
+        videoId: String(lesson._id || lesson.id || lessonId),
+        playbackSessionId: playbackSession.playbackSessionId,
+        videoType: COURSE_VIDEO_TYPE,
+        watchLimit: watchState.allowedFullWatches,
+        watchCompletionPercent: watchState.fullWatchThresholdPercentage,
+        watchState: buildVideoWatchStateSummary(watchState),
+        playbackGrantExpiresAt: null,
+        playbackGrantRemainingViews: null,
+        courseVideoAccessMode: accessDecision.course_video_access_mode,
+      });
     }
 
     throw new ApiError(400, 'Secure playback is only available for protected lessons', { code: 'UNSUPPORTED_LESSON_TYPE' });
+    } catch (error) {
+      accessDecision.failure_code = error?.code || error?.name || 'UNKNOWN_ERROR';
+      accessDecision.conflict_reason = error?.details?.conflictReason || error?.details?.decisionReason || null;
+      accessDecision.blocked_reason = error?.code || error?.message || 'UNKNOWN_ERROR';
+      if (accessDecision.video_release_status === 'unknown') {
+        accessDecision.video_release_status = 'not_checked';
+      }
+      if (accessDecision.course_access_status === 'unknown') {
+        accessDecision.course_access_status = 'not_checked';
+      }
+      if (accessDecision.course_validity_status === 'unknown') {
+        accessDecision.course_validity_status = 'not_checked';
+      }
+      if (accessDecision.video_watch_limit_status === 'not_checked' && error?.code === 'VIDEO_WATCH_LIMIT_REACHED') {
+        accessDecision.video_watch_limit_status = 'reached';
+      }
+      logPlaybackAccessDecision('warn');
+      throw error;
+    }
+  },
+
+  async delete(id) {
+    if (isPostgresMode()) {
+      await pgExec('DELETE FROM users WHERE id = $1', [String(id)]);
+      try {
+        await deleteRedisKey(cacheKey('user', String(id)));
+        await deleteRedisKey(cacheKey('user-session', String(id)));
+      } catch (error) {}
+      invalidateGlobalPlatformCaches();
+      invalidateUserPlatformCaches(id);
+      return true;
+    }
+
+    if (isMongoMode()) {
+      await User.findByIdAndDelete(id);
+      return true;
+    }
+
+    const index = state.users.findIndex((user) => user._id === String(id));
+    if (index >= 0) {
+      state.users.splice(index, 1);
+      return true;
+    }
+
+    return false;
   },
 };
 
@@ -5124,7 +8069,7 @@ const testsRepository = {
     return true;
   },
 
-  async getProtectedVideoPlayback(testId, { userId = null, userRole = 'guest', user = null } = {}) {
+  async getProtectedVideoPlayback(testId, { userId = null, userRole = 'guest', user = null, requestContext = null } = {}) {
     const test = await testsRepository.findById(testId);
     if (!test) {
       throw new ApiError(404, 'Test not found', { code: 'TEST_NOT_FOUND' });
@@ -5163,6 +8108,7 @@ const testsRepository = {
       }
     }
 
+    const linkedCourseId = getLinkedCourseIdForTest(test) || `test:${String(test._id)}`;
     const hlsReady = video.deliveryStrategy === 'hls'
       && video.hlsProcessingStatus === 'ready'
       && video.hlsPlaybackPath;
@@ -5178,12 +8124,29 @@ const testsRepository = {
     const playbackBundleVersion = String(video.hlsManifestVersion || '').trim();
     const drmConfig = null;
     const allowSourceFallback = !drmConfig && sourceFallbackAllowed;
+    const { playbackSession, watchState } = await videoPlaybackRepository.startPlaybackSession({
+      userId: String(resolvedUser._id || userId),
+      courseId: linkedCourseId,
+      lessonId: null,
+      videoId: video.id || test._id,
+      videoType: EXPLANATION_VIDEO_TYPE,
+      videoDurationSeconds: Number(video.durationMinutes || 0) * 60,
+      authSessionId: resolvedUser.session || null,
+      requestContext,
+      ipAddress: requestContext?.ipAddress || null,
+      userAgent: requestContext?.userAgent || null,
+    });
 
     const sourceIssuedToken = allowSourceFallback && sourceReady
       ? issuePlaybackToken({
         userId: String(resolvedUser._id || userId),
         sessionId: resolvedUser.session || null,
         testId: String(test._id),
+        courseId: linkedCourseId,
+        videoId: String(video.id || test._id),
+        videoType: EXPLANATION_VIDEO_TYPE,
+        playbackSessionId: playbackSession.playbackSessionId,
+        userAgentHash: requestContext?.userAgentHash || null,
         storageProvider: video.storageProvider || 'local',
         storagePath: String(video.storagePath),
         mimeType: video.mimeType || 'video/mp4',
@@ -5211,6 +8174,11 @@ const testsRepository = {
         userId: String(resolvedUser._id || userId),
         sessionId: resolvedUser.session || null,
         testId: String(test._id),
+        courseId: linkedCourseId,
+        videoId: String(video.id || test._id),
+        videoType: EXPLANATION_VIDEO_TYPE,
+        playbackSessionId: playbackSession.playbackSessionId,
+        userAgentHash: requestContext?.userAgentHash || null,
         storageProvider: playbackProvider,
         storagePath: playbackPath,
         mimeType: playbackMimeType,
@@ -5239,10 +8207,21 @@ const testsRepository = {
             ? 'Adaptive HLS processing failed. Protected source playback is temporarily available.'
             : 'Protected test-series video ready.',
       watermarkText: buildPlaybackWatermarkText(resolvedUser),
-      resumeSeconds: 0,
+      resumeSeconds: resolveProtectedLessonResumeSeconds({
+        watchState,
+        lessonProgress: null,
+        durationSeconds: Number(video.durationMinutes || 0) * 60,
+      }),
       completed: false,
       tokenExpiresAt: issuedToken.expiresAt,
       drmEnabled: Boolean(drmConfig),
+      courseId: linkedCourseId,
+      videoId: String(video.id || test._id),
+      playbackSessionId: playbackSession.playbackSessionId,
+      videoType: EXPLANATION_VIDEO_TYPE,
+      watchLimit: watchState.allowedFullWatches,
+      watchCompletionPercent: watchState.fullWatchThresholdPercentage,
+      watchState: buildVideoWatchStateSummary(watchState),
     };
   },
 
@@ -5857,10 +8836,15 @@ const quizzesRepository = {
 };
 
 const notificationsRepository = {
-  async list(userId) {
+  async list(userId, options = {}) {
     await ensurePlatformReady();
 
-    const cacheKeyNotifications = userId ? cacheKey('notifications', `user:${userId}`) : cacheKey('notifications', 'list');
+    const requestedLimit = Number(options.limit || 0);
+    const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+      ? Math.max(1, Math.min(Math.floor(requestedLimit), 100))
+      : null;
+    const cacheScope = userId ? `user:${userId}` : 'list';
+    const cacheKeyNotifications = cacheKey('notifications', limit ? `${cacheScope}:limit:${limit}` : cacheScope);
     const notificationsCacheTtlMs = Math.max(500, Number(appConfig.notificationsCacheTtlMs || 2000));
 
     try {
@@ -5870,9 +8854,15 @@ const notificationsRepository = {
 
     if (isPostgresMode()) {
       if (userId) {
+        const params = [String(userId)];
+        let sql = 'SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC';
+        if (limit) {
+          params.push(limit);
+          sql += ' LIMIT $2';
+        }
         const rows = await pgMany(
-          'SELECT * FROM notifications WHERE user_id = $1 ORDER BY created_at DESC',
-          [String(userId)],
+          sql,
+          params,
           mapNotificationRow,
         );
         try { await setRedisJson(cacheKeyNotifications, rows, { ttlSeconds: Math.ceil(notificationsCacheTtlMs / 1000) }); } catch (e) {}
@@ -5891,10 +8881,44 @@ const notificationsRepository = {
     const result = items
       .slice()
       .sort((left, right) => sortNewestFirst(left, right, 'createdAt'))
+      .slice(0, limit || undefined)
       .map((item) => clone(item));
 
     try { await setRedisJson(cacheKeyNotifications, result, { ttlSeconds: Math.ceil(notificationsCacheTtlMs / 1000) }); } catch (e) {}
     return result;
+  },
+
+  async count(userId) {
+    await ensurePlatformReady();
+
+    if (!userId) {
+      return Number(state.notifications?.length || 0);
+    }
+
+    const cacheKeyNotificationsCount = cacheKey('notifications-count', `user:${userId}`);
+    const notificationsCacheTtlMs = Math.max(500, Number(appConfig.notificationsCacheTtlMs || 2000));
+    try {
+      const cached = await getRedisJson(cacheKeyNotificationsCount);
+      if (cached !== null && cached !== undefined) {
+        return Number(cached || 0);
+      }
+    } catch (e) {}
+
+    let total = 0;
+    if (isPostgresMode()) {
+      total = await pgOne(
+        'SELECT COUNT(*)::int AS total FROM notifications WHERE user_id = $1 AND is_read = FALSE',
+        [String(userId)],
+        (row) => Number(row.total || 0),
+      );
+    } else {
+      total = state.notifications.filter((notification) => notification.userId === String(userId) && !notification.isRead).length;
+    }
+
+    try {
+      await setRedisJson(cacheKeyNotificationsCount, total, { ttlSeconds: Math.ceil(notificationsCacheTtlMs / 1000) });
+    } catch (e) {}
+    return total;
   },
 
   async create(payload) {
@@ -5916,6 +8940,8 @@ const notificationsRepository = {
       actionUrl: payload.actionUrl || null,
       actionLabel: payload.actionLabel || null,
       payload: asObject(payload.payload),
+      isRead: Boolean(payload.isRead),
+      readAt: payload.readAt || null,
       createdAt: nowIso(),
     };
 
@@ -5932,6 +8958,70 @@ const notificationsRepository = {
     state.notifications.push(notification);
     invalidateUserPlatformCaches(notification.userId);
     return clone(notification);
+  },
+
+  async markRead(userId, notificationId) {
+    await ensurePlatformReady();
+    const now = nowIso();
+
+    if (isPostgresMode()) {
+      const notification = await pgOne(
+        `
+          UPDATE notifications
+          SET is_read = TRUE,
+              read_at = COALESCE(read_at, $3)
+          WHERE id = $1 AND user_id = $2
+          RETURNING *
+        `,
+        [String(notificationId), String(userId), now],
+        mapNotificationRow,
+      );
+      if (!notification) {
+        return null;
+      }
+      invalidateUserPlatformCaches(String(userId));
+      return notification;
+    }
+
+    const entry = state.notifications.find((notification) =>
+      notification._id === String(notificationId) && notification.userId === String(userId));
+    if (!entry) {
+      return null;
+    }
+    entry.isRead = true;
+    entry.readAt = entry.readAt || now;
+    invalidateUserPlatformCaches(String(userId));
+    return clone(entry);
+  },
+
+  async markAllRead(userId) {
+    await ensurePlatformReady();
+    const now = nowIso();
+
+    if (isPostgresMode()) {
+      const result = await pgExec(
+        `
+          UPDATE notifications
+          SET is_read = TRUE,
+              read_at = COALESCE(read_at, $2)
+          WHERE user_id = $1 AND is_read = FALSE
+        `,
+        [String(userId), now],
+      );
+      invalidateUserPlatformCaches(String(userId));
+      return Number(result.rowCount || 0);
+    }
+
+    let count = 0;
+    state.notifications.forEach((notification) => {
+      if (notification.userId === String(userId) && !notification.isRead) {
+        notification.isRead = true;
+        notification.readAt = notification.readAt || now;
+        count += 1;
+      }
+    });
+    invalidateUserPlatformCaches(String(userId));
+    return count;
   },
 
   async resolveLiveClassAudience(liveClass) {
@@ -6945,42 +10035,7 @@ const analyticsRepository = {
     }
 
     const data = await loadPlatformData();
-    const quizInsights = computeQuizInsights(data, userId);
-    const testInsights = computeTestInsights(data, userId);
-    const seriesPerformance = buildTestSeriesPerformance(data, userId);
-    const weakTopics = new Set(
-      seriesPerformance.length > 0
-        ? seriesPerformance.flatMap((series) => series.focusConcepts.map((concept) => concept.topic)).slice(0, 8)
-        : (testInsights.latestAttempt?.weakTopics || []),
-    );
-    const strongTopics = new Set(
-      seriesPerformance.length > 0
-        ? seriesPerformance.flatMap((series) => series.healthyConcepts.map((concept) => concept.topic)).slice(0, 8)
-        : (testInsights.latestAttempt?.strongTopics || []),
-    );
-
-    const accuracyValues = [quizInsights.accuracy, testInsights.accuracy].filter((value) => value > 0);
-    const accuracy = accuracyValues.length === 0
-      ? 0
-      : Number((accuracyValues.reduce((sum, value) => sum + value, 0) / accuracyValues.length).toFixed(2));
-
-    const speed = testInsights.attempts.length === 0
-      ? quizInsights.attempts === 0 ? 0 : 1.1
-      : Number((testInsights.attempts.length / Math.max(testInsights.attempts.length, 1)).toFixed(2));
-
-    const attempts = quizInsights.attempts + testInsights.attempts.length;
-
-    const result = {
-      accuracy,
-      speed,
-      attempts,
-      weakTopics: Array.from(weakTopics),
-      strongTopics: Array.from(strongTopics),
-      suggestions: [buildAiRecommendation({ accuracy, weakTopics: Array.from(weakTopics), attempts })].filter(Boolean),
-      trend: buildAnalyticsTrend(data, userId),
-      adaptivePlan: computeAdaptivePlan({ accuracy, attempts }),
-      seriesPerformance,
-    };
+    const result = buildUserAnalyticsFromData(data, userId);
 
     try {
       await setRedisJson(cacheKeyUserAnalytics, result, { ttlSeconds: Math.ceil(userAnalyticsCacheTtlMs / 1000) });
@@ -7118,6 +10173,541 @@ const analyticsRepository = {
     };
   },
 };
+
+const findPgPaymentByIdentifiers = async ({
+  paymentId = '',
+  providerOrderId = '',
+  providerPaymentId = '',
+  userId = '',
+  courseId = '',
+}, client = null) => {
+  const filters = [`provider = 'razorpay'`];
+  const params = [];
+  const identifierFilters = [];
+
+  if (paymentId) {
+    params.push(String(paymentId));
+    identifierFilters.push(`id = $${params.length}`);
+  }
+  if (providerOrderId) {
+    params.push(String(providerOrderId));
+    identifierFilters.push(`provider_order_id = $${params.length}`);
+  }
+  if (providerPaymentId) {
+    params.push(String(providerPaymentId));
+    identifierFilters.push(`provider_payment_id = $${params.length}`);
+  }
+  if (identifierFilters.length === 0) {
+    return null;
+  }
+  filters.push(`(${identifierFilters.join(' OR ')})`);
+  if (userId) {
+    params.push(String(userId));
+    filters.push(`user_id = $${params.length}`);
+  }
+  if (courseId) {
+    params.push(String(courseId));
+    filters.push(`course_id = $${params.length}`);
+  }
+
+  return pgOne(
+    `
+      SELECT * FROM payments
+      WHERE ${filters.join(' AND ')}
+      ORDER BY COALESCE(paid_at, updated_at, created_at) DESC
+      LIMIT 1
+    `,
+    params,
+    mapPaymentRow,
+    client,
+  );
+};
+
+const findMemoryPaymentByIdentifiers = ({
+  paymentId = '',
+  providerOrderId = '',
+  providerPaymentId = '',
+  userId = '',
+  courseId = '',
+}) => state.payments.find((payment) => {
+  if (payment.provider !== 'razorpay') {
+    return false;
+  }
+  const identifierMatch = (
+    (paymentId && payment._id === String(paymentId))
+    || (providerOrderId && payment.providerOrderId === String(providerOrderId))
+    || (providerPaymentId && payment.providerPaymentId === String(providerPaymentId))
+  );
+  if (!identifierMatch) {
+    return false;
+  }
+  if (userId && payment.userId !== String(userId)) {
+    return false;
+  }
+  if (courseId && payment.courseId !== String(courseId)) {
+    return false;
+  }
+  return true;
+}) || null;
+
+const findRazorpayPaymentByReference = async ({
+  paymentId = '',
+  providerOrderId = '',
+  providerPaymentId = '',
+  userId = '',
+  courseId = '',
+}, client = null) => {
+  const exact = isPostgresMode()
+    ? await findPgPaymentByIdentifiers({ paymentId, providerOrderId, providerPaymentId, userId, courseId }, client)
+    : findMemoryPaymentByIdentifiers({ paymentId, providerOrderId, providerPaymentId, userId, courseId });
+  if (exact) {
+    return exact;
+  }
+  if (!userId || !courseId) {
+    return null;
+  }
+  if (isPostgresMode()) {
+    return pgOne(
+      `
+        SELECT * FROM payments
+        WHERE provider = 'razorpay'
+          AND user_id = $1
+          AND course_id = $2
+        ORDER BY COALESCE(paid_at, updated_at, created_at) DESC
+        LIMIT 1
+      `,
+      [String(userId), String(courseId)],
+      mapPaymentRow,
+      client,
+    );
+  }
+  return getLatestEntry(state.payments.filter((entry) =>
+    entry.provider === 'razorpay'
+    && entry.userId === String(userId)
+    && entry.courseId === String(courseId))) || null;
+};
+
+const verifyAndActivateRazorpayAccess = async ({
+  paymentId = '',
+  providerOrderId = '',
+  providerPaymentId = '',
+  userId = '',
+  courseId = '',
+  remotePayment = null,
+  remoteOrder = null,
+  syncSource = 'system',
+  reason = '',
+  actorId = null,
+  ipAddress = null,
+  userAgent = null,
+  callbackSignatureVerified = false,
+  webhookSignatureVerified = false,
+}, client = null) => {
+  const payment = typeof paymentId === 'object' && paymentId
+    ? paymentId
+    : await findRazorpayPaymentByReference({
+      paymentId,
+      providerOrderId,
+      providerPaymentId,
+      userId,
+      courseId,
+    }, client);
+
+  if (!payment) {
+    return {
+      payment: null,
+      remoteOrder: remoteOrder ? clone(remoteOrder) : null,
+      remotePayment: remotePayment ? clone(remotePayment) : null,
+      outcome: 'pending',
+      verificationDecision: 'LOCAL_TRANSACTION_NOT_FOUND',
+      verificationReason: 'No safe local transaction could be matched.',
+      enrollment: null,
+      enrollmentCreated: false,
+      accessEnabled: false,
+      validityUpdated: false,
+      cacheRefreshed: false,
+      manualReviewRequired: true,
+    };
+  }
+  if (payment.provider !== 'razorpay') {
+    throw new ApiError(400, 'Only Razorpay transactions can be synced from gateway', { code: 'RAZORPAY_SYNC_UNSUPPORTED' });
+  }
+
+  const resolvedProviderOrderId = String(providerOrderId || payment.providerOrderId || remotePayment?.order_id || remoteOrder?.id || '').trim();
+  const resolvedProviderPaymentId = String(providerPaymentId || payment.providerPaymentId || remotePayment?.id || '').trim();
+  const fetchedRemoteOrder = remoteOrder || (resolvedProviderOrderId ? await fetchRazorpayOrder(resolvedProviderOrderId).catch(() => null) : null);
+  const remotePayments = remotePayment
+    ? [remotePayment]
+    : resolvedProviderPaymentId
+      ? [await fetchRazorpayPayment(resolvedProviderPaymentId).catch(() => null)].filter(Boolean)
+      : resolvedProviderOrderId
+        ? await fetchRazorpayOrderPayments(resolvedProviderOrderId).catch(() => [])
+        : [];
+  const resolvedRemotePayment = selectBestRazorpayPayment(remotePayments, payment.providerPaymentId);
+  const user = payment.userId ? await usersRepository.findSafeById(payment.userId).catch(() => null) : null;
+  const course = payment.courseId ? await coursesRepository.findById(payment.courseId).catch(() => null) : null;
+  if (!course && payment.courseId) {
+    throw new ApiError(404, 'Course not found', { code: 'COURSE_NOT_FOUND' });
+  }
+
+  const remoteOrderNotes = asObject(fetchedRemoteOrder?.notes);
+  const remotePaymentOrderId = String(resolvedRemotePayment?.order_id || '').trim();
+  const remoteOrderId = String(fetchedRemoteOrder?.id || '').trim();
+  const remoteStatus = String(resolvedRemotePayment?.status || '').trim().toLowerCase();
+  const receivedAmountPaise = Number(resolvedRemotePayment?.amount || 0);
+  const expectedAmountPaise = course ? getCoursePayableAmountPaise(course) : Number(payment.meta?.expectedAmountPaise || 0);
+  const currency = String(resolvedRemotePayment?.currency || fetchedRemoteOrder?.currency || payment.currency || 'INR').trim().toUpperCase();
+  const localUserId = String(payment.userId || '').trim();
+  const localCourseId = String(payment.courseId || '').trim();
+  const orderMatches = Boolean(resolvedProviderOrderId && remotePaymentOrderId && resolvedProviderOrderId === remotePaymentOrderId);
+  const remoteOrderMatches = !resolvedProviderOrderId || !remoteOrderId || resolvedProviderOrderId === remoteOrderId;
+  const amountMatches = expectedAmountPaise > 0 && receivedAmountPaise > 0 && expectedAmountPaise === receivedAmountPaise;
+  const currencyMatches = currency === 'INR';
+  const refundDetected = Boolean(
+    String(resolvedRemotePayment?.refund_status || '').trim()
+    || Number(resolvedRemotePayment?.amount_refunded || 0) > 0
+    || remoteStatus === 'refunded'
+  );
+  const disputeDetected = Boolean(resolvedRemotePayment?.disputed);
+  const orderNoteUserId = String(remoteOrderNotes.userId || '').trim();
+  const orderNoteCourseId = String(remoteOrderNotes.courseId || '').trim();
+  const gatewayEmail = normalizeEmail(resolvedRemotePayment?.email || '');
+  const gatewayContact = normalizeMobileNumber(resolvedRemotePayment?.contact || '');
+  const localEmail = normalizeEmail(user?.email || '');
+  const localMobile = normalizeMobileNumber(user?.mobileNumber || '');
+  const userMatches = (!orderNoteUserId || orderNoteUserId === localUserId)
+    && (!gatewayEmail || !localEmail || gatewayEmail === localEmail)
+    && (!gatewayContact || !localMobile || gatewayContact === localMobile);
+  const courseMatches = (!orderNoteCourseId || orderNoteCourseId === localCourseId)
+    && (!payment.meta?.courseId || String(payment.meta.courseId) === localCourseId);
+  const verificationNotes = [];
+
+  let verificationDecision = 'MANUAL_REVIEW_REQUIRED';
+  let verificationReason = '';
+  if (!resolvedRemotePayment || !fetchedRemoteOrder) {
+    verificationDecision = 'MANUAL_REVIEW_REQUIRED';
+    verificationReason = 'Razorpay order or payment could not be verified safely.';
+  } else if (!orderMatches || !remoteOrderMatches) {
+    verificationDecision = 'ORDER_MISMATCH';
+    verificationReason = 'Gateway payment does not belong to the expected Razorpay order.';
+  } else if (!currencyMatches || !amountMatches) {
+    verificationDecision = 'AMOUNT_MISMATCH';
+    verificationReason = !currencyMatches
+      ? `Currency mismatch. Expected INR but received ${currency || 'unknown'}.`
+      : 'Payment amount does not match the expected course amount.';
+  } else if (!userMatches) {
+    verificationDecision = 'USER_MISMATCH';
+    verificationReason = 'Gateway order/payment details do not safely match the expected student.';
+  } else if (!courseMatches) {
+    verificationDecision = 'COURSE_MISMATCH';
+    verificationReason = 'Gateway order/payment details do not safely match the expected course.';
+  } else if (refundDetected || disputeDetected) {
+    verificationDecision = 'REFUNDED_OR_CHARGEBACK';
+    verificationReason = disputeDetected
+      ? 'Payment is disputed or suspicious at Razorpay.'
+      : 'Payment was refunded at Razorpay.';
+  } else if (remoteStatus === 'failed') {
+    verificationDecision = 'GATEWAY_FAILED';
+    verificationReason = String(resolvedRemotePayment?.error_description || 'Razorpay marked the payment as failed.');
+  } else if (['authorized', 'created', 'pending'].includes(remoteStatus)) {
+    verificationDecision = 'GATEWAY_PENDING';
+    verificationReason = 'Payment is still pending confirmation at Razorpay.';
+  } else if (remoteStatus === 'captured') {
+    verificationDecision = 'VERIFIED_CAPTURED_ACTIVATED';
+    verificationReason = 'Gateway order, payment, amount, user, and course all matched safely.';
+  }
+
+  if (orderNoteUserId) {
+    verificationNotes.push(`Gateway order user note: ${orderNoteUserId}`);
+  }
+  if (orderNoteCourseId) {
+    verificationNotes.push(`Gateway order course note: ${orderNoteCourseId}`);
+  }
+  if (gatewayEmail) {
+    verificationNotes.push(`Gateway email: ${gatewayEmail}`);
+  }
+  if (gatewayContact) {
+    verificationNotes.push(`Gateway contact: ${gatewayContact}`);
+  }
+
+  const presentation = getRazorpayVerificationPresentation(verificationDecision);
+  const localStatus = mapRazorpayStatusToLocalPaymentStatus(resolvedRemotePayment?.status);
+  const effectiveStatus = verificationDecision === 'VERIFIED_CAPTURED_ACTIVATED'
+    ? 'paid'
+    : verificationDecision === 'GATEWAY_FAILED'
+      ? 'failed'
+      : verificationDecision === 'REFUNDED_OR_CHARGEBACK'
+        ? 'refunded'
+        : 'pending';
+  const nextMeta = buildRazorpayVerificationMeta({
+    payment,
+    course,
+    user,
+    remoteOrder: fetchedRemoteOrder,
+    remotePayment: resolvedRemotePayment,
+    previousMeta: payment.meta,
+    syncSource,
+    verificationDecision,
+    verificationReason,
+    verificationNotes,
+    callbackSignatureVerified,
+    webhookSignatureVerified,
+  });
+  const previousPayment = clone(payment);
+  const nextPayment = {
+    ...payment,
+    providerOrderId: String(resolvedRemotePayment?.order_id || fetchedRemoteOrder?.id || payment.providerOrderId || ''),
+    providerPaymentId: String(resolvedRemotePayment?.id || payment.providerPaymentId || ''),
+    status: effectiveStatus,
+    retryable: effectiveStatus !== 'paid',
+    lastError: effectiveStatus === 'failed'
+      ? String(resolvedRemotePayment?.error_description || payment.lastError || 'Payment failed on Razorpay.')
+      : (presentation.manualReviewRequired ? verificationReason : null),
+    paidAt: effectiveStatus === 'paid'
+      ? (payment.paidAt || toUnixTimestampIso(resolvedRemotePayment?.captured_at || resolvedRemotePayment?.created_at) || nowIso())
+      : payment.paidAt || null,
+    updatedAt: nowIso(),
+    meta: nextMeta,
+  };
+
+  if (client) {
+    const duplicatePayment = nextPayment.providerPaymentId
+      ? await pgOne(
+        'SELECT id FROM payments WHERE provider_payment_id = $1 AND id <> $2 LIMIT 1',
+        [nextPayment.providerPaymentId, payment._id],
+        (row) => row,
+        client,
+      )
+      : null;
+    if (duplicatePayment) {
+      throw new ApiError(409, 'Duplicate gateway payment ID is not allowed', { code: 'DUPLICATE_TRANSACTION_ID' });
+    }
+    await insertPgPayment(nextPayment, client);
+  } else {
+    const duplicatePayment = nextPayment.providerPaymentId
+      ? state.payments.find((entry) => entry.providerPaymentId === nextPayment.providerPaymentId && entry._id !== payment._id)
+      : null;
+    if (duplicatePayment) {
+      throw new ApiError(409, 'Duplicate gateway payment ID is not allowed', { code: 'DUPLICATE_TRANSACTION_ID' });
+    }
+    const paymentIndex = state.payments.findIndex((entry) => entry._id === payment._id);
+    if (paymentIndex >= 0) {
+      state.payments[paymentIndex] = nextPayment;
+    }
+  }
+
+  const previousEnrollment = payment.courseId && payment.userId
+    ? await getEnrollmentForCourse(payment.userId, payment.courseId, client)
+    : null;
+  const hasVerifiedCapturedAccessForCourse = async () => {
+    if (!payment.courseId || !payment.userId) {
+      return false;
+    }
+
+    if (verificationDecision === 'VERIFIED_CAPTURED_ACTIVATED') {
+      return true;
+    }
+
+    if (client) {
+      const verifiedMatch = await pgOne(
+        `
+          SELECT id
+          FROM payments
+          WHERE user_id = $1
+            AND course_id = $2
+            AND id <> $3
+            AND status = 'paid'
+            AND UPPER(COALESCE(payment_meta ->> 'verificationDecision', payment_meta ->> 'verificationStatus', '')) = 'VERIFIED_CAPTURED_ACTIVATED'
+            AND LOWER(COALESCE(payment_meta ->> 'gatewayStatus', payment_meta ->> 'razorpayGatewayStatus', '')) = 'captured'
+            AND COALESCE(NULLIF(provider_payment_id, ''), '') <> ''
+            AND COALESCE(NULLIF(provider_order_id, ''), '') <> ''
+          LIMIT 1
+        `,
+        [payment.userId, payment.courseId, payment._id],
+        (row) => row,
+        client,
+      );
+      return Boolean(verifiedMatch);
+    }
+
+    return state.payments.some((entry) => (
+      entry._id !== payment._id
+      && entry.userId === payment.userId
+      && entry.courseId === payment.courseId
+      && String(entry.status || '').toLowerCase() === 'paid'
+      && normalizeRazorpayVerificationDecision(entry.meta?.verificationDecision || entry.meta?.verificationStatus || '') === 'VERIFIED_CAPTURED_ACTIVATED'
+      && String(entry.meta?.gatewayStatus || entry.meta?.razorpayGatewayStatus || '').toLowerCase() === 'captured'
+      && Boolean(entry.providerPaymentId)
+      && Boolean(entry.providerOrderId)
+    ));
+  };
+  let enrollment = previousEnrollment;
+  let enrollmentCreated = false;
+  let accessEnabled = false;
+  let validityUpdated = false;
+
+  if (verificationDecision === 'VERIFIED_CAPTURED_ACTIVATED' && payment.courseId && payment.userId && course) {
+    const nextExpiry = (!enrollment || !isEnrollmentActive(enrollment))
+      ? addDaysIso(course.validityDays || courseDefaultValidityDays)
+      : enrollment.expiresAt || addDaysIso(course.validityDays || courseDefaultValidityDays);
+
+    if (client) {
+      enrollment = await insertPgEnrollment({
+        userId: payment.userId,
+        courseId: payment.courseId,
+        source: syncSource === 'manual_admin_grant' ? 'manual_admin_grant' : 'razorpay',
+        accessType: 'course',
+        accessStatus: 'enabled',
+        adminNote: reason || 'Auto-synced from Razorpay captured payment',
+        validityDays: course.validityDays || courseDefaultValidityDays,
+        expiresAt: nextExpiry,
+      }, client);
+    } else if (previousEnrollment) {
+      previousEnrollment.source = syncSource === 'manual_admin_grant' ? 'manual_admin_grant' : 'razorpay';
+      previousEnrollment.accessStatus = 'enabled';
+      previousEnrollment.adminNote = reason || 'Auto-synced from Razorpay captured payment';
+      previousEnrollment.expiresAt = nextExpiry;
+      previousEnrollment.updatedAt = nowIso();
+      enrollment = previousEnrollment;
+    } else {
+      enrollment = {
+        _id: nextId('enrollment'),
+        userId: payment.userId,
+        courseId: payment.courseId,
+        accessType: 'course',
+        source: syncSource === 'manual_admin_grant' ? 'manual_admin_grant' : 'razorpay',
+        accessStatus: 'enabled',
+        adminNote: reason || 'Auto-synced from Razorpay captured payment',
+        enrolledAt: nowIso(),
+        expiresAt: nextExpiry,
+        viewCount: 0,
+        updatedAt: nowIso(),
+      };
+      state.enrollments.push(enrollment);
+    }
+    enrollmentCreated = !previousEnrollment;
+    accessEnabled = true;
+    validityUpdated = !previousEnrollment?.expiresAt || !isEnrollmentActive(previousEnrollment);
+  } else if (previousEnrollment && payment.courseId && payment.userId) {
+    const enrollmentSource = String(previousEnrollment.source || '').toLowerCase();
+    const isManualGrant = ['manual_admin_grant', 'admin', 'admin_repair'].includes(enrollmentSource);
+    if (!isManualGrant) {
+      const hasVerifiedCapturedAccess = await hasVerifiedCapturedAccessForCourse();
+      const shouldDisable = !hasVerifiedCapturedAccess;
+      const disabledReason = verificationReason || (
+        shouldDisable
+          ? 'Access disabled after Razorpay verification failed.'
+          : 'Access held until payment verification completes.'
+      );
+      if (client) {
+        enrollment = await insertPgEnrollment({
+          _id: previousEnrollment._id,
+          userId: payment.userId,
+          courseId: payment.courseId,
+          source: enrollmentSource || 'razorpay',
+          accessType: previousEnrollment.accessType || 'course',
+          accessStatus: shouldDisable ? 'disabled' : previousEnrollment.accessStatus || 'enabled',
+          adminNote: reason || disabledReason,
+          enrolledAt: previousEnrollment.enrolledAt || nowIso(),
+          expiresAt: previousEnrollment.expiresAt || addDaysIso(courseDefaultValidityDays),
+          viewCount: previousEnrollment.viewCount || 0,
+          updatedAt: nowIso(),
+        }, client);
+      } else {
+        if (shouldDisable) {
+          previousEnrollment.accessStatus = 'disabled';
+        }
+        previousEnrollment.adminNote = reason || disabledReason;
+        previousEnrollment.updatedAt = nowIso();
+        enrollment = previousEnrollment;
+      }
+    }
+  }
+
+  if (payment.userId) {
+    const user = await usersRepository.findSafeById(payment.userId).catch(() => null);
+    if (user) {
+      queueBestEffortDeviceActivity({
+        userId: user._id,
+        sessionId: user.session,
+        device: user.device,
+        eventType: effectiveStatus === 'paid' ? 'payment_completed' : effectiveStatus === 'failed' ? 'payment_failed' : 'payment_status_synced',
+        meta: {
+          paymentId: payment._id,
+          provider: 'razorpay',
+          courseId: payment.courseId || null,
+          status: effectiveStatus,
+          verificationDecision,
+          gatewayStatus: nextMeta.gatewayStatus || null,
+          providerPaymentId: nextPayment.providerPaymentId || null,
+        },
+      });
+    }
+  }
+
+  await insertAdminAuditLogEntry({
+    adminUserId: actorId || 'system',
+    actionType: syncSource === 'system' ? 'razorpay_payment_auto_synced' : 'razorpay_payment_synced',
+    targetUserId: payment.userId || null,
+    courseId: payment.courseId || null,
+    transactionId: nextPayment.providerPaymentId || payment.providerPaymentId || payment._id,
+    oldValue: previousPayment,
+    newValue: {
+      verificationDecision,
+      verificationReason,
+      payment: nextPayment,
+      remoteOrder: fetchedRemoteOrder ? {
+        id: fetchedRemoteOrder.id || null,
+        amount: Number(fetchedRemoteOrder.amount || 0) || null,
+        currency: fetchedRemoteOrder.currency || null,
+        status: fetchedRemoteOrder.status || null,
+        notes: asObject(fetchedRemoteOrder.notes),
+      } : null,
+      remotePayment: {
+        id: resolvedRemotePayment?.id || null,
+        orderId: resolvedRemotePayment?.order_id || null,
+        status: resolvedRemotePayment?.status || null,
+        method: resolvedRemotePayment?.method || null,
+        rrn: getRazorpayAcquirerReference(resolvedRemotePayment),
+      },
+      enrollment,
+    },
+    reason: reason || verificationReason || `Razorpay ${effectiveStatus} sync`,
+    ipAddress,
+    userAgent,
+  }, client);
+
+  console.info('[payments] razorpay reconciliation complete', {
+    paymentId: payment._id,
+    providerOrderId: nextPayment.providerOrderId || null,
+    providerPaymentId: nextPayment.providerPaymentId || null,
+    localStatus: effectiveStatus,
+    gatewayStatus: nextMeta.gatewayStatus || null,
+    verificationDecision,
+    userId: payment.userId || null,
+    courseId: payment.courseId || null,
+    syncSource,
+    enrollmentCreated,
+    accessEnabled,
+  });
+
+  return {
+    payment: clone(nextPayment),
+    remoteOrder: fetchedRemoteOrder ? clone(fetchedRemoteOrder) : null,
+    remotePayment: resolvedRemotePayment ? clone(resolvedRemotePayment) : null,
+    enrollment: enrollment ? clone(enrollment) : null,
+    outcome: effectiveStatus,
+    verificationDecision,
+    verificationReason,
+    enrollmentCreated,
+    accessEnabled,
+    validityUpdated,
+    cacheRefreshed: Boolean(payment.userId),
+    manualReviewRequired: Boolean(nextMeta.manualReviewRequired),
+  };
+};
+
+const reconcileRazorpayPaymentRecord = async (payload, client = null) => verifyAndActivateRazorpayAccess(payload, client);
 
 const paymentRepository = {
   async createCheckout(payload) {
@@ -7263,159 +10853,200 @@ const paymentRepository = {
     const providerOrderId = String(payload.providerOrderId || '');
     const providerPaymentId = String(payload.providerPaymentId || '');
     const providerSignature = String(payload.providerSignature || '');
+    const remoteStatus = String(payload.remoteStatus || 'captured').trim().toLowerCase() || 'captured';
+    const remoteCreatedAt = Number(payload.remoteCreatedAt || 0);
+    const remoteMethod = String(payload.remoteMethod || '').trim() || null;
+    const remoteAcquirerData = asObject(payload.remoteAcquirerData);
+
+    const loadPayment = async (client = null) => {
+      const payment = client
+        ? await pgOne('SELECT * FROM payments WHERE id = $1 AND user_id = $2', [paymentId, userId], mapPaymentRow, client)
+        : state.payments.find((item) => item._id === paymentId && item.userId === userId) || null;
+      if (!payment) {
+        throw new ApiError(404, 'Payment not found', { code: 'PAYMENT_NOT_FOUND' });
+      }
+      if (payment.provider !== 'razorpay') {
+        throw new ApiError(400, 'Payment provider mismatch', { code: 'PAYMENT_PROVIDER_MISMATCH' });
+      }
+      if (payment.courseId !== courseId) {
+        throw new ApiError(400, 'Payment does not match this course', { code: 'PAYMENT_COURSE_MISMATCH' });
+      }
+      if (payment.providerOrderId !== providerOrderId) {
+        throw new ApiError(400, 'Payment order mismatch', { code: 'PAYMENT_ORDER_MISMATCH' });
+      }
+      return payment;
+    };
+
+    const remotePayment = {
+      id: providerPaymentId,
+      order_id: providerOrderId,
+      status: remoteStatus,
+      captured: remoteStatus === 'captured',
+      created_at: Number.isFinite(remoteCreatedAt) && remoteCreatedAt > 0 ? remoteCreatedAt : Math.floor(Date.now() / 1000),
+      method: remoteMethod,
+      acquirer_data: remoteAcquirerData,
+    };
 
     if (isPostgresMode()) {
       const result = await runInTransaction(async (client) => {
-        const payment = await pgOne(
-          'SELECT * FROM payments WHERE id = $1 AND user_id = $2',
-          [paymentId, userId],
-          mapPaymentRow,
-          client,
-        );
-        if (!payment) {
-          throw new ApiError(404, 'Payment not found', { code: 'PAYMENT_NOT_FOUND' });
-        }
-        if (payment.provider !== 'razorpay') {
-          throw new ApiError(400, 'Payment provider mismatch', { code: 'PAYMENT_PROVIDER_MISMATCH' });
-        }
-        if (payment.courseId !== courseId) {
-          throw new ApiError(400, 'Payment does not match this course', { code: 'PAYMENT_COURSE_MISMATCH' });
-        }
-        if (payment.providerOrderId !== providerOrderId) {
-          throw new ApiError(400, 'Payment order mismatch', { code: 'PAYMENT_ORDER_MISMATCH' });
-        }
-
-        const course = await coursesRepository.findById(courseId);
-        if (!course) {
-          throw new ApiError(404, 'Course not found', { code: 'COURSE_NOT_FOUND' });
-        }
-
-        const updatedPayment = {
-          ...payment,
+        const payment = await loadPayment(client);
+        const synced = await verifyAndActivateRazorpayAccess({
+          paymentId: {
+            ...payment,
+            providerSignature,
+            meta: {
+              ...asObject(payment.meta),
+              verifiedAt: nowIso(),
+              verifiedBy: 'checkout_signature',
+            },
+          },
+          providerOrderId,
           providerPaymentId,
-          providerSignature,
-          status: 'paid',
-          retryable: false,
-          lastError: null,
-          paidAt: payment.paidAt || nowIso(),
-          updatedAt: nowIso(),
-          meta: {
-            ...asObject(payment.meta),
-            verifiedAt: nowIso(),
-          },
-        };
-        await insertPgPayment(updatedPayment, client);
-
-        const existingEnrollment = await pgOne(
-          `SELECT * FROM enrollments WHERE user_id = $1 AND course_id = $2 AND ${activeEnrollmentSql} LIMIT 1`,
-          [userId, courseId],
-          mapEnrollmentRow,
-          client,
-        );
-        const enrollment = existingEnrollment || await insertPgEnrollment({
-          userId,
-          courseId,
-          source: 'razorpay',
-          accessType: 'course',
-          validityDays: course.validityDays || courseDefaultValidityDays,
-          expiresAt: addDaysIso(course.validityDays || courseDefaultValidityDays),
+          remotePayment,
+          syncSource: 'checkout_signature',
+          reason: 'Verified from Razorpay checkout signature callback',
+          actorId: userId,
+          callbackSignatureVerified: true,
         }, client);
-
-        queueBestEffortDeviceActivity({
-          userId,
-          eventType: 'payment_completed',
-          meta: {
-            paymentId,
-            provider: 'razorpay',
-            courseId,
-            amount: updatedPayment.amount,
-            providerPaymentId,
-          },
-        });
-
         return {
-          payment: updatedPayment,
-          enrollment,
+          payment: synced.payment,
+          enrollment: synced.enrollment,
+          verificationDecision: synced.verificationDecision,
         };
       });
-
       invalidatePlatformDataCache();
       invalidateUserPlatformCaches(userId);
       return result;
     }
 
-    const paymentIndex = state.payments.findIndex((item) => item._id === paymentId && item.userId === userId);
-    if (paymentIndex === -1) {
-      throw new ApiError(404, 'Payment not found', { code: 'PAYMENT_NOT_FOUND' });
-    }
-    const payment = state.payments[paymentIndex];
-    if (payment.provider !== 'razorpay') {
-      throw new ApiError(400, 'Payment provider mismatch', { code: 'PAYMENT_PROVIDER_MISMATCH' });
-    }
-    if (payment.courseId !== courseId) {
-      throw new ApiError(400, 'Payment does not match this course', { code: 'PAYMENT_COURSE_MISMATCH' });
-    }
-    if (payment.providerOrderId !== providerOrderId) {
-      throw new ApiError(400, 'Payment order mismatch', { code: 'PAYMENT_ORDER_MISMATCH' });
-    }
-
-    const course = await coursesRepository.findById(courseId);
-    if (!course) {
-      throw new ApiError(404, 'Course not found', { code: 'COURSE_NOT_FOUND' });
-    }
-
-    state.payments[paymentIndex] = {
-      ...payment,
+    const payment = await loadPayment();
+    const synced = await verifyAndActivateRazorpayAccess({
+      paymentId: {
+        ...payment,
+        providerSignature,
+        meta: {
+          ...asObject(payment.meta),
+          verifiedAt: nowIso(),
+          verifiedBy: 'checkout_signature',
+        },
+      },
+      providerOrderId,
       providerPaymentId,
-      providerSignature,
-      status: 'paid',
-      retryable: false,
-      lastError: null,
-      paidAt: payment.paidAt || nowIso(),
-      updatedAt: nowIso(),
-      meta: {
-        ...asObject(payment.meta),
-        verifiedAt: nowIso(),
-      },
-    };
-
-    let enrollment = state.enrollments.find(
-      (entry) => entry.userId === userId && entry.courseId === courseId && (!entry.expiresAt || Date.parse(entry.expiresAt) > Date.now()),
-    ) || null;
-    if (!enrollment) {
-      enrollment = {
-        _id: nextId('enrollment'),
-        userId,
-        courseId,
-        accessType: 'course',
-        source: 'razorpay',
-        enrolledAt: nowIso(),
-        expiresAt: addDaysIso(course.validityDays || courseDefaultValidityDays),
-        viewCount: 0,
-      };
-      state.enrollments.push(enrollment);
-    }
-
-    queueBestEffortDeviceActivity({
-      userId,
-      eventType: 'payment_completed',
-      meta: {
-        paymentId,
-        provider: 'razorpay',
-        courseId,
-        amount: state.payments[paymentIndex].amount,
-        providerPaymentId,
-      },
+      remotePayment,
+      syncSource: 'checkout_signature',
+      reason: 'Verified from Razorpay checkout signature callback',
+      actorId: userId,
+      callbackSignatureVerified: true,
     });
-
+    invalidatePlatformDataCache();
+    invalidateUserPlatformCaches(userId);
     return {
-      payment: clone(state.payments[paymentIndex]),
-      enrollment: clone(enrollment),
+      payment: synced.payment,
+      enrollment: synced.enrollment,
+      verificationDecision: synced.verificationDecision,
     };
   },
 
   async handleWebhook(payload) {
     await ensurePlatformReady();
+    const isRazorpayWebhook = Boolean(payload?.event && payload?.payload?.payment?.entity);
+
+    if (isRazorpayWebhook) {
+      const paymentEntity = payload.payload.payment.entity || {};
+      const paymentId = String(paymentEntity.id || '').trim();
+      const orderId = String(paymentEntity.order_id || '').trim();
+      const webhookStatus = mapRazorpayStatusToLocalPaymentStatus(paymentEntity.status);
+
+      if (isPostgresMode()) {
+        const result = await runInTransaction(async (client) => {
+          const localPayment = await findPgPaymentByIdentifiers({
+            paymentId: '',
+            providerOrderId: orderId,
+            providerPaymentId: paymentId,
+          }, client);
+          const webhookRecord = await insertPgWebhook({
+            paymentId: localPayment?._id || null,
+            status: webhookStatus,
+            event: String(payload.event || 'payment.updated'),
+            payload: {
+              ...payload,
+              providerPaymentId: paymentId,
+              providerOrderId: orderId,
+            },
+          }, client);
+
+          if (!localPayment) {
+            return webhookRecord;
+          }
+
+          const synced = await verifyAndActivateRazorpayAccess({
+            paymentId: {
+              ...localPayment,
+              meta: {
+                ...asObject(localPayment.meta),
+                gatewayWebhookReceivedAt: nowIso(),
+                gatewayWebhookEvent: String(payload.event || 'payment.updated'),
+              },
+            },
+            providerOrderId: orderId,
+            providerPaymentId: paymentId,
+            remotePayment: paymentEntity,
+            syncSource: 'razorpay_webhook',
+            reason: `Auto-reconciled from Razorpay webhook ${String(payload.event || 'payment.updated')}`,
+            actorId: 'system',
+            webhookSignatureVerified: true,
+          }, client);
+          await insertPgWebhook({
+            paymentId: synced.payment?._id || localPayment._id,
+            status: synced.outcome,
+            event: String(payload.event || 'payment.updated'),
+            payload: {
+              ...payload,
+              syncOutcome: synced.outcome,
+            },
+          }, client);
+          return webhookRecord;
+        });
+        invalidatePlatformDataCache();
+        return result;
+      }
+
+      const localPayment = findMemoryPaymentByIdentifiers({
+        providerOrderId: orderId,
+        providerPaymentId: paymentId,
+      });
+      const webhookRecord = {
+        _id: nextId('webhook'),
+        event: String(payload.event || 'payment.updated'),
+        paymentId: localPayment?._id || '',
+        status: webhookStatus,
+        receivedAt: nowIso(),
+        payload: clone(payload),
+      };
+      state.webhooks.push(webhookRecord);
+      if (localPayment) {
+        await verifyAndActivateRazorpayAccess({
+          paymentId: {
+            ...localPayment,
+            meta: {
+              ...asObject(localPayment.meta),
+              gatewayWebhookReceivedAt: nowIso(),
+              gatewayWebhookEvent: String(payload.event || 'payment.updated'),
+            },
+          },
+          providerOrderId: orderId,
+          providerPaymentId: paymentId,
+          remotePayment: paymentEntity,
+          syncSource: 'razorpay_webhook',
+          reason: `Auto-reconciled from Razorpay webhook ${String(payload.event || 'payment.updated')}`,
+          actorId: 'system',
+          webhookSignatureVerified: true,
+        });
+        invalidateUserPlatformCaches(localPayment.userId);
+      }
+      invalidatePlatformDataCache();
+      return clone(webhookRecord);
+    }
 
     if (isPostgresMode()) {
       return runInTransaction(async (client) => {
@@ -7438,24 +11069,7 @@ const paymentRepository = {
             updatedPayment.lastError = null;
           }
           await insertPgPayment(updatedPayment, client);
-
-          const user = await pgOne('SELECT * FROM users WHERE id = $1', [payment.userId], mapUserRow, client);
-          if (user) {
-          queueBestEffortDeviceActivity({
-            userId: user._id,
-            sessionId: user.session,
-            device: user.device,
-            eventType: nextStatus === 'paid' ? 'payment_completed' : 'payment_failed',
-            meta: {
-              paymentId: payment._id,
-              item: payment.item,
-              amount: payment.amount,
-              status: nextStatus,
-            },
-          });
-          }
         }
-
         return webhookRecord;
       });
     }
@@ -7468,38 +11082,273 @@ const paymentRepository = {
       receivedAt: nowIso(),
       payload: clone(payload),
     };
-
     state.webhooks.push(webhookRecord);
+    return clone(webhookRecord);
+  },
 
-    const payment = state.payments.find((item) => item._id === webhookRecord.paymentId);
-    if (payment) {
-      payment.status = webhookRecord.status;
-      payment.retryable = webhookRecord.status !== 'paid';
-      payment.lastError = webhookRecord.status === 'failed'
-        ? payload.errorMessage || 'Payment failed. Retry is available.'
-        : null;
+  async verifyAndActivateRazorpayAccess(payload = {}) {
+    await ensurePlatformReady();
 
-      const user = state.users.find((item) => item._id === payment.userId);
-      if (user) {
-        state.deviceActivities.unshift({
-          _id: nextId('activity'),
-          userId: user._id,
-          sessionId: user.session,
-          device: user.device,
-          eventType: webhookRecord.status === 'paid' ? 'payment_completed' : 'payment_failed',
-          meta: {
-            paymentId: payment._id,
-            item: payment.item,
-            amount: payment.amount,
-            status: webhookRecord.status,
-          },
-          createdAt: nowIso(),
+    const params = {
+      paymentId: String(payload.paymentId || '').trim(),
+      providerOrderId: String(payload.orderId || payload.providerOrderId || '').trim(),
+      providerPaymentId: String(payload.gatewayPaymentId || payload.providerPaymentId || '').trim(),
+      userId: String(payload.userId || '').trim(),
+      courseId: String(payload.courseId || '').trim(),
+    };
+
+    if (isPostgresMode()) {
+      const result = await runInTransaction(async (client) => verifyAndActivateRazorpayAccess({
+        ...params,
+        remotePayment: payload.remotePayment || null,
+        remoteOrder: payload.remoteOrder || null,
+        syncSource: String(payload.syncSource || 'manual_verification').trim() || 'manual_verification',
+        reason: String(payload.reason || 'Razorpay access verification').trim() || 'Razorpay access verification',
+        actorId: payload.actorId ? String(payload.actorId) : 'system',
+        ipAddress: payload.ipAddress || null,
+        userAgent: payload.userAgent || null,
+        callbackSignatureVerified: Boolean(payload.callbackSignatureVerified),
+        webhookSignatureVerified: Boolean(payload.webhookSignatureVerified),
+      }, client));
+      invalidatePlatformDataCache();
+      if (result.payment?.userId) {
+        invalidateUserPlatformCaches(result.payment.userId);
+      }
+      return result;
+    }
+
+    const result = await verifyAndActivateRazorpayAccess({
+      ...params,
+      remotePayment: payload.remotePayment || null,
+      remoteOrder: payload.remoteOrder || null,
+      syncSource: String(payload.syncSource || 'manual_verification').trim() || 'manual_verification',
+      reason: String(payload.reason || 'Razorpay access verification').trim() || 'Razorpay access verification',
+      actorId: payload.actorId ? String(payload.actorId) : 'system',
+      ipAddress: payload.ipAddress || null,
+      userAgent: payload.userAgent || null,
+      callbackSignatureVerified: Boolean(payload.callbackSignatureVerified),
+      webhookSignatureVerified: Boolean(payload.webhookSignatureVerified),
+    });
+    invalidatePlatformDataCache();
+    if (result.payment?.userId) {
+      invalidateUserPlatformCaches(result.payment.userId);
+    }
+    return result;
+  },
+
+  async syncRazorpayPayment(payload) {
+    await ensurePlatformReady();
+
+    const params = {
+      paymentId: String(payload.paymentId || '').trim(),
+      providerOrderId: String(payload.orderId || payload.providerOrderId || '').trim(),
+      providerPaymentId: String(payload.gatewayPaymentId || payload.providerPaymentId || '').trim(),
+      userId: String(payload.userId || '').trim(),
+      courseId: String(payload.courseId || '').trim(),
+    };
+    const syncSource = String(payload.syncSource || 'admin_sync').trim() || 'admin_sync';
+    const reason = String(payload.reason || 'Razorpay payment sync').trim() || 'Razorpay payment sync';
+    const actorId = payload.actorId ? String(payload.actorId) : 'system';
+
+    if (isPostgresMode()) {
+      const result = await runInTransaction(async (client) => {
+        return verifyAndActivateRazorpayAccess({
+          paymentId: params.paymentId,
+          providerOrderId: params.providerOrderId,
+          providerPaymentId: params.providerPaymentId,
+          userId: params.userId,
+          courseId: params.courseId,
+          syncSource,
+          reason,
+          actorId,
+          ipAddress: payload.ipAddress || null,
+          userAgent: payload.userAgent || null,
+        }, client);
+      });
+      invalidatePlatformDataCache();
+      if (result.payment?.userId) {
+        invalidateUserPlatformCaches(result.payment.userId);
+      }
+      return result;
+    }
+
+    const result = await verifyAndActivateRazorpayAccess({
+      paymentId: params.paymentId,
+      providerOrderId: params.providerOrderId,
+      providerPaymentId: params.providerPaymentId,
+      userId: params.userId,
+      courseId: params.courseId,
+      syncSource,
+      reason,
+      actorId,
+      ipAddress: payload.ipAddress || null,
+      userAgent: payload.userAgent || null,
+    });
+    invalidatePlatformDataCache();
+    if (result.payment?.userId) {
+      invalidateUserPlatformCaches(result.payment.userId);
+    }
+    return result;
+  },
+
+  async syncAllPendingRazorpayPayments(payload = {}) {
+    await ensurePlatformReady();
+
+    const maxRecords = Math.max(1, Math.min(Number(payload.maxRecords || 500), 5000));
+    const actorId = payload.actorId ? String(payload.actorId) : 'system';
+    const syncSource = String(payload.syncSource || 'bulk_admin_sync').trim() || 'bulk_admin_sync';
+    const summary = {
+      totalChecked: 0,
+      capturedFixed: 0,
+      verifiedCapturedActivated: 0,
+      stillPending: 0,
+      failed: 0,
+      refunded: 0,
+      amountMismatch: 0,
+      orderMismatch: 0,
+      userMismatch: 0,
+      courseMismatch: 0,
+      manualReviewRequired: 0,
+      enrollmentCreated: 0,
+      accessEnabled: 0,
+      cacheRefreshed: 0,
+      errors: [],
+      items: [],
+    };
+
+    const pendingPayments = isPostgresMode()
+      ? await queryPostgres(
+        `
+          SELECT * FROM payments
+          WHERE provider = 'razorpay'
+            AND status = 'pending'
+            AND COALESCE(provider_order_id, '') <> ''
+          ORDER BY created_at ASC
+          LIMIT $1
+        `,
+        [maxRecords],
+      ).then((result) => result.rows.map(mapPaymentRow))
+      : state.payments
+        .filter((payment) => payment.provider === 'razorpay' && payment.status === 'pending' && payment.providerOrderId)
+        .slice(0, maxRecords);
+
+    for (const payment of pendingPayments) {
+      summary.totalChecked += 1;
+      try {
+        const result = await paymentRepository.syncRazorpayPayment({
+          paymentId: payment._id,
+          actorId,
+          syncSource,
+          reason: `Bulk sync for pending Razorpay payment ${payment._id}`,
+          ipAddress: payload.ipAddress || null,
+          userAgent: payload.userAgent || null,
         });
-        state.deviceActivities = state.deviceActivities.slice(0, 200);
+        switch (normalizeRazorpayVerificationDecision(result.verificationDecision)) {
+          case 'VERIFIED_CAPTURED_ACTIVATED':
+            summary.capturedFixed += 1;
+            summary.verifiedCapturedActivated += 1;
+            break;
+          case 'GATEWAY_FAILED':
+            summary.failed += 1;
+            break;
+          case 'REFUNDED_OR_CHARGEBACK':
+            summary.refunded += 1;
+            break;
+          case 'AMOUNT_MISMATCH':
+            summary.amountMismatch += 1;
+            break;
+          case 'ORDER_MISMATCH':
+            summary.orderMismatch += 1;
+            break;
+          case 'USER_MISMATCH':
+            summary.userMismatch += 1;
+            break;
+          case 'COURSE_MISMATCH':
+            summary.courseMismatch += 1;
+            break;
+          case 'MANUAL_REVIEW_REQUIRED':
+          case 'LOCAL_TRANSACTION_NOT_FOUND':
+            summary.manualReviewRequired += 1;
+            break;
+          default:
+            summary.stillPending += 1;
+            break;
+        }
+        if (result.enrollmentCreated) {
+          summary.enrollmentCreated += 1;
+        }
+        if (result.accessEnabled) {
+          summary.accessEnabled += 1;
+        }
+        if (result.cacheRefreshed) {
+          summary.cacheRefreshed += 1;
+        }
+        summary.items.push({
+          paymentId: payment._id,
+          orderId: payment.providerOrderId || null,
+          gatewayPaymentId: result.payment?.providerPaymentId || null,
+          status: result.payment?.status || payment.status,
+          verificationDecision: result.verificationDecision || null,
+          courseId: payment.courseId || null,
+          userId: payment.userId || null,
+        });
+      } catch (error) {
+        summary.errors.push({
+          paymentId: payment._id,
+          orderId: payment.providerOrderId || null,
+          message: error instanceof Error ? error.message : 'Unknown sync error',
+        });
       }
     }
 
-    return clone(webhookRecord);
+    return summary;
+  },
+
+  async syncPendingRazorpayPaymentsForUser(userId, payload = {}) {
+    await ensurePlatformReady();
+
+    const normalizedUserId = String(userId || '').trim();
+    if (!normalizedUserId) {
+      return [];
+    }
+
+    const maxRecords = Math.max(1, Math.min(Number(payload.maxRecords || 5), 20));
+    const pendingPayments = isPostgresMode()
+      ? await queryPostgres(
+        `
+          SELECT * FROM payments
+          WHERE provider = 'razorpay'
+            AND status = 'pending'
+            AND user_id = $1
+            AND COALESCE(provider_order_id, '') <> ''
+          ORDER BY created_at DESC
+          LIMIT $2
+        `,
+        [normalizedUserId, maxRecords],
+      ).then((result) => result.rows.map(mapPaymentRow))
+      : state.payments
+        .filter((payment) => payment.provider === 'razorpay' && payment.status === 'pending' && payment.userId === normalizedUserId && payment.providerOrderId)
+        .slice(0, maxRecords);
+
+    const results = [];
+    for (const payment of pendingPayments) {
+      try {
+        results.push(await paymentRepository.syncRazorpayPayment({
+          paymentId: payment._id,
+          actorId: 'system',
+          syncSource: 'student_access_refresh',
+          reason: 'Auto-refreshed pending Razorpay payment while loading student access',
+        }));
+      } catch (error) {
+        results.push({
+          payment: clone(payment),
+          outcome: 'error',
+          error: error instanceof Error ? error.message : 'Unknown sync error',
+        });
+      }
+    }
+
+    return results;
   },
 
   async retryPayment(paymentId, userId) {
@@ -7594,9 +11443,15 @@ const platformRepository = {
   },
 
   async getOverview(userId) {
+    if (userId) {
+      await paymentRepository.syncPendingRazorpayPaymentsForUser(userId, { maxRecords: 20 }).catch(() => undefined);
+    }
     const data = await loadPlatformData();
-    const safeUser = userId ? await usersRepository.findSafeById(userId) : null;
-    const analyticsPromise = userId ? analyticsRepository.getUserAnalytics(userId) : Promise.resolve({
+    const rawUser = userId
+      ? data.users.find((user) => String(user._id) === String(userId)) || null
+      : null;
+    const safeUser = sanitizeUser(rawUser);
+    const analytics = userId ? buildUserAnalyticsFromData(data, userId) : {
       accuracy: 0,
       speed: 0,
       attempts: 0,
@@ -7606,21 +11461,18 @@ const platformRepository = {
       trend: buildAnalyticsTrend(data, 'guest'),
       adaptivePlan: computeAdaptivePlan({ accuracy: 0, attempts: 0 }),
       seriesPerformance: [],
-    });
-
+    };
     const dailyQuizPromise = quizzesRepository.findByDate(new Date().toISOString().slice(0, 10));
     const gamificationPromise = userId
       ? engagementRepository.getGamification(userId)
       : Promise.resolve({ points: 0, badges: [], streak: 0, referrals: 0 });
-    const coursesPromise = coursesRepository.list();
-    const testsPromise = testsRepository.listForAttempt({
-      userId,
-      userRole: safeUser?.role || 'guest',
-    });
     const weeklyLeaderboardPromise = quizzesRepository.getWeeklyLeaderboard();
     const notificationsPromise = userId
-      ? notificationsRepository.list(userId).catch(() => [])
+      ? notificationsRepository.list(userId, { limit: 10 }).catch(() => [])
       : Promise.resolve([]);
+    const notificationCountPromise = userId
+      ? notificationsRepository.count(userId).catch(() => 0)
+      : Promise.resolve(0);
     const testInsightsPromise = userId
       ? Promise.resolve(computeTestInsights(data, userId))
       : Promise.resolve({ latestAttempt: null, attempts: [] });
@@ -7630,33 +11482,33 @@ const platformRepository = {
     const leaderboardPromise = dailyQuizPromise.then((quiz) => (quiz ? quizzesRepository.getLeaderboard(quiz._id) : []));
 
     const [
-      analytics,
       dailyQuiz,
       leaderboard,
       gamification,
-      courses,
-      tests,
       weeklyLeaderboard,
       notifications,
+      notificationCount,
       testInsights,
       adminOverview,
     ] = await Promise.all([
-      analyticsPromise,
       dailyQuizPromise,
       leaderboardPromise,
       gamificationPromise,
-      coursesPromise,
-      testsPromise,
       weeklyLeaderboardPromise,
       notificationsPromise,
+      notificationCountPromise,
       testInsightsPromise,
       adminOverviewPromise,
     ]);
 
-    const enrollments = userId
-      ? filterActiveEnrollments(data.enrollments.filter((entry) => entry.userId === String(userId)))
+    const userEnrollments = userId
+      ? data.enrollments.filter((entry) => entry.userId === String(userId))
       : [];
+    const enrollments = filterActiveEnrollments(userEnrollments);
     const enrolledCourseIds = new Set(enrollments.map((entry) => entry.courseId));
+    const userPayments = userId
+      ? data.payments.filter((entry) => entry.userId === String(userId))
+      : [];
     const userNameById = new Map(data.users.map((user) => [user._id, user.name]));
     const decorateLeaderboard = (entries) =>
       entries.map((entry) => ({
@@ -7664,7 +11516,7 @@ const platformRepository = {
         name: userNameById.get(entry.userId) || entry.name || entry.userId,
       }));
 
-    const visibleCourses = courses.filter((course) => {
+    const visibleCourses = data.courses.filter((course) => {
       if (safeUser?.role === 'admin') {
         return true;
       }
@@ -7673,13 +11525,21 @@ const platformRepository = {
     });
 
     const courseCards = visibleCourses.map((course) => {
-      const isEnrolled = enrolledCourseIds.has(course._id);
-      const hasFullCourseAccess = safeUser?.role === 'admin' || isEnrolled;
+      const latestEnrollment = getLatestEntry(userEnrollments.filter((entry) => entry.courseId === course._id));
+      const latestPayment = getBestPaymentEntry(userPayments.filter((entry) => entry.courseId === course._id));
+      const access = getCourseVideoPlaybackAccess({
+        course,
+        enrollment: latestEnrollment,
+        payment: latestPayment,
+        isAdmin: safeUser?.role === 'admin',
+      });
+      const hasFullCourseAccess = safeUser?.role === 'admin' || Boolean(access.canAccessCourse);
       const progress = userId ? computeCourseProgress(data, userId, course) : { progressPercent: 0, continueLesson: null, continueProgressSeconds: 0 };
       const visibleCourse = redactCourseForViewer(course, hasFullCourseAccess);
       return {
         ...visibleCourse,
         enrolled: hasFullCourseAccess,
+        ...access,
         progressPercent: progress.progressPercent,
         continueLesson: progress.continueLesson,
         continueProgressSeconds: progress.continueProgressSeconds,
@@ -7687,10 +11547,15 @@ const platformRepository = {
         lessonProgress: progress.watchHistory || [],
       };
     });
+    const tests = data.tests
+      .filter((test) => canAccessLinkedTestWithCourseIds(test, enrolledCourseIds, safeUser?.role || 'guest'))
+      .map((test) => redactTestForAttempt(test));
 
-    const liveClasses = clone(data.liveClasses)
-      .sort((left, right) => sortOldestFirst(left, right, 'startTime'))
-      .map((item) => sanitizeLiveClassForViewer(item));
+    const liveClasses = appConfig.liveClassesEnabled
+      ? clone(data.liveClasses)
+          .sort((left, right) => sortOldestFirst(left, right, 'startTime'))
+          .map((item) => sanitizeLiveClassForViewer(item))
+      : [];
     const activePlanIds = new Set(
       userId
         ? data.userSubscriptions
@@ -7732,6 +11597,7 @@ const platformRepository = {
         active: activePlanIds.has(plan._id),
       })),
       notifications,
+      notificationCount,
       analytics,
       ai: {
         headline: buildAiRecommendation({ accuracy: analytics.accuracy, weakTopics: analytics.weakTopics, attempts: analytics.attempts }),
@@ -7743,7 +11609,12 @@ const platformRepository = {
         recentSessions: getRecentSessions(data, userId),
         recentDeviceActivity: getRecentDeviceActivity(data, userId),
       } : null,
-      adminOverview,
+      adminOverview: adminOverview
+        ? {
+            ...adminOverview,
+            liveClasses: appConfig.liveClassesEnabled ? adminOverview.liveClasses : 0,
+          }
+        : null,
     };
   },
 
@@ -7928,8 +11799,13 @@ const platformRepository = {
     explanationSeconds = null,
     videoWatchCount = null,
     explanationWatchCount = null,
+    durationSeconds = null,
+    eventType = null,
+    playbackTabId = null,
+    requestTimestamp = null,
     sessionId = null,
     device = null,
+    requestContext = null,
   }) {
     await ensurePlatformReady();
 
@@ -7963,6 +11839,104 @@ const platformRepository = {
       ) || null;
 
     const isProtectedVideoLesson = lesson.type === 'private-video';
+    const safeProgressPercent = Math.max(Math.min(Number(progressPercent || 0), 100), 0);
+    const safeProgressSeconds = Math.max(Number(progressSeconds || 0), 0);
+    const safeDurationSeconds = Math.max(Number(durationSeconds || 0), safeProgressSeconds, 0);
+    const normalizedEventType = String(
+      eventType
+      || (completed ? 'completion' : 'progress'),
+    ).trim().toLowerCase() || 'progress';
+    const deliveryProfileHint = String(lesson.deliveryProfile || '').trim() || null;
+    const deliveryPathHint = (() => {
+      const normalizedDeliveryProfile = String(deliveryProfileHint || '').toLowerCase();
+      if (
+        normalizedDeliveryProfile.includes('private-source')
+        || normalizedDeliveryProfile.includes('source-fallback')
+      ) {
+        return 'source_fallback';
+      }
+      if (normalizedDeliveryProfile.includes('cloudflare-stream')) {
+        return 'direct_cloudflare_stream';
+      }
+      if (
+        lesson.type === 'private-video'
+        || normalizedDeliveryProfile.includes('private-hls')
+        || normalizedDeliveryProfile.includes('manifest')
+        || normalizedDeliveryProfile.includes('gateway')
+        || normalizedDeliveryProfile.includes('cache')
+      ) {
+        return 'protected_hls_gateway';
+      }
+      return 'unknown';
+    })();
+    const effectiveRequestTimestamp = (() => {
+      if (!requestTimestamp) {
+        return nowIso();
+      }
+      const parsed = new Date(String(requestTimestamp));
+      return Number.isNaN(parsed.getTime()) ? nowIso() : parsed.toISOString();
+    })();
+    const effectivePlaybackTabId = String(
+      playbackTabId
+      || device?.playbackTabId
+      || requestContext?.playbackTabId
+      || '',
+    ).trim() || null;
+    const existingProgressSeconds = Math.max(Number(existingRecord?.progressSeconds || 0), 0);
+    const existingProgressPercent = Math.max(Number(existingRecord?.progressPercent || 0), 0);
+    const existingUpdatedAtMs = Date.parse(String(existingRecord?.updatedAt || existingRecord?.lastWatchedAt || ''));
+    const requestTimestampMs = Date.parse(effectiveRequestTimestamp);
+    const staleProgressRegression = Boolean(
+      existingRecord
+      && normalizedEventType !== 'seek'
+      && safeProgressSeconds + 3 < existingProgressSeconds
+      && safeProgressPercent + 3 < existingProgressPercent,
+    );
+    const staleRequestRegression = Boolean(
+      existingRecord
+      && Number.isFinite(existingUpdatedAtMs)
+      && Number.isFinite(requestTimestampMs)
+      && requestTimestampMs + 5000 < existingUpdatedAtMs
+      && safeProgressSeconds <= existingProgressSeconds
+      && safeProgressPercent <= existingProgressPercent
+      && !completed,
+    );
+    const logWatchProgressDecision = (extra = {}) => {
+      console.info(`[watch-progress] ${JSON.stringify({
+        request_id: requestContext?.requestId || null,
+        replica: requestContext?.replica || String(process.env.REPLICA_NAME || process.env.HOSTNAME || process.env.SERVICE_NAME || `pid:${process.pid}`),
+        user_id: String(userId),
+        course_id: String(courseId),
+        lesson_id: String(lessonId),
+        video_id: String(lesson._id || lesson.id || lessonId),
+        incoming_current_time: safeProgressSeconds,
+        saved_current_time: Math.max(Number(extra.savedCurrentTime ?? existingRecord?.progressSeconds ?? 0), 0),
+        duration_seconds: safeDurationSeconds || null,
+        incoming_progress_percent: safeProgressPercent,
+        saved_progress_percent: Math.max(Number(extra.savedProgressPercent ?? existingRecord?.progressPercent ?? 0), 0),
+        event_type: normalizedEventType,
+        delivery_profile: deliveryProfileHint,
+        delivery_path_hint: deliveryPathHint,
+        accepted: extra.accepted ?? true,
+        rejection_reason: extra.rejectionReason || null,
+        completion_requested: Boolean(completed),
+        completion_saved: Boolean(extra.completionSaved ?? existingRecord?.completed ?? false),
+        watch_count_before: Math.max(Number(existingRecord?.videoWatchCount || 0), 0),
+        watch_count_after: Math.max(Number(extra.watchCountAfter ?? existingRecord?.videoWatchCount ?? 0), 0),
+        device_id: device?.id || requestContext?.deviceId || null,
+        playback_tab_id: effectivePlaybackTabId,
+        request_time: effectiveRequestTimestamp,
+      })}`);
+    };
+
+    if (staleProgressRegression || staleRequestRegression) {
+      logWatchProgressDecision({
+        accepted: false,
+        rejectionReason: staleProgressRegression ? 'out_of_order_progress' : 'stale_request_timestamp',
+      });
+      return existingRecord || null;
+    }
+
     const normalizedLessonStage = normalizeLessonStage(lessonStage);
     const requestedVideoWatchCount = videoWatchCount === null || videoWatchCount === undefined
       ? (completed ? 1 : 0)
@@ -7988,8 +11962,8 @@ const platformRepository = {
           userId,
           courseId,
           lessonId,
-          progressPercent,
-          progressSeconds,
+          progressPercent: safeProgressPercent,
+          progressSeconds: safeProgressSeconds,
           completed: normalizedCompleted,
           lessonStage: normalizedLessonStage,
           examSubmitted,
@@ -8004,12 +11978,18 @@ const platformRepository = {
           userId,
           courseId,
           lessonId,
-          progressPercent,
-          progressSeconds,
+          progressPercent: safeProgressPercent,
+          progressSeconds: safeProgressSeconds,
           completed: normalizedCompleted,
         })) {
           invalidateUserPlatformCaches(userId);
         }
+        logWatchProgressDecision({
+          savedCurrentTime: record?.progressSeconds,
+          savedProgressPercent: record?.progressPercent,
+          completionSaved: record?.completed,
+          watchCountAfter: record?.videoWatchCount,
+        });
         return record;
       }
 
@@ -8018,8 +11998,8 @@ const platformRepository = {
           userId,
           courseId,
           lessonId,
-          progressPercent,
-          progressSeconds,
+          progressPercent: safeProgressPercent,
+          progressSeconds: safeProgressSeconds,
           completed: normalizedCompleted,
           lessonStage: normalizedLessonStage,
           examSubmitted,
@@ -8044,12 +12024,20 @@ const platformRepository = {
           meta: {
             courseId: String(courseId),
             lessonId: String(lessonId),
-            progressPercent: Number(progressPercent || 0),
+            progressPercent: safeProgressPercent,
+            progressSeconds: safeProgressSeconds,
+            eventType: normalizedEventType,
           },
         });
 
         invalidatePlatformDataCache();
         invalidateUserPlatformCaches(userId);
+        logWatchProgressDecision({
+          savedCurrentTime: record?.progressSeconds,
+          savedProgressPercent: record?.progressPercent,
+          completionSaved: record?.completed,
+          watchCountAfter: record?.videoWatchCount,
+        });
         return record;
       });
     }
@@ -8067,8 +12055,8 @@ const platformRepository = {
       userId: String(userId),
       courseId: String(courseId),
       lessonId: String(lessonId),
-      progressPercent: Math.max(Number(existingMemoryRecord?.progressPercent || 0), Number(progressPercent || 0)),
-      progressSeconds: Math.max(Number(existingMemoryRecord?.progressSeconds || 0), Number(progressSeconds || 0)),
+      progressPercent: Math.max(Number(existingMemoryRecord?.progressPercent || 0), safeProgressPercent),
+      progressSeconds: Math.max(Number(existingMemoryRecord?.progressSeconds || 0), safeProgressSeconds),
       completed: Boolean(existingMemoryRecord?.completed) || Boolean(normalizedCompleted),
       lessonStage: getLessonStagePriority(existingMemoryRecord?.lessonStage) >= getLessonStagePriority(normalizedLessonStage)
         ? normalizeLessonStage(existingMemoryRecord?.lessonStage)
@@ -8098,7 +12086,9 @@ const platformRepository = {
       meta: {
         courseId: String(courseId),
         lessonId: String(lessonId),
-        progressPercent: Number(progressPercent || 0),
+        progressPercent: safeProgressPercent,
+        progressSeconds: safeProgressSeconds,
+        eventType: normalizedEventType,
       },
     });
 
@@ -8106,8 +12096,8 @@ const platformRepository = {
       userId,
       courseId,
       lessonId,
-      progressPercent,
-      progressSeconds,
+      progressPercent: safeProgressPercent,
+      progressSeconds: safeProgressSeconds,
       completed: normalizedCompleted,
     })) {
       invalidateUserPlatformCaches(userId);
@@ -8118,6 +12108,12 @@ const platformRepository = {
       lessonId,
       videoWatchCount: normalizedVideoWatchCount,
       completed: normalizedCompleted,
+    });
+    logWatchProgressDecision({
+      savedCurrentTime: record?.progressSeconds,
+      savedProgressPercent: record?.progressPercent,
+      completionSaved: record?.completed,
+      watchCountAfter: record?.videoWatchCount,
     });
     return clone(record);
   },
@@ -8402,5 +12398,8 @@ module.exports = {
   paymentRepository,
   platformRepository,
   sessionRepository,
+  videoPlaybackRepository,
+  resolveProtectedLessonResumeSeconds,
   sanitizeUser,
+  invalidateAllPlatformCachesForUser,
 };

@@ -1,9 +1,12 @@
 // Payment Controller
-const crypto = require('crypto');
 const Razorpay = require('razorpay');
 const { appConfig } = require('../lib/config.js');
 const { coursesRepository, paymentRepository } = require('../lib/repositories.js');
 const { ApiError, asyncHandler, ok, requireNumber, requireString, optionalString } = require('../lib/http.js');
+const {
+  verifyRazorpayCheckoutSignature,
+  verifyRazorpayWebhookSignature,
+} = require('./razorpay-client.js');
 
 let razorpayClient = null;
 const getRazorpayClient = () => {
@@ -118,12 +121,11 @@ const verifyRazorpayPayment = asyncHandler(async (req, res) => {
     throw new ApiError(503, 'Razorpay is not configured on the server', { code: 'RAZORPAY_NOT_CONFIGURED' });
   }
 
-  const expectedSignature = crypto
-    .createHmac('sha256', appConfig.razorpayKeySecret)
-    .update(`${razorpayOrderId}|${razorpayPaymentId}`)
-    .digest('hex');
-
-  if (expectedSignature !== razorpaySignature) {
+  if (!verifyRazorpayCheckoutSignature({
+    orderId: razorpayOrderId,
+    paymentId: razorpayPaymentId,
+    signature: razorpaySignature,
+  })) {
     throw new ApiError(400, 'Payment signature mismatch', { code: 'INVALID_PAYMENT_SIGNATURE' });
   }
 
@@ -148,9 +150,6 @@ const verifyRazorpayPayment = asyncHandler(async (req, res) => {
   if (remoteOrderId !== razorpayOrderId) {
     throw new ApiError(400, 'Razorpay payment is linked to a different order', { code: 'PAYMENT_ORDER_MISMATCH' });
   }
-  if (!['authorized', 'captured'].includes(remoteStatus)) {
-    throw new ApiError(400, 'Razorpay payment is not successful', { code: 'PAYMENT_NOT_SUCCESSFUL' });
-  }
 
   const result = await paymentRepository.markRazorpayCoursePaymentPaid({
     userId,
@@ -159,16 +158,34 @@ const verifyRazorpayPayment = asyncHandler(async (req, res) => {
     providerOrderId: razorpayOrderId,
     providerPaymentId: razorpayPaymentId,
     providerSignature: razorpaySignature,
+    remoteStatus,
+    remoteCreatedAt: remotePayment?.created_at || null,
+    remoteMethod: remotePayment?.method || null,
+    remoteAcquirerData: remotePayment?.acquirer_data || null,
   });
 
   return ok(res, {
     success: true,
     payment: result.payment,
     enrollment: result.enrollment,
+    verificationDecision: result.verificationDecision || null,
   });
 });
 
 const webhook = asyncHandler(async (req, res) => {
+  const razorpaySignature = String(req.get('x-razorpay-signature') || '').trim();
+  if (razorpaySignature && req.rawBody?.length) {
+    const signatureValid = verifyRazorpayWebhookSignature({
+      rawBody: req.rawBody,
+      signature: razorpaySignature,
+    });
+    if (!signatureValid) {
+      throw new ApiError(401, 'Invalid Razorpay webhook signature', { code: 'INVALID_RAZORPAY_WEBHOOK_SIGNATURE' });
+    }
+    const webhookRecord = await paymentRepository.handleWebhook(req.body || {});
+    return ok(res, { message: 'Razorpay webhook received', webhook: webhookRecord });
+  }
+
   const paymentId = requireString(req.body?.paymentId, 'paymentId');
   const status = requireString(req.body?.status, 'status');
   const webhookRecord = await paymentRepository.handleWebhook({

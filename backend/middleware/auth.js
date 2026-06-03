@@ -1,6 +1,6 @@
 const jwt = require('jsonwebtoken');
 const { appConfig } = require('../lib/config.js');
-const { sessionRepository } = require('../lib/repositories.js');
+const { sessionRepository, usersRepository } = require('../lib/repositories.js');
 
 const getTokenFromHeader = (header) => {
   if (!header || !header.startsWith('Bearer ')) {
@@ -10,22 +10,46 @@ const getTokenFromHeader = (header) => {
   return header.slice('Bearer '.length).trim();
 };
 
+const buildAuthFailure = (code, message, details = {}) => ({
+  code,
+  message,
+  details,
+});
+
 const attachUserFromToken = async (req, token) => {
   try {
     if (!token) {
-      return false;
+      return buildAuthFailure('AUTH_TOKEN_MISSING', 'Authorization token required');
     }
 
     const decoded = jwt.verify(token, appConfig.jwtSecret);
     const persistedSessionId = decoded.session || null;
     const activeSessionId = appConfig.nodeEnv === 'production'
-      ? await sessionRepository.getActiveSessionId(String(decoded.id), persistedSessionId)
+      ? await sessionRepository.getActiveSessionId(String(decoded.id), null)
       : persistedSessionId;
 
-    if (appConfig.nodeEnv === 'production' && decoded.session) {
-      const validSessionIds = [activeSessionId, persistedSessionId].filter(Boolean);
-      if (validSessionIds.length > 0 && !validSessionIds.includes(decoded.session)) {
-        return false;
+    if (appConfig.nodeEnv === 'production') {
+      if (!persistedSessionId) {
+        console.warn('[auth-session]', JSON.stringify({
+          user_id: decoded?.id ? String(decoded.id) : null,
+          reason: 'missing_session_claim',
+        }));
+        return buildAuthFailure('AUTH_SESSION_MISSING', 'Session is missing from token.', {
+          reason: 'missing_session_claim',
+        });
+      }
+
+      if (!activeSessionId || String(activeSessionId) !== String(persistedSessionId)) {
+        console.warn('[auth-session]', JSON.stringify({
+          user_id: decoded?.id ? String(decoded.id) : null,
+          token_session_id: String(persistedSessionId),
+          active_session_id: activeSessionId ? String(activeSessionId) : null,
+          reason: 'replaced_or_inactive_session_token',
+        }));
+        return buildAuthFailure('AUTH_SESSION_REPLACED', 'This login session was replaced by a newer login.', {
+          reason: 'replaced_or_inactive_session_token',
+          activeSessionId: activeSessionId ? String(activeSessionId) : null,
+        });
       }
     }
 
@@ -42,21 +66,31 @@ const attachUserFromToken = async (req, token) => {
       },
     };
 
-    return true;
+    const currentUser = await usersRepository.findSafeById(String(decoded.id)).catch(() => null);
+    if (currentUser && String(currentUser.accountStatus || 'active').toLowerCase() !== 'active') {
+      return buildAuthFailure('ACCOUNT_DISABLED', 'This account is no longer active.', {
+        accountStatus: String(currentUser.accountStatus || 'disabled').toLowerCase(),
+      });
+    }
+
+    return null;
   } catch (error) {
-    return false;
+    return buildAuthFailure('AUTH_TOKEN_INVALID', 'Invalid token');
   }
 };
 
 const requireAuth = async (req, res, next) => {
   const token = getTokenFromHeader(req.headers.authorization || '');
   if (!token) {
-    return res.status(401).json({ message: 'Authorization token required' });
+    return res.status(401).json({
+      message: 'Authorization token required',
+      code: 'AUTH_TOKEN_MISSING',
+    });
   }
 
-  const attached = await attachUserFromToken(req, token);
-  if (!attached) {
-    return res.status(401).json({ message: 'Invalid token' });
+  const failure = await attachUserFromToken(req, token);
+  if (failure) {
+    return res.status(401).json(failure);
   }
 
   return next();

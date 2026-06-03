@@ -1,0 +1,12 @@
+reverse_proxy manifest-app:5001 manifest-app-2:5001 {
+  health_uri /backend/api/course-manifests/health
+  health_interval 5s
+  health_timeout 2s
+  health_status 200
+  lb_retries 3
+  lb_try_duration 10s
+  lb_try_interval 250ms
+  fail_duration 30s
+  max_fails 2
+  unhealthy_status 502 503 504
+}

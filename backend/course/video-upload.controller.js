@@ -18,7 +18,12 @@ const {
   storePrivateVideoUpload,
   deleteStoredPrivateVideo,
 } = require('../lib/private-video-storage.js');
-const { createInitialVideoDeliveryState, scheduleVideoProcessing, deleteProcessedHlsAssets } = require('../lib/video-processing.js');
+const {
+  createInitialVideoDeliveryState,
+  scheduleVideoProcessing,
+  deleteProcessedHlsAssets,
+  repairCourseLessonHlsOutputs,
+} = require('../lib/video-processing.js');
 const {
   isCloudflareStreamEnabled,
   isCloudflareStreamConfigured,
@@ -189,10 +194,28 @@ const persistUploadedLessonVideo = async ({
   lessonContainer.lessons.push(videoMetadata);
   course.updated_at = new Date().toISOString();
   await coursesRepository.updateCourseModule(courseId, course);
-  scheduleVideoProcessing({ courseId, lessonId });
+  try {
+    const scheduled = await scheduleVideoProcessing({ courseId, lessonId, source: 'admin-upload' });
+    if (!scheduled) {
+      throw new Error(`Video processing job ${courseId}:${lessonId} was not accepted by the worker queue.`);
+    }
+  } catch (error) {
+    await coursesRepository.updateLesson(courseId, lessonId, (current) => ({
+      ...current,
+      sourceFallbackAllowed: true,
+      playbackReady: false,
+      hlsProcessingStatus: 'failed',
+      hlsProcessingCompletedAt: new Date().toISOString(),
+      hlsProcessingError: error instanceof Error ? error.message : 'Video processing queue rejected the upload.',
+    }));
+    throw new ApiError(503, 'Video uploaded but processing could not be scheduled. Please retry processing from admin.', {
+      code: 'VIDEO_PROCESSING_QUEUE_UNAVAILABLE',
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
 
   return {
-    message: 'Video uploaded successfully. Private adaptive HLS encoding has started and the topic will appear for students after processing completes.',
+    message: 'Video uploaded successfully. Protected source playback is available while private adaptive HLS encoding finishes.',
     processingProvider: 'local-hls',
     video: videoMetadata,
     course,
@@ -810,6 +833,45 @@ const listVideosInModule = asyncHandler(async (req, res) => {
   });
 });
 
+const retryVideoProcessing = asyncHandler(async (req, res) => {
+  const courseId = requireString(req.params.courseId, 'courseId');
+  const moduleId = requireString(req.params.moduleId, 'moduleId');
+  const videoId = requireString(req.params.videoId, 'videoId');
+  const chapterId = optionalString(req.query?.chapterId, '', { maxLength: 120 });
+
+  const course = await coursesRepository.findById(courseId);
+  if (!course) {
+    throw new ApiError(404, 'Course not found', { code: 'COURSE_NOT_FOUND' });
+  }
+
+  const selection = getModuleVideoSelection(course, moduleId, chapterId);
+  const videoLocation = findVideoInModule(selection.module, videoId);
+  if (!videoLocation || (chapterId && videoLocation.chapter?.id !== chapterId)) {
+    throw new ApiError(404, 'Video not found', { code: 'VIDEO_NOT_FOUND' });
+  }
+
+  const repairResult = await repairCourseLessonHlsOutputs({
+    courseId,
+    lessonId: videoId,
+  });
+
+  const refreshedCourse = await coursesRepository.findById(courseId);
+  const refreshedSelection = refreshedCourse
+    ? getModuleVideoSelection(refreshedCourse, moduleId, chapterId)
+    : selection;
+  const refreshedLocation = findVideoInModule(refreshedSelection.module, videoId);
+
+  return ok(res, {
+    message: repairResult.status === 'repaired'
+      ? 'Video playback assets repaired successfully.'
+      : repairResult.status === 'requeued'
+        ? 'Video processing restarted successfully.'
+        : 'Video processing retry could not recover this lesson yet.',
+    result: repairResult,
+    video: refreshedLocation?.video || null,
+  });
+});
+
 const getVideoMetadata = asyncHandler(async (req, res) => {
   const courseId = requireString(req.params.courseId, 'courseId');
   const moduleId = requireString(req.params.moduleId, 'moduleId');
@@ -844,5 +906,6 @@ module.exports = {
   handleCloudflareStreamWebhook,
   deleteVideoFromModule,
   listVideosInModule,
+  retryVideoProcessing,
   getVideoMetadata,
 };

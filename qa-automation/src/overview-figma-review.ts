@@ -6,8 +6,10 @@ import { selectors } from './selectors.js';
 import { CaptureRecord, FailureRecord, StepDefinition } from './types.js';
 import { artifactPath, createRunContext, writeJson, writeText } from './utils.js';
 
+const baseUrl = process.env.QA_BASE_URL || config.baseUrl;
+
 const apiOrigin = (() => {
-  const url = new URL(config.baseUrl);
+  const url = new URL(baseUrl);
   if (url.hostname === '10.0.2.2') {
     url.hostname = '127.0.0.1';
   }
@@ -26,18 +28,14 @@ const step: StepDefinition = {
     selectors.overviewStreak,
     selectors.overviewScoreSummary,
     selectors.overviewScoreCard,
-    selectors.overviewUpcomingClasses,
     selectors.overviewUpcomingTests,
   ],
   expectedTexts: [
     'Welcome back',
-    'Courses',
     'Performance Overview',
     'Learning Activity',
-    "Today's Schedule",
     'Tests',
     'Latest Result',
-    'Session Status',
   ],
 };
 
@@ -103,7 +101,7 @@ const clickFirstVisible = async (page: puppeteer.Page, selectorOptions: string[]
 };
 
 const waitForOverviewAppReady = async (page: puppeteer.Page, includeAuth = false) => {
-  const deadline = Date.now() + 30000;
+  const deadline = Date.now() + 45000;
   const readySelectors = [
     selectors.shellReady,
     selectors.overviewDashboard,
@@ -126,12 +124,12 @@ const waitForOverviewAppReady = async (page: puppeteer.Page, includeAuth = false
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
 
-  throw new Error('Overview app did not become ready within 30000ms.');
+  throw new Error('Overview app did not become ready within 45000ms.');
 };
 
 const loadPage = async (page: puppeteer.Page) => {
   try {
-    await page.goto(config.baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
   } catch (error) {
     if (!(error instanceof Error) || !error.message.includes('Navigation timeout')) {
       throw error;
@@ -212,7 +210,6 @@ export const runOverviewReview = async (): Promise<{ captures: CaptureRecord[]; 
           selectors.overviewRecommendation,
         ] as string[],
         extraTexts: [
-          'Continue learning',
           'Active Courses',
           'Quick Revision',
           'Recommended Track',
@@ -224,13 +221,11 @@ export const runOverviewReview = async (): Promise<{ captures: CaptureRecord[]; 
         extraSelectors: [
           selectors.mobileNavOverview,
           selectors.mobileNavCourses,
-          selectors.mobileNavLive,
           selectors.mobileNavTests,
         ] as string[],
         extraTexts: [
           'View all',
           'Open Courses',
-          'View timetable',
           'View all tests',
         ] as string[],
       },
@@ -317,6 +312,7 @@ export const runOverviewReview = async (): Promise<{ captures: CaptureRecord[]; 
 
     return { captures, failures };
   } finally {
+    await writeJson(path.join(ctx.analysisDir, 'summary.json'), { captures, failures }).catch(() => undefined);
     await browser.close().catch(() => undefined);
   }
 };

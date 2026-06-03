@@ -206,6 +206,53 @@ const deleteLessonCbt = asyncHandler(async (req, res) => {
   });
 });
 
+const updateLessonSettings = asyncHandler(async (req, res) => {
+  const courseId = requireString(req.params.courseId, 'course id');
+  const moduleId = requireString(req.params.moduleId, 'module id');
+  const lessonId = requireString(req.params.lessonId, 'lesson id');
+  const chapterId = optionalString(req.body?.chapterId, '', { maxLength: 120 });
+
+  const course = await loadCourseOrThrow(courseId);
+  const module = loadModuleOrThrow(course, moduleId);
+  const lessons = findLessonContainerOrThrow(module, lessonId, chapterId);
+  const lesson = lessons.find((entry) => entry.id === lessonId);
+  if (!lesson) {
+    throw new ApiError(404, 'Lesson not found', { code: 'LESSON_NOT_FOUND' });
+  }
+
+  if (req.body.watchLimit !== undefined) {
+    lesson.watchLimit = optionalNumber(req.body.watchLimit, lesson.watchLimit || 2, {
+      min: 1,
+      max: 20,
+      integer: true,
+    });
+  }
+
+  if (req.body.watchCompletionPercent !== undefined) {
+    lesson.watchCompletionPercent = optionalNumber(
+      req.body.watchCompletionPercent,
+      lesson.watchCompletionPercent || 90,
+      {
+        min: 50,
+        max: 100,
+        integer: true,
+      },
+    );
+  }
+
+  lesson.updatedAt = new Date().toISOString();
+  lesson.updatedBy = req.user?.id || 'admin';
+  course.updated_at = new Date().toISOString();
+
+  const updatedCourse = await coursesRepository.updateCourseModule(courseId, course);
+
+  return ok(res, {
+    message: 'Lesson playback settings updated successfully',
+    lesson,
+    course: updatedCourse,
+  });
+});
+
 const updateCourse = asyncHandler(async (req, res) => {
   const id = requireString(req.params.id, 'course id');
   const course = await loadCourseOrThrow(id);
@@ -236,12 +283,6 @@ const updateCourse = asyncHandler(async (req, res) => {
 const deleteCourse = asyncHandler(async (req, res) => {
   const id = requireString(req.params.id, 'course id');
   const course = await loadCourseOrThrow(id);
-
-  if (course.enrollmentCount && course.enrollmentCount > 0) {
-    throw new ApiError(409, `Cannot delete course with ${course.enrollmentCount} active enrollments. Archive instead.`, {
-      code: 'COURSE_HAS_ENROLLMENTS',
-    });
-  }
 
   const fs = require('fs');
   const path = require('path');
@@ -470,4 +511,5 @@ module.exports = {
   listCoursesAdmin,
   attachLessonCbt,
   deleteLessonCbt,
+  updateLessonSettings,
 };

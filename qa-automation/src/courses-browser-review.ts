@@ -17,6 +17,12 @@ const apiOrigin = (() => {
 const desktopViewport = { width: 1536, height: 1024 };
 const mobileViewport = { width: 390, height: 844 };
 
+const storeAuthToken = async (page: puppeteer.Page, token: string) => {
+  await page.evaluateOnNewDocument((jwt) => {
+    window.localStorage.setItem('edumaster.jwt', jwt);
+  }, token);
+};
+
 const loginAndStoreSession = async (page: puppeteer.Page, email: string, password: string) => {
   const response = await fetch(new URL('/backend/api/auth/login', apiOrigin), {
     method: 'POST',
@@ -34,9 +40,8 @@ const loginAndStoreSession = async (page: puppeteer.Page, email: string, passwor
     throw new Error(payload?.error || payload?.message || 'Unable to login for course flow review');
   }
 
-  await page.evaluate((token) => {
-    window.localStorage.setItem('edumaster.jwt', token);
-  }, payload.token as string);
+  await page.goto(config.baseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => undefined);
+  await storeAuthToken(page, payload.token as string);
 };
 
 const takeScreenshot = async (
@@ -415,7 +420,7 @@ const reviewFlow = async (
     Object.keys(window.localStorage)
       .filter((key) => String(key || '').startsWith('edumaster.course-figma-progress'))
       .forEach((key) => window.localStorage.removeItem(key));
-  });
+  }).catch(() => undefined);
 
   await loadPage(page);
   await waitForCourseAppReady(page, true);

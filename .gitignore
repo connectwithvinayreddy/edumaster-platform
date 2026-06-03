@@ -15,6 +15,7 @@ uploads/
 private_uploads/
 .env*
 !.env.example
+!.env.staging.private-mirror.example
 android/app/*.jks
 android/app/*.keystore
 android/app/keystore.properties

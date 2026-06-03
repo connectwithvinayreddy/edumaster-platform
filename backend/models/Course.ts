@@ -8,7 +8,20 @@ const LessonSchema = new Schema(
     durationMinutes: { type: Number, required: true, default: 0 },
     videoUrl: { type: String, default: null },
     notesUrl: { type: String, default: null },
+    attachments: { type: [Schema.Types.Mixed], default: [] },
     premium: { type: Boolean, default: false },
+  },
+  { _id: false },
+);
+
+const ChapterSchema = new Schema(
+  {
+    id: { type: String, required: true },
+    title: { type: String, required: true },
+    description: { type: String, default: '' },
+    order: { type: Number, default: 1 },
+    attachments: { type: [Schema.Types.Mixed], default: [] },
+    lessons: { type: [LessonSchema], default: [] },
   },
   { _id: false },
 );
@@ -17,6 +30,10 @@ const ModuleSchema = new Schema(
   {
     id: { type: String, required: true },
     title: { type: String, required: true },
+    description: { type: String, default: '' },
+    order: { type: Number, default: 1 },
+    attachments: { type: [Schema.Types.Mixed], default: [] },
+    chapters: { type: [ChapterSchema], default: [] },
     lessons: { type: [LessonSchema], default: [] },
   },
   { _id: false },

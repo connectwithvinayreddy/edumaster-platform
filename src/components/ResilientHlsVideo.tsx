@@ -41,10 +41,12 @@ type ResilientHlsVideoProps = {
   selectedQualityHeight?: number;
   defaultQualityHeight?: number;
   nativeControls?: boolean;
+  resetResumeCounter?: number;
   onQualityOptionsChange?: (options: RecordedVideoQualityOption[]) => void;
   onProgress?: (progressSeconds: number, durationSeconds: number, completed: boolean) => void;
   onReady?: () => void;
   onPlaybackStateChange?: (state: { playing: boolean; ended?: boolean; waiting?: boolean }) => void;
+  onVideoClick?: () => void;
 };
 
 export type ResilientHlsVideoHandle = {
@@ -249,10 +251,12 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
   selectedQualityHeight,
   defaultQualityHeight = 480,
   nativeControls = true,
+  resetResumeCounter = 0,
   onQualityOptionsChange,
   onProgress,
   onReady,
   onPlaybackStateChange,
+  onVideoClick,
 }, ref) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<HlsRuntimeInstance | null>(null);
@@ -2280,6 +2284,45 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
   }, [onQualityOptionsChange]);
 
   useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    try {
+      window.sessionStorage.removeItem(lastResumeStorageKeyRef.current);
+    } catch {
+      // Ignore storage access failures.
+    }
+
+    const video = videoRef.current;
+    lastResumeSourceRef.current = '';
+    lastHeartbeatPositionRef.current = 0;
+    lastObservedPlaybackPositionRef.current = 0;
+    lastCurrentTimeRef.current = 0;
+    lastPersistedResumeFloorRef.current = 0;
+    pendingResumeRef.current = 0;
+    firstFrameReachedRef.current = false;
+    startupStartedAtRef.current = 0;
+    startupReportedRef.current = false;
+    startupProgressAtRef.current = 0;
+    startupProgressPhaseRef.current = 'idle';
+    stablePlaybackSnapshotRef.current = {
+      ...stablePlaybackSnapshotRef.current,
+      currentTime: 0,
+      firstFrameReached: false,
+      updatedAt: Date.now(),
+    };
+
+    if (video) {
+      try {
+        video.currentTime = 0;
+      } catch {
+        // Ignore seek races while the player is still settling.
+      }
+    }
+  }, [resetResumeCounter]);
+
+  useEffect(() => {
     const video = videoRef.current;
     if (!video) {
       return;
@@ -2376,6 +2419,7 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
         controlsList="nodownload noplaybackrate noremoteplayback"
         disablePictureInPicture
         disableRemotePlayback
+        onClick={() => onVideoClick?.()}
         onContextMenu={(event) => event.preventDefault()}
         aria-label={title}
       />

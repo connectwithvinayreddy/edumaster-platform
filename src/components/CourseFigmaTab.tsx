@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
+import Button from '@mui/material/Button';
 import {
   Bell,
   Bookmark,
@@ -1239,6 +1240,7 @@ export const CourseFigmaTab = ({
   const [editorialPlayback, setEditorialPlayback] = useState<ProtectedLessonPlayback | null>(null);
   const [loadingEditorialId, setLoadingEditorialId] = useState<string | null>(null);
   const [editorialError, setEditorialError] = useState<string | null>(null);
+  const [lessonReplayResetCounter, setLessonReplayResetCounter] = useState(0);
   const [useProtectedSourceFallback, setUseProtectedSourceFallback] = useState(false);
   const [privateVideoQualityOptions, setPrivateVideoQualityOptions] = useState<RecordedVideoQualityOption[]>([]);
   const [selectedPrivateVideoQuality, setSelectedPrivateVideoQuality] = useState<number | null>(null);
@@ -1257,6 +1259,7 @@ export const CourseFigmaTab = ({
   const protectedLessonVideoRef = useRef<ResilientHlsVideoHandle | null>(null);
   const protectedPlaybackTimeoutRetryCountRef = useRef(0);
   const protectedPlaybackRetryTimerRef = useRef<number | null>(null);
+  const replayFromStartLessonIdRef = useRef<string | null>(null);
   const playerControlsHideTimerRef = useRef<number | null>(null);
   const hlsRef = useRef<HlsRuntimeInstance | null>(null);
 
@@ -1489,7 +1492,7 @@ export const CourseFigmaTab = ({
       ?? selectedLessonEntry?.lesson.watchLimit
       ?? MAX_VIDEO_WATCHES,
     ),
-    1,
+    MAX_VIDEO_WATCHES,
   );
   const selectedLessonWatchCompletionPercent = Math.min(
     Math.max(
@@ -1521,17 +1524,21 @@ export const CourseFigmaTab = ({
   );
   const selectedLessonExplanationWatchCount = getExplanationWatchCount(selectedLessonStoredProgress);
   const hasCompletedLessonVideo = selectedLessonVideoWatchCount > 0 || hasLessonVideoMilestone(selectedLessonStoredProgress);
-  const hasReachedLessonVideoWatchLimit = selectedLessonProtectedWatchState
-    ? Boolean(selectedLessonProtectedWatchState.locked)
-    : selectedLessonVideoWatchCount >= selectedLessonVideoWatchLimit;
+  const selectedLessonReachedVideoWatchLimitByCount = selectedLessonVideoWatchCount >= selectedLessonVideoWatchLimit;
   const isLessonGraceReplayAvailable = Boolean(
     selectedLessonProtectedWatchState
     && !selectedLessonProtectedWatchState.locked
     && selectedLessonProtectedReplayState === 'grace_cycle'
     && selectedLessonGraceRemainingSeconds > 0,
   );
+  const hasReachedLessonVideoWatchLimit = selectedLessonProtectedWatchState
+    ? Boolean(selectedLessonProtectedWatchState.locked)
+    || (!isLessonGraceReplayAvailable && selectedLessonReachedVideoWatchLimitByCount)
+    : selectedLessonReachedVideoWatchLimitByCount;
   const canRewatchLessonVideo = selectedLessonProtectedWatchState
-    ? selectedLessonVideoWatchCount > 0 && !selectedLessonProtectedWatchState.locked
+    ? selectedLessonVideoWatchCount > 0
+    && !selectedLessonProtectedWatchState.locked
+    && !selectedLessonReachedVideoWatchLimitByCount
     : selectedLessonVideoWatchCount > 0 && selectedLessonVideoWatchCount < selectedLessonVideoWatchLimit;
   const selectedLessonReplayStatusLabel = hasReachedLessonVideoWatchLimit
     ? 'Video limit reached'
@@ -1849,7 +1856,15 @@ export const CourseFigmaTab = ({
     const selectedLessonId = String(selectedLesson?.id || '').trim();
     if (!selectedLessonId) {
       setActiveProtectedPlaybackBinding(null);
+      replayFromStartLessonIdRef.current = null;
       return;
+    }
+
+    if (
+      replayFromStartLessonIdRef.current
+      && String(replayFromStartLessonIdRef.current) !== selectedLessonId
+    ) {
+      replayFromStartLessonIdRef.current = null;
     }
 
     setActiveProtectedPlaybackBinding((current) => (
@@ -1887,6 +1902,7 @@ export const CourseFigmaTab = ({
       return;
     }
 
+    const shouldStartFromBeginning = String(replayFromStartLessonIdRef.current || '') === String(selectedLesson.id || '');
     const nextBinding: StableProtectedPlaybackBinding = {
       lessonId: String(selectedLesson.id),
       videoId: String(protectedLessonPlayback.videoId || selectedLesson.id || '').trim() || null,
@@ -1897,7 +1913,7 @@ export const CourseFigmaTab = ({
       playbackSessionId: String(protectedLessonPlayback.playbackSessionId || '').trim() || null,
       videoType: protectedLessonPlayback.videoType || 'course',
       deliveryProfile: protectedLessonPlayback.deliveryProfile || null,
-      resumeSeconds: Math.max(Number(protectedLessonPlayback.resumeSeconds || 0), 0),
+      resumeSeconds: shouldStartFromBeginning ? 0 : Math.max(Number(protectedLessonPlayback.resumeSeconds || 0), 0),
       watchState: protectedLessonPlayback.watchState || null,
       replayState: protectedLessonPlayback.watchState?.replayState || null,
     };
@@ -1922,7 +1938,7 @@ export const CourseFigmaTab = ({
         drmConfig: current.drmManifestUrl === nextBinding.drmManifestUrl
           ? (nextBinding.drmConfig || current.drmConfig || null)
           : current.drmConfig || null,
-        resumeSeconds: Math.max(Number(nextBinding.resumeSeconds || 0), 0),
+        resumeSeconds: shouldStartFromBeginning ? 0 : Math.max(Number(nextBinding.resumeSeconds || 0), 0),
         watchState: nextBinding.watchState || current.watchState || null,
         replayState: nextBinding.replayState || current.replayState || null,
       };
@@ -2008,28 +2024,32 @@ export const CourseFigmaTab = ({
           drmManifestUrl: payload.drmConfig?.manifestUrl || null,
         });
         protectedPlaybackTimeoutRetryCountRef.current = 0;
+        const shouldStartFromBeginning = String(replayFromStartLessonIdRef.current || '') === String(selectedLesson.id || '');
+        const normalizedPayload = shouldStartFromBeginning
+          ? { ...payload, resumeSeconds: 0 }
+          : payload;
         setProtectedLessonPlayback((current) => {
           const currentVideoId = String(current?.videoId || '').trim();
-          const payloadVideoId = String(payload?.videoId || selectedLesson.id || '').trim();
+          const payloadVideoId = String(normalizedPayload?.videoId || selectedLesson.id || '').trim();
           const sameVideo = Boolean(current && currentVideoId && payloadVideoId && currentVideoId === payloadVideoId);
           if (!sameVideo) {
-            return payload;
+            return normalizedPayload;
           }
 
           return {
             ...current,
-            ...payload,
-            streamUrl: payload.streamUrl || current.streamUrl || null,
-            drmConfig: payload.drmConfig?.manifestUrl
-              ? payload.drmConfig
-              : payload.drmConfig || current.drmConfig || null,
-            fallbackStreamUrl: payload.fallbackStreamUrl || current.fallbackStreamUrl || null,
-            fallbackStreamFormat: payload.fallbackStreamFormat || current.fallbackStreamFormat || null,
-            deliveryProfile: payload.deliveryProfile || current.deliveryProfile || null,
-            streamFormat: payload.streamFormat || current.streamFormat || null,
-            statusMessage: payload.statusMessage || current.statusMessage || null,
-            resumeSeconds: Math.max(Number(payload.resumeSeconds || current.resumeSeconds || 0), 0),
-            watchState: payload.watchState || current.watchState || null,
+            ...normalizedPayload,
+            streamUrl: normalizedPayload.streamUrl || current.streamUrl || null,
+            drmConfig: normalizedPayload.drmConfig?.manifestUrl
+              ? normalizedPayload.drmConfig
+              : normalizedPayload.drmConfig || current.drmConfig || null,
+            fallbackStreamUrl: normalizedPayload.fallbackStreamUrl || current.fallbackStreamUrl || null,
+            fallbackStreamFormat: normalizedPayload.fallbackStreamFormat || current.fallbackStreamFormat || null,
+            deliveryProfile: normalizedPayload.deliveryProfile || current.deliveryProfile || null,
+            streamFormat: normalizedPayload.streamFormat || current.streamFormat || null,
+            statusMessage: normalizedPayload.statusMessage || current.statusMessage || null,
+            resumeSeconds: shouldStartFromBeginning ? 0 : Math.max(Number(normalizedPayload.resumeSeconds || current.resumeSeconds || 0), 0),
+            watchState: normalizedPayload.watchState || current.watchState || null,
           };
         });
       })
@@ -2494,6 +2514,9 @@ export const CourseFigmaTab = ({
       return;
     }
 
+    const replayLessonId = String(selectedLessonEntry.lesson.id || '').trim();
+    replayFromStartLessonIdRef.current = replayLessonId || null;
+    setLessonReplayResetCounter((current) => current + 1);
     autoplayHandledRef.current = null;
     setAutoplayCountdown(null);
     setIsVideoReplayMode(true);
@@ -2502,6 +2525,10 @@ export const CourseFigmaTab = ({
     setVideoPlaybackSeconds(0);
     setIsVideoPlaying(false);
     setIsExplanationPlaying(false);
+    protectedLessonVideoRef.current?.seekTo(0);
+    if (lessonVideoRef.current) {
+      lessonVideoRef.current.currentTime = 0;
+    }
 
     if (selectedLessonHasSecurePlayback) {
       setLoadingProtectedLesson(true);
@@ -2551,6 +2578,9 @@ export const CourseFigmaTab = ({
       autoplayHandledRef.current = autoplayKey;
       setIsVideoPlaying(false);
       setIsVideoReplayMode(false);
+      if (String(replayFromStartLessonIdRef.current || '') === String(selectedLessonEntry.lesson.id || '')) {
+        replayFromStartLessonIdRef.current = null;
+      }
       setCompletedVideoPlaybackKey(null);
       persistProgress(selectedCourse._id, selectedLessonEntry.lesson.id, {
         lessonId: selectedLessonEntry.lesson.id,
@@ -3851,10 +3881,13 @@ export const CourseFigmaTab = ({
         }}
         onTouchStart={() => showPlayerControls({ keepSettings: true })}
         onClick={(event) => {
-          if (event.target === event.currentTarget) {
-            showPlayerControls({ keepSettings: true });
-            setPlayerSettingsView('closed');
+          const target = event.target as HTMLElement | null;
+          if (target?.closest('button, input, select, textarea, [data-course-player-interactive="true"]')) {
+            return;
           }
+          showPlayerControls({ keepSettings: true });
+          setPlayerSettingsView('closed');
+          void toggleCurrentLessonPlayback();
         }}
       >
         <div
@@ -3881,7 +3914,7 @@ export const CourseFigmaTab = ({
         </div>
         {renderSettingsPanel()}
         <div className={cn('absolute inset-x-[10px] bottom-[10px] transition-opacity duration-200', controlsVisible ? 'opacity-100' : 'opacity-0')}>
-          <div className="pointer-events-auto rounded-[18px] border border-white/10 bg-[rgba(7,11,19,0.58)] px-[10px] py-[8px] text-white shadow-[0_16px_28px_rgba(0,0,0,0.22)] backdrop-blur-md">
+          <div data-course-player-interactive="true" className="pointer-events-auto rounded-[18px] border border-white/10 bg-[rgba(7,11,19,0.58)] px-[10px] py-[8px] text-white shadow-[0_16px_28px_rgba(0,0,0,0.22)] backdrop-blur-md">
             <input
               data-testid="course-player-seek"
               type="range"
@@ -3990,7 +4023,7 @@ export const CourseFigmaTab = ({
     const drmManifestUrl = useProtectedSourceFallback
       ? null
       : activeProtectedPlaybackBinding?.drmManifestUrl
-        || (playerDrmConfig?.enabled ? playerDrmConfig.manifestUrl || null : null);
+      || (playerDrmConfig?.enabled ? playerDrmConfig.manifestUrl || null : null);
     const fallbackPlayerUrl = useProtectedSourceFallback && protectedLessonPlayback?.fallbackStreamUrl
       ? protectedLessonPlayback.fallbackStreamUrl
       : null;
@@ -4105,6 +4138,7 @@ export const CourseFigmaTab = ({
               streamFormat={playerDrmConfig?.manifestFormat || playerFormat || 'hls'}
               deliveryProfile={activeProtectedPlaybackBinding?.deliveryProfile || protectedLessonPlayback?.deliveryProfile || null}
               deliveryPathHint={playerDeliveryPath}
+              resetResumeCounter={lessonReplayResetCounter}
               resumeSeconds={activeProtectedPlaybackBinding?.resumeSeconds ?? protectedLessonPlayback?.resumeSeconds ?? 0}
               playbackSpeed={playbackSpeed}
               defaultQualityHeight={480}
@@ -4117,13 +4151,14 @@ export const CourseFigmaTab = ({
                 setIsVideoPlaying(Boolean(state.playing));
                 setIsPlayerBuffering(Boolean(state.waiting));
               }}
+              onVideoClick={() => void toggleCurrentLessonPlayback()}
               className={cn(
                 'w-full bg-black',
                 isFullscreen
                   ? 'h-screen min-h-0 rounded-none border-0 object-contain'
                   : variant === 'mobile'
-                  ? 'h-full min-h-0 object-cover'
-                  : 'aspect-video min-h-[420px] object-contain',
+                    ? 'h-full min-h-0 object-cover'
+                    : 'aspect-video min-h-[420px] object-contain',
               )}
               onReady={() => setIsVideoPlaying(false)}
               onProgress={(progressSeconds, durationSeconds, completed) => {
@@ -4156,8 +4191,8 @@ export const CourseFigmaTab = ({
                 isFullscreen
                   ? 'h-screen min-h-0 object-contain'
                   : variant === 'mobile'
-                  ? 'h-full min-h-0 object-cover'
-                  : 'aspect-video min-h-[420px] object-contain',
+                    ? 'h-full min-h-0 object-cover'
+                    : 'aspect-video min-h-[420px] object-contain',
               )}
               onPlay={() => {
                 setIsVideoPlaying(true);
@@ -4201,6 +4236,10 @@ export const CourseFigmaTab = ({
                   setCompletedVideoPlaybackKey(`${selectedLesson.id}::${Date.now()}`);
                 }
                 setIsPlayerBuffering(false);
+              }}
+              onClick={(event) => {
+                event.stopPropagation();
+                void toggleCurrentLessonPlayback();
               }}
             />
           )}
@@ -4277,9 +4316,9 @@ export const CourseFigmaTab = ({
         data-course-view="catalog"
         className="mobile-safe-screen min-h-[100dvh] overflow-x-hidden bg-[#f4f7ff] pb-[76px]"
       >
-          <div className="mobile-safe-content mx-auto pb-[10px] pt-[10px]" style={uiFontStyle}>
+        <div className="mobile-safe-content mx-auto pb-[10px] pt-[10px]" style={uiFontStyle}>
 
-            <header>
+          <header>
             <div className="flex items-center justify-between gap-[12px]">
               <h1 className="text-[19px] font-semibold leading-none tracking-[-0.02em] text-[#1c2844]">All Courses</h1>
             </div>
@@ -4371,102 +4410,102 @@ export const CourseFigmaTab = ({
         </div>
       </div>
     ) : (
-    <div
-      data-testid="course-figma-page"
-      data-course-view="catalog"
-      className="overflow-hidden rounded-[30px] border border-white/70 bg-[linear-gradient(180deg,#f9fbff_0%,#eef3ff_100%)] shadow-[0_30px_90px_rgba(33,51,97,0.13)]"
-    >
-      <header className="flex flex-col gap-[18px] border-b border-[#dde5f5] bg-[linear-gradient(180deg,#ffffff_0%,#f7faff_100%)] px-[24px] py-[20px] lg:flex-row lg:items-center lg:justify-between">
-        <h1 className="text-[24px] font-semibold leading-none tracking-[-0.03em] text-[#1c2844]">All Courses</h1>
-        <HeaderTools
-          searchValue={searchQuery}
-          onSearchChange={setSearchQuery}
-          placeholder="Search courses..."
-          testId="course-catalog-search"
-        />
-      </header>
+      <div
+        data-testid="course-figma-page"
+        data-course-view="catalog"
+        className="overflow-hidden rounded-[30px] border border-white/70 bg-[linear-gradient(180deg,#f9fbff_0%,#eef3ff_100%)] shadow-[0_30px_90px_rgba(33,51,97,0.13)]"
+      >
+        <header className="flex flex-col gap-[18px] border-b border-[#dde5f5] bg-[linear-gradient(180deg,#ffffff_0%,#f7faff_100%)] px-[24px] py-[20px] lg:flex-row lg:items-center lg:justify-between">
+          <h1 className="text-[24px] font-semibold leading-none tracking-[-0.03em] text-[#1c2844]">All Courses</h1>
+          <HeaderTools
+            searchValue={searchQuery}
+            onSearchChange={setSearchQuery}
+            placeholder="Search courses..."
+            testId="course-catalog-search"
+          />
+        </header>
 
-      <div className="flex flex-col gap-[16px] border-b border-[#dde5f5] bg-[linear-gradient(180deg,#f2f6ff_0%,#eef3ff_100%)] px-[24px] py-[18px] xl:flex-row xl:items-center xl:justify-between">
-        <div className="flex flex-wrap gap-[10px]">
+        <div className="flex flex-col gap-[16px] border-b border-[#dde5f5] bg-[linear-gradient(180deg,#f2f6ff_0%,#eef3ff_100%)] px-[24px] py-[18px] xl:flex-row xl:items-center xl:justify-between">
+          <div className="flex flex-wrap gap-[10px]">
+            <label className="relative">
+              <select
+                value={categoryFilter}
+                onChange={(event) => setCategoryFilter(event.target.value)}
+                className="h-[42px] min-w-[170px] appearance-none rounded-[12px] border border-[#d7dfef] bg-white px-[16px] pr-[38px] text-[15px] text-[#27385c] shadow-[0_8px_18px_rgba(64,89,142,0.05)] outline-none"
+              >
+                {categories.map((category) => (
+                  <option key={category} value={category}>
+                    {category === 'all' ? 'Category' : category}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown className="pointer-events-none absolute right-[12px] top-1/2 h-[15px] w-[15px] -translate-y-1/2 text-[#5f7297]" />
+            </label>
+
+            <label className="relative">
+              <select
+                value={statusFilter}
+                onChange={(event) => setStatusFilter(event.target.value as typeof statusFilter)}
+                className="h-[42px] min-w-[170px] appearance-none rounded-[12px] border border-[#d7dfef] bg-white px-[16px] pr-[38px] text-[15px] text-[#27385c] shadow-[0_8px_18px_rgba(64,89,142,0.05)] outline-none"
+              >
+                <option value="all">Status</option>
+                <option value="unlocked">Unlocked</option>
+                <option value="progress">In Progress</option>
+                <option value="completed">Completed</option>
+                <option value="not-started">Not Started</option>
+              </select>
+              <ChevronDown className="pointer-events-none absolute right-[12px] top-1/2 h-[15px] w-[15px] -translate-y-1/2 text-[#5f7297]" />
+            </label>
+
+            <button
+              type="button"
+              onClick={() => {
+                setCategoryFilter('all');
+                setStatusFilter('all');
+                setSortBy('latest');
+                setSearchQuery('');
+              }}
+              className="flex h-[42px] items-center gap-[8px] rounded-[12px] border border-[#d7dfef] bg-white px-[16px] text-[15px] text-[#516786] shadow-[0_8px_18px_rgba(64,89,142,0.05)]"
+            >
+              <Sparkles className="h-[15px] w-[15px]" />
+              Reset Filter
+            </button>
+          </div>
+
           <label className="relative">
             <select
-              value={categoryFilter}
-              onChange={(event) => setCategoryFilter(event.target.value)}
-              className="h-[42px] min-w-[170px] appearance-none rounded-[12px] border border-[#d7dfef] bg-white px-[16px] pr-[38px] text-[15px] text-[#27385c] shadow-[0_8px_18px_rgba(64,89,142,0.05)] outline-none"
+              value={sortBy}
+              onChange={(event) => setSortBy(event.target.value as typeof sortBy)}
+              className="h-[42px] min-w-[190px] appearance-none rounded-[12px] border border-[#d7dfef] bg-white px-[16px] pr-[38px] text-[15px] text-[#27385c] shadow-[0_8px_18px_rgba(64,89,142,0.05)] outline-none"
             >
-              {categories.map((category) => (
-                <option key={category} value={category}>
-                  {category === 'all' ? 'Category' : category}
-                </option>
-              ))}
+              <option value="latest">Latest</option>
+              <option value="progress">Progress</option>
+              <option value="title">Title</option>
             </select>
             <ChevronDown className="pointer-events-none absolute right-[12px] top-1/2 h-[15px] w-[15px] -translate-y-1/2 text-[#5f7297]" />
           </label>
-
-          <label className="relative">
-            <select
-              value={statusFilter}
-              onChange={(event) => setStatusFilter(event.target.value as typeof statusFilter)}
-              className="h-[42px] min-w-[170px] appearance-none rounded-[12px] border border-[#d7dfef] bg-white px-[16px] pr-[38px] text-[15px] text-[#27385c] shadow-[0_8px_18px_rgba(64,89,142,0.05)] outline-none"
-            >
-              <option value="all">Status</option>
-              <option value="unlocked">Unlocked</option>
-              <option value="progress">In Progress</option>
-              <option value="completed">Completed</option>
-              <option value="not-started">Not Started</option>
-            </select>
-            <ChevronDown className="pointer-events-none absolute right-[12px] top-1/2 h-[15px] w-[15px] -translate-y-1/2 text-[#5f7297]" />
-          </label>
-
-          <button
-            type="button"
-            onClick={() => {
-              setCategoryFilter('all');
-              setStatusFilter('all');
-              setSortBy('latest');
-              setSearchQuery('');
-            }}
-            className="flex h-[42px] items-center gap-[8px] rounded-[12px] border border-[#d7dfef] bg-white px-[16px] text-[15px] text-[#516786] shadow-[0_8px_18px_rgba(64,89,142,0.05)]"
-          >
-            <Sparkles className="h-[15px] w-[15px]" />
-            Reset Filter
-          </button>
         </div>
 
-        <label className="relative">
-          <select
-            value={sortBy}
-            onChange={(event) => setSortBy(event.target.value as typeof sortBy)}
-            className="h-[42px] min-w-[190px] appearance-none rounded-[12px] border border-[#d7dfef] bg-white px-[16px] pr-[38px] text-[15px] text-[#27385c] shadow-[0_8px_18px_rgba(64,89,142,0.05)] outline-none"
-          >
-            <option value="latest">Latest</option>
-            <option value="progress">Progress</option>
-            <option value="title">Title</option>
-          </select>
-          <ChevronDown className="pointer-events-none absolute right-[12px] top-1/2 h-[15px] w-[15px] -translate-y-1/2 text-[#5f7297]" />
-        </label>
+        <div className="bg-[radial-gradient(circle_at_12%_12%,rgba(255,255,255,0.88),transparent_22%),linear-gradient(180deg,#eaf1ff_0%,#e7efff_100%)] px-[24px] py-[22px]">
+          {filteredCourses.length === 0 ? (
+            <div className="rounded-[24px] border border-dashed border-[#d8e1f1] bg-white/90 px-[24px] py-[32px] text-center text-[15px] text-[#607089]">
+              No courses match the current search and filters.
+            </div>
+          ) : (
+            <div className="grid gap-[18px] xl:grid-cols-3">
+              {filteredCourses.map((course, index) => (
+                <CatalogCourseCard
+                  key={course._id}
+                  course={course}
+                  tone={getCatalogTone(course, index)}
+                  snapshot={courseSnapshots[course._id] || { totalLessons: 0, completedLessons: 0, progressPercent: 0 }}
+                  onOpen={() => openCourse(course._id, 'course')}
+                />
+              ))}
+            </div>
+          )}
+        </div>
       </div>
-
-      <div className="bg-[radial-gradient(circle_at_12%_12%,rgba(255,255,255,0.88),transparent_22%),linear-gradient(180deg,#eaf1ff_0%,#e7efff_100%)] px-[24px] py-[22px]">
-        {filteredCourses.length === 0 ? (
-          <div className="rounded-[24px] border border-dashed border-[#d8e1f1] bg-white/90 px-[24px] py-[32px] text-center text-[15px] text-[#607089]">
-            No courses match the current search and filters.
-          </div>
-        ) : (
-          <div className="grid gap-[18px] xl:grid-cols-3">
-            {filteredCourses.map((course, index) => (
-              <CatalogCourseCard
-                key={course._id}
-                course={course}
-                tone={getCatalogTone(course, index)}
-                snapshot={courseSnapshots[course._id] || { totalLessons: 0, completedLessons: 0, progressPercent: 0 }}
-                onOpen={() => openCourse(course._id, 'course')}
-              />
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
     )
   );
 
@@ -4736,7 +4775,7 @@ export const CourseFigmaTab = ({
                       <div className="min-w-0 flex items-center gap-[8px]">
                         <p className="text-[12.5px] font-semibold text-[#1f2d4e]">{section.label}</p>
                         <p className="truncate text-[11.5px] text-[#516786]">{section.title}</p>
-                        </div>
+                      </div>
                       <div className="flex shrink-0 items-center gap-[5px] text-[9px] text-[#5f7297]">
                         <span>{completedCount}/{section.lessons.length} Lessons</span>
                         <ChevronDown className={cn('h-[14px] w-[14px] transition', expanded ? 'rotate-180' : '')} />
@@ -4858,230 +4897,233 @@ export const CourseFigmaTab = ({
         </div>
       </div>
     ) : (
-    <div
-      data-testid="course-figma-page"
-      data-course-view="course"
-      className="overflow-hidden rounded-[26px] border border-white/70 bg-[linear-gradient(180deg,#f9fbff_0%,#eef3ff_100%)] shadow-[0_30px_90px_rgba(33,51,97,0.13)] xl:rounded-[30px]"
-    >
-      <header className="flex flex-col gap-[14px] border-b border-[#dde5f5] bg-[linear-gradient(180deg,#ffffff_0%,#f8fbff_100%)] px-[16px] py-[16px] xl:flex-row xl:items-center xl:justify-between xl:px-[24px] xl:py-[20px]">
-        <button
-          type="button"
-          data-testid="course-back-to-catalog"
-          onClick={() => {
-            setScreen('catalog');
-            setSearchQuery('');
-          }}
-          className="flex items-center gap-[10px] text-left text-[14px] text-[#5e7397] xl:text-[15px]"
-        >
-          <ChevronLeft className="h-[18px] w-[18px]" />
-          <span>{['Courses', selectedCourse?.title].filter(Boolean).join(' / ')}</span>
-        </button>
-        <HeaderTools
-          searchValue={searchQuery}
-          onSearchChange={setSearchQuery}
-          placeholder="Search lessons..."
-        />
-      </header>
+      <div
+        data-testid="course-figma-page"
+        data-course-view="course"
+        className="overflow-hidden rounded-[26px] border border-white/70 bg-[linear-gradient(180deg,#f9fbff_0%,#eef3ff_100%)] shadow-[0_30px_90px_rgba(33,51,97,0.13)] xl:rounded-[30px]"
+      >
+        <header className="flex flex-col gap-[14px] border-b border-[#dde5f5] bg-[linear-gradient(180deg,#ffffff_0%,#f8fbff_100%)] px-[16px] py-[16px] xl:flex-row xl:items-center xl:justify-between xl:px-[24px] xl:py-[20px]">
+          <button
+            type="button"
+            data-testid="course-back-to-catalog"
+            onClick={() => {
+              setScreen('catalog');
+              setSearchQuery('');
+            }}
+            className="flex items-center gap-[10px] text-left text-[14px] text-[#5e7397] xl:text-[15px]"
+          >
+            <ChevronLeft className="h-[18px] w-[18px]" />
+            <span>{['Courses', selectedCourse?.title].filter(Boolean).join(' / ')}</span>
+          </button>
+          <HeaderTools
+            searchValue={searchQuery}
+            onSearchChange={setSearchQuery}
+            placeholder="Search lessons..."
+          />
+        </header>
 
-      <div className="grid gap-[14px] px-[14px] py-[14px] xl:grid-cols-[minmax(0,1fr)_300px] xl:gap-[18px] xl:px-[24px] xl:py-[20px]">
-        <div className="min-w-0">
-          <section className="overflow-hidden rounded-[20px] border border-[#dbe4f3] bg-white shadow-[0_16px_34px_rgba(54,78,123,0.08)] xl:rounded-[24px]">
-            <div
-              data-testid="course-figma-hero"
-              className={cn(
-                'relative h-[160px] overflow-hidden xl:h-[220px]',
-                selectedCourse && !selectedCourseHasAccess && 'xl:h-[290px]',
-              )}
-            >
-              <img alt="" aria-hidden="true" className="absolute inset-0 h-full w-full object-cover" src={selectedCourseVisual} />
-              <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(255,255,255,0.18)_0%,rgba(255,255,255,0.06)_55%,rgba(255,255,255,0)_100%)]" />
-              <div className="relative h-full px-[18px] pt-[18px] text-[#16264a] xl:px-[30px] xl:pt-[32px]">
-                <h2 className="max-w-[280px] text-[24px] font-semibold leading-[1.08] tracking-[-0.03em] xl:max-w-[560px] xl:text-[32px] xl:leading-[1.12]">
-                  {selectedCourse?.title}
-                </h2>
-                <div className="mt-[10px] flex items-center gap-[10px] text-[14px] text-[#24355a] xl:mt-[14px] xl:gap-[14px] xl:text-[16px]">
-                  <span>{selectedCourseSnapshot.progressPercent}% Complete</span>
-                  <div className="h-[8px] w-[138px] overflow-hidden rounded-full bg-[#cfdcf2] xl:h-[10px] xl:w-[180px]">
-                    <div className={cn('h-full rounded-full', selectedToneStyles.progress)} style={{ width: `${selectedCourseSnapshot.progressPercent}%` }} />
-                  </div>
-                </div>
-                {selectedCourse && !selectedCourseHasAccess ? (() => {
-                  const pricing = getCoursePricingMeta(selectedCourse);
-                  return (
-                    <div className="mt-[16px] max-w-[360px] rounded-[16px] border border-[#ffd9b6] bg-[linear-gradient(135deg,rgba(255,247,237,0.94)_0%,rgba(255,255,255,0.96)_100%)] px-[14px] py-[12px] shadow-[0_12px_26px_rgba(201,106,43,0.10)] xl:mt-[18px]">
-                      <div className="flex items-start justify-between gap-[10px]">
-                        <div>
-                          {pricing.hasOffer ? (
-                            <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#c96a2b]">Offer price</p>
-                          ) : null}
-                          <p className="mt-[4px] text-[28px] font-bold leading-none text-[#17233d]">{currency.format(pricing.finalPrice)}</p>
-                        </div>
-                        {pricing.hasOffer && (
-                          <span className="rounded-full bg-[#ffedd5] px-[10px] py-[6px] text-[11px] font-bold text-[#c96a2b]">
-                            {pricing.offerPercentage}% OFF
-                          </span>
-                        )}
-                      </div>
-                      {pricing.hasOffer ? (
-                        <div className="mt-[8px] flex flex-wrap items-center gap-[8px] text-[11px]">
-                          <span className="font-semibold text-[#7a8aa7] line-through decoration-[#c96a2b]/55">
-                            {currency.format(pricing.basePrice)}
-                          </span>
-                          <span className="rounded-full bg-[#fff3e6] px-[8px] py-[3px] font-semibold text-[#c96a2b]">
-                            Save {currency.format(pricing.savings)}
-                          </span>
-                        </div>
-                      ) : null}
-                      <div className="mt-[12px] flex flex-wrap items-center gap-[10px]">
-                        {renderCourseAccessActions(selectedCourse, 'desktop')}
-                        <span className="text-[11px] font-medium text-[#6c7f9f]">
-                          Unlock this course to start lessons and linked mock tests.
-                        </span>
-                      </div>
-                    </div>
-                  );
-                })() : null}
-                <div className="mt-[16px] flex flex-wrap items-center gap-[10px] xl:mt-[28px]">
-                  {selectedCourseHasAccess ? (
-                    <button
-                      type="button"
-                      onClick={() => selectedLessonEntry && openLesson(selectedLessonEntry.lesson.id)}
-                      className="inline-flex h-[38px] items-center gap-[8px] rounded-[11px] bg-[linear-gradient(180deg,#4487f4_0%,#2d6ee5_100%)] px-[16px] text-[13px] font-semibold text-white shadow-[0_14px_28px_rgba(45,110,229,0.24)] xl:h-[46px] xl:gap-[10px] xl:rounded-[12px] xl:px-[22px] xl:text-[15px]"
-                    >
-                      {getCoursePrimaryActionLabel(selectedCourse, selectedCourseSnapshot.progressPercent)}
-                      <ChevronRight className="h-[16px] w-[16px]" />
-                    </button>
-                  ) : null}
-                </div>
-                {(courseAccessMessage || (!selectedCourseHasAccess && selectedCourse?.accessBlockReason)) && (
-                  <p className="mt-[10px] inline-flex max-w-[520px] rounded-[12px] bg-white/82 px-[12px] py-[8px] text-[12px] leading-5 text-[#41597d]">
-                    {courseAccessMessage || selectedCourse?.accessBlockReason}
-                  </p>
+        <div className="grid gap-[14px] px-[14px] py-[14px] xl:grid-cols-[minmax(0,1fr)_300px] xl:gap-[18px] xl:px-[24px] xl:py-[20px]">
+          <div className="min-w-0">
+            <section className="overflow-hidden rounded-[20px] border border-[#dbe4f3] bg-white shadow-[0_16px_34px_rgba(54,78,123,0.08)] xl:rounded-[24px]">
+              <div
+                data-testid="course-figma-hero"
+                className={cn(
+                  'relative h-[160px] overflow-hidden xl:h-[220px]',
+                  selectedCourse && !selectedCourseHasAccess && 'xl:h-[290px]',
                 )}
+              >
+                <img alt="" aria-hidden="true" className="absolute inset-0 h-full w-full object-cover" src={selectedCourseVisual} />
+                <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(255,255,255,0.18)_0%,rgba(255,255,255,0.06)_55%,rgba(255,255,255,0)_100%)]" />
+                <div className="relative h-full px-[18px] pt-[18px] text-[#16264a] xl:px-[30px] xl:pt-[32px]">
+                  <h2 className="max-w-[280px] text-[24px] font-semibold leading-[1.08] tracking-[-0.03em] xl:max-w-[560px] xl:text-[32px] xl:leading-[1.12]">
+                    {selectedCourse?.title}
+                  </h2>
+                  <div className="mt-[10px] flex items-center gap-[10px] text-[14px] text-[#24355a] xl:mt-[14px] xl:gap-[14px] xl:text-[16px]">
+                    <span>{selectedCourseSnapshot.progressPercent}% Complete</span>
+                    <div className="h-[8px] w-[138px] overflow-hidden rounded-full bg-[#cfdcf2] xl:h-[10px] xl:w-[180px]">
+                      <div className={cn('h-full rounded-full', selectedToneStyles.progress)} style={{ width: `${selectedCourseSnapshot.progressPercent}%` }} />
+                    </div>
+                  </div>
+                  {selectedCourse && !selectedCourseHasAccess ? (() => {
+                    const pricing = getCoursePricingMeta(selectedCourse);
+                    return (
+                      <div className="mt-[16px] max-w-[360px] rounded-[16px] border border-[#ffd9b6] bg-[linear-gradient(135deg,rgba(255,247,237,0.94)_0%,rgba(255,255,255,0.96)_100%)] px-[14px] py-[12px] shadow-[0_12px_26px_rgba(201,106,43,0.10)] xl:mt-[18px]">
+                        <div className="flex items-start justify-between gap-[10px]">
+                          <div>
+                            {pricing.hasOffer ? (
+                              <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#c96a2b]">Offer price</p>
+                            ) : null}
+                            <p className="mt-[4px] text-[28px] font-bold leading-none text-[#17233d]">{currency.format(pricing.finalPrice)}</p>
+                          </div>
+                          {pricing.hasOffer && (
+                            <span className="rounded-full bg-[#ffedd5] px-[10px] py-[6px] text-[11px] font-bold text-[#c96a2b]">
+                              {pricing.offerPercentage}% OFF
+                            </span>
+                          )}
+                        </div>
+                        {pricing.hasOffer ? (
+                          <div className="mt-[8px] flex flex-wrap items-center gap-[8px] text-[11px]">
+                            <span className="font-semibold text-[#7a8aa7] line-through decoration-[#c96a2b]/55">
+                              {currency.format(pricing.basePrice)}
+                            </span>
+                            <span className="rounded-full bg-[#fff3e6] px-[8px] py-[3px] font-semibold text-[#c96a2b]">
+                              Save {currency.format(pricing.savings)}
+                            </span>
+                          </div>
+                        ) : null}
+                        <div className="mt-[12px] flex flex-wrap items-center gap-[10px]">
+                          {renderCourseAccessActions(selectedCourse, 'desktop')}
+                          <span className="text-[11px] font-medium text-[#6c7f9f]">
+                            Unlock this course to start lessons and linked mock tests.
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })() : null}
+                  <div className="mt-[16px] flex flex-wrap items-center gap-[10px] xl:mt-[28px]">
+                    {selectedCourseHasAccess ? (
+                      <button
+                        type="button"
+                        onClick={() => selectedLessonEntry && openLesson(selectedLessonEntry.lesson.id)}
+                        className="inline-flex h-[38px] items-center gap-[8px] rounded-[11px] bg-[linear-gradient(180deg,#4487f4_0%,#2d6ee5_100%)] px-[16px] text-[13px] font-semibold text-white shadow-[0_14px_28px_rgba(45,110,229,0.24)] xl:h-[46px] xl:gap-[10px] xl:rounded-[12px] xl:px-[22px] xl:text-[15px]"
+                      >
+                        {getCoursePrimaryActionLabel(selectedCourse, selectedCourseSnapshot.progressPercent)}
+                        <ChevronRight className="h-[16px] w-[16px]" />
+                      </button>
+                    ) : null}
+                  </div>
+                  {(courseAccessMessage || (!selectedCourseHasAccess && selectedCourse?.accessBlockReason)) && (
+                    <p className="mt-[10px] inline-flex max-w-[520px] rounded-[12px] bg-white/82 px-[12px] py-[8px] text-[12px] leading-5 text-[#41597d]">
+                      {courseAccessMessage || selectedCourse?.accessBlockReason}
+                    </p>
+                  )}
+                </div>
               </div>
-            </div>
 
-            <div className="flex flex-col gap-[10px] border-b border-[#e0e8f6] bg-white px-[14px] py-[14px] xl:flex-row xl:items-end xl:justify-between xl:px-[20px] xl:py-[18px]">
-              <div data-testid="course-figma-tabs" className="flex gap-[20px] overflow-x-auto xl:gap-[26px]">
-                {courseTabs.map((tab) => (
+              <div className="flex flex-col gap-[10px] border-b border-[#e0e8f6] bg-white px-[14px] py-[14px] xl:flex-row xl:items-end xl:justify-between xl:px-[20px] xl:py-[18px]">
+                <div data-testid="course-figma-tabs" className="flex gap-[20px] overflow-x-auto xl:gap-[26px]">
+                  {courseTabs.map((tab) => (
+                    <button
+                      key={tab}
+                      type="button"
+                      onClick={() => setActiveCourseTab(tab)}
+                      className={cn(
+                        'relative pb-[8px] text-[15px] text-[#4c6086] xl:pb-[10px] xl:text-[16px]',
+                        activeCourseTab === tab ? 'font-semibold text-[#16264a]' : 'font-medium',
+                      )}
+                    >
+                      {tab}
+                      {activeCourseTab === tab && <span className="absolute bottom-0 left-0 right-0 h-[3px] rounded-full bg-[#3c83ef]" />}
+                    </button>
+                  ))}
+                </div>
+
+                {selectedCourseCbtEligibleCount > 0 ? (
+                  <div className="inline-flex h-[36px] items-center gap-[7px] rounded-[10px] border border-[#dbe4f3] bg-[#f7faff] px-[12px] text-[13px] text-[#5e7397] xl:h-[40px] xl:gap-[8px] xl:px-[14px] xl:text-[15px]">
+                    <ClipboardCheck className="h-[15px] w-[15px]" />
+                    {selectedCourseExamAttempts}/{selectedCourseCbtEligibleCount} CBT attempts
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="bg-[linear-gradient(180deg,#f6f9ff_0%,#eef4ff_100%)] px-[12px] py-[12px] xl:px-[14px] xl:py-[14px]">
+                {activeCourseTab === 'Lessons' && renderLessonsTab()}
+                {activeCourseTab === 'Editorial' && renderEditorialTab('desktop')}
+              </div>
+            </section>
+          </div>
+
+          <aside data-testid="course-figma-sidebar" className="space-y-[12px]">
+            <section data-testid="course-figma-stats" className="rounded-[18px] bg-white px-[16px] pb-[14px] pt-[14px] shadow-[0_16px_34px_rgba(54,78,123,0.08)] xl:rounded-[22px] xl:px-[18px] xl:pb-[14px] xl:pt-[16px]">
+              <p className="text-[16px] font-medium text-[#1c2d4c] xl:text-[17px]">Course Statistics</p>
+              <div className="mt-[14px] flex justify-center">
+                <ProgressDonut percent={selectedCourseSnapshot.progressPercent} title="Completed" size={isMobileLayout ? 100 : 118} testId="course-progress-percent" />
+              </div>
+              <div className="mt-[14px] grid grid-cols-2 gap-y-[8px] px-[2px] text-[13px] text-[#5d7092] xl:px-[6px] xl:text-[14px]">
+                <span data-testid="course-progress-lessons-completed">{selectedCourseVideoCompletedDisplayCount} Lessons</span>
+                {selectedCourseCbtEligibleCount > 0 ? <span>{selectedCourseExamAttempts} CBT Done</span> : <span>Video only</span>}
+                {selectedCourseCbtEligibleCount > 0 ? <span>{Math.max(selectedCourseCbtEligibleCount - selectedCourseExamAttempts, 0)} CBT Left</span> : <span>No CBT linked</span>}
+                <span className="text-[#7a90b7]">{selectedCourseSnapshot.totalLessons} Total</span>
+              </div>
+            </section>
+
+            <section data-testid="course-figma-note" className="rounded-[18px] bg-[#fbf3e5] px-[16px] py-[14px] shadow-[0_16px_34px_rgba(54,78,123,0.06)] xl:rounded-[22px] xl:px-[18px]">
+              <div className="flex items-center gap-[8px] text-[14px] text-[#bf8646] xl:text-[15px]">
+                <BookOpen className="h-[14px] w-[14px]" />
+                <span>Pinned Note</span>
+              </div>
+              <h3 className="mt-[10px] text-[15px] font-medium leading-[1.24] text-[#202833] xl:text-[16px]">
+                Basic concepts build the foundation
+              </h3>
+              <p className="mt-[8px] text-[13px] leading-[1.5] text-[#747980] xl:text-[14px] xl:leading-[1.42]">
+                Use this course page to expand chapters, choose the next topic, and carry progress cleanly into the player without losing context.
+              </p>
+            </section>
+
+            <section data-testid="course-figma-topics" className="rounded-[18px] bg-white px-[16px] py-[14px] shadow-[0_16px_34px_rgba(54,78,123,0.08)] xl:rounded-[22px] xl:px-[18px]">
+              <p className="text-[15px] font-medium text-[#1c2d4c] xl:text-[16px]">Recommended Topics</p>
+              <div className="mt-[12px] space-y-[10px]">
+                {recommendedTopics.slice(0, 3).map((topic) => (
                   <button
-                    key={tab}
+                    key={topic}
                     type="button"
-                    onClick={() => setActiveCourseTab(tab)}
-                    className={cn(
-                      'relative pb-[8px] text-[15px] text-[#4c6086] xl:pb-[10px] xl:text-[16px]',
-                      activeCourseTab === tab ? 'font-semibold text-[#16264a]' : 'font-medium',
-                    )}
+                    onClick={() => selectedLessonEntry && openLesson(selectedLessonEntry.lesson.id)}
+                    className="flex w-full items-center gap-[10px] text-left"
                   >
-                    {tab}
-                    {activeCourseTab === tab && <span className="absolute bottom-0 left-0 right-0 h-[3px] rounded-full bg-[#3c83ef]" />}
+                    <div className="flex h-[24px] w-[24px] items-center justify-center rounded-[7px] bg-[#dfeafb] text-[#4b86ea]">
+                      <BookOpen className="h-[12px] w-[12px]" />
+                    </div>
+                    <p className="text-[14px] leading-[1.24] text-[#34486f] xl:text-[15px] xl:leading-[1.18]">{topic}</p>
                   </button>
                 ))}
               </div>
+            </section>
 
-              {selectedCourseCbtEligibleCount > 0 ? (
-                <div className="inline-flex h-[36px] items-center gap-[7px] rounded-[10px] border border-[#dbe4f3] bg-[#f7faff] px-[12px] text-[13px] text-[#5e7397] xl:h-[40px] xl:gap-[8px] xl:px-[14px] xl:text-[15px]">
-                  <ClipboardCheck className="h-[15px] w-[15px]" />
-                  {selectedCourseExamAttempts}/{selectedCourseCbtEligibleCount} CBT attempts
-                </div>
-              ) : null}
-            </div>
-
-            <div className="bg-[linear-gradient(180deg,#f6f9ff_0%,#eef4ff_100%)] px-[12px] py-[12px] xl:px-[14px] xl:py-[14px]">
-              {activeCourseTab === 'Lessons' && renderLessonsTab()}
-              {activeCourseTab === 'Editorial' && renderEditorialTab('desktop')}
-            </div>
-          </section>
-        </div>
-
-        <aside data-testid="course-figma-sidebar" className="space-y-[12px]">
-          <section data-testid="course-figma-stats" className="rounded-[18px] bg-white px-[16px] pb-[14px] pt-[14px] shadow-[0_16px_34px_rgba(54,78,123,0.08)] xl:rounded-[22px] xl:px-[18px] xl:pb-[14px] xl:pt-[16px]">
-            <p className="text-[16px] font-medium text-[#1c2d4c] xl:text-[17px]">Course Statistics</p>
-            <div className="mt-[14px] flex justify-center">
-              <ProgressDonut percent={selectedCourseSnapshot.progressPercent} title="Completed" size={isMobileLayout ? 100 : 118} testId="course-progress-percent" />
-            </div>
-            <div className="mt-[14px] grid grid-cols-2 gap-y-[8px] px-[2px] text-[13px] text-[#5d7092] xl:px-[6px] xl:text-[14px]">
-              <span data-testid="course-progress-lessons-completed">{selectedCourseVideoCompletedDisplayCount} Lessons</span>
-              {selectedCourseCbtEligibleCount > 0 ? <span>{selectedCourseExamAttempts} CBT Done</span> : <span>Video only</span>}
-              {selectedCourseCbtEligibleCount > 0 ? <span>{Math.max(selectedCourseCbtEligibleCount - selectedCourseExamAttempts, 0)} CBT Left</span> : <span>No CBT linked</span>}
-              <span className="text-[#7a90b7]">{selectedCourseSnapshot.totalLessons} Total</span>
-            </div>
-          </section>
-
-          <section data-testid="course-figma-note" className="rounded-[18px] bg-[#fbf3e5] px-[16px] py-[14px] shadow-[0_16px_34px_rgba(54,78,123,0.06)] xl:rounded-[22px] xl:px-[18px]">
-            <div className="flex items-center gap-[8px] text-[14px] text-[#bf8646] xl:text-[15px]">
-              <BookOpen className="h-[14px] w-[14px]" />
-              <span>Pinned Note</span>
-            </div>
-            <h3 className="mt-[10px] text-[15px] font-medium leading-[1.24] text-[#202833] xl:text-[16px]">
-              Basic concepts build the foundation
-            </h3>
-            <p className="mt-[8px] text-[13px] leading-[1.5] text-[#747980] xl:text-[14px] xl:leading-[1.42]">
-              Use this course page to expand chapters, choose the next topic, and carry progress cleanly into the player without losing context.
-            </p>
-          </section>
-
-          <section data-testid="course-figma-topics" className="rounded-[18px] bg-white px-[16px] py-[14px] shadow-[0_16px_34px_rgba(54,78,123,0.08)] xl:rounded-[22px] xl:px-[18px]">
-            <p className="text-[15px] font-medium text-[#1c2d4c] xl:text-[16px]">Recommended Topics</p>
-            <div className="mt-[12px] space-y-[10px]">
-              {recommendedTopics.slice(0, 3).map((topic) => (
-                <button
-                  key={topic}
-                  type="button"
-                  onClick={() => selectedLessonEntry && openLesson(selectedLessonEntry.lesson.id)}
-                  className="flex w-full items-center gap-[10px] text-left"
-                >
-                  <div className="flex h-[24px] w-[24px] items-center justify-center rounded-[7px] bg-[#dfeafb] text-[#4b86ea]">
-                    <BookOpen className="h-[12px] w-[12px]" />
+            {!isMobileLayout && selectedLessonHasCbt && (
+              <section data-testid="course-figma-recommended" className="overflow-hidden rounded-[22px] bg-white shadow-[0_16px_34px_rgba(54,78,123,0.08)]">
+                <div className="flex h-[40px] items-center justify-between border-b border-[#edf2fb] px-[18px]">
+                  <div className="flex items-center gap-[8px] text-[15px] text-[#1c2d4c]">
+                    <span className="h-[14px] w-[14px] rounded-[4px] bg-[#62c2a4]" />
+                    <span>Recommended</span>
                   </div>
-                  <p className="text-[14px] leading-[1.24] text-[#34486f] xl:text-[15px] xl:leading-[1.18]">{topic}</p>
-                </button>
-              ))}
-            </div>
-          </section>
-
-          {!isMobileLayout && selectedLessonHasCbt && (
-            <section data-testid="course-figma-recommended" className="overflow-hidden rounded-[22px] bg-white shadow-[0_16px_34px_rgba(54,78,123,0.08)]">
-            <div className="flex h-[40px] items-center justify-between border-b border-[#edf2fb] px-[18px]">
-              <div className="flex items-center gap-[8px] text-[15px] text-[#1c2d4c]">
-                <span className="h-[14px] w-[14px] rounded-[4px] bg-[#62c2a4]" />
-                <span>Recommended</span>
-              </div>
-              <div className="flex items-center gap-[6px]">
-                <span className="h-[8px] w-[8px] rounded-full bg-[#d8e0f2]" />
-                <span className="h-[8px] w-[8px] rounded-full bg-[#3d83ef]" />
-                <span className="h-[8px] w-[8px] rounded-full bg-[#d8e0f2]" />
-              </div>
-            </div>
-            <div className="px-[18px] py-[12px]">
-              <p className="text-[15px] leading-[1.28] text-[#273852]">
-                {selectedLessonCopy.quiz.prompt}
-              </p>
-              <div className="mt-[10px] flex items-center justify-between text-[13px] text-[#677b9e]">
-                <div className="flex items-center gap-[6px]">
-                  <Clock3 className="h-[13px] w-[13px]" />
-                  <span>{Math.max(Math.round(selectedLessonVideoDurationSeconds / 60), 1)} mins{selectedLessonHasCbt ? ' + CBT' : ''}</span>
+                  <div className="flex items-center gap-[6px]">
+                    <span className="h-[8px] w-[8px] rounded-full bg-[#d8e0f2]" />
+                    <span className="h-[8px] w-[8px] rounded-full bg-[#3d83ef]" />
+                    <span className="h-[8px] w-[8px] rounded-full bg-[#d8e0f2]" />
+                  </div>
                 </div>
-                <button
-                  type="button"
-                  onClick={startLessonExam}
-                  disabled={!isLessonReadyForExam}
-                  className={cn(
-                    'rounded-full px-[12px] py-[4px] text-[12px]',
-                    isLessonReadyForExam
-                      ? 'bg-[#e2ebfb] text-[#7086ab]'
-                      : 'cursor-not-allowed bg-[#eef3fb] text-[#9caac1]',
-                  )}
-                >
-                  Open CBT
-                </button>
-              </div>
-            </div>
-          </section>
-          )}
-        </aside>
+                <div className="px-[18px] py-[12px]">
+                  <p className="text-[15px] leading-[1.28] text-[#273852]">
+                    {selectedLessonCopy.quiz.prompt}
+                  </p>
+                  <div className="mt-[10px] flex items-center justify-between text-[13px] text-[#677b9e]">
+                    <div className="flex items-center gap-[6px]">
+                      <Clock3 className="h-[13px] w-[13px]" />
+                      <span>{Math.max(Math.round(selectedLessonVideoDurationSeconds / 60), 1)} mins{selectedLessonHasCbt ? ' + CBT' : ''}</span>
+                    </div>
+                    <Button
+                      type="button"
+                      color="primary"
+                      onClick={startLessonExam}
+                      disabled={!isLessonReadyForExam}
+                      variant="contained"
+                      disableElevation
+                      className={cn(
+                        'rounded-full px-[12px] py-[4px] text-[12px]',
+                        isLessonReadyForExam
+                          ? 'bg-[#e2ebfb] text-[#7086ab]'
+                          : 'cursor-not-allowed bg-[#eef3fb] text-[#9caac1]',
+                      )}
+                    >
+                      Open CBT
+                    </Button>
+                  </div>
+                </div>
+              </section>
+            )}
+          </aside>
+        </div>
       </div>
-    </div>
     )
   );
 
@@ -5284,118 +5326,118 @@ export const CourseFigmaTab = ({
     }
 
     return (
-    <div className="space-y-[18px]">
-      <section
-        ref={playerViewportRef}
-        data-testid="course-figma-player"
-        className={cn(
-          'relative overflow-visible rounded-[18px] border border-[#dde7f5] bg-[#d8e8ff] shadow-[0_12px_28px_rgba(46,67,111,0.08)]',
-          isFullscreen && 'h-screen w-screen rounded-none border-0 bg-black shadow-none',
-        )}
-      >
-        {actualLessonMedia ? (
-          <div className={cn('overflow-hidden rounded-[inherit] bg-black', isFullscreen && 'flex h-full w-full items-center justify-center rounded-none')}>
-            {actualLessonMedia}
-          </div>
-        ) : (
-          renderLessonMediaUnavailable('desktop')
-        )}
-        <button
-          type="button"
-          data-testid="course-player-fullscreen"
-          onClick={() => void toggleFullscreen()}
-          className="absolute right-[16px] top-[16px] inline-flex items-center gap-[8px] rounded-full border border-white/16 bg-black/52 px-[14px] py-[10px] text-[12px] font-semibold text-white shadow-[0_12px_30px_rgba(0,0,0,0.28)] backdrop-blur-sm transition hover:bg-black/68"
+      <div className="space-y-[18px]">
+        <section
+          ref={playerViewportRef}
+          data-testid="course-figma-player"
+          className={cn(
+            'relative overflow-visible rounded-[18px] border border-[#dde7f5] bg-[#d8e8ff] shadow-[0_12px_28px_rgba(46,67,111,0.08)]',
+            isFullscreen && 'h-screen w-screen rounded-none border-0 bg-black shadow-none',
+          )}
         >
-          {isFullscreen ? <Minimize2 className="h-[14px] w-[14px]" /> : <Maximize2 className="h-[14px] w-[14px]" />}
-          {isFullscreen ? 'Exit full screen' : 'Expand'}
-        </button>
-      </section>
+          {actualLessonMedia ? (
+            <div className={cn('overflow-hidden rounded-[inherit] bg-black', isFullscreen && 'flex h-full w-full items-center justify-center rounded-none')}>
+              {actualLessonMedia}
+            </div>
+          ) : (
+            renderLessonMediaUnavailable('desktop')
+          )}
+          <button
+            type="button"
+            data-testid="course-player-fullscreen"
+            onClick={() => void toggleFullscreen()}
+            className="absolute right-[16px] top-[16px] inline-flex items-center gap-[8px] rounded-full border border-white/16 bg-black/52 px-[14px] py-[10px] text-[12px] font-semibold text-white shadow-[0_12px_30px_rgba(0,0,0,0.28)] backdrop-blur-sm transition hover:bg-black/68"
+          >
+            {isFullscreen ? <Minimize2 className="h-[14px] w-[14px]" /> : <Maximize2 className="h-[14px] w-[14px]" />}
+            {isFullscreen ? 'Exit full screen' : 'Expand'}
+          </button>
+        </section>
 
-      {renderLessonSupportSections('desktop')}
-      {renderLessonPdfPanel('desktop')}
+        {renderLessonSupportSections('desktop')}
+        {renderLessonPdfPanel('desktop')}
 
-      <section className="grid gap-[14px] xl:grid-cols-[minmax(0,1.1fr)_260px]">
-        <div className="rounded-[18px] border border-[#dbe4f3] bg-white px-[18px] py-[16px] shadow-[0_12px_24px_rgba(54,78,123,0.05)]">
-          <p className="text-[16px] font-semibold text-[#1b2d50]">About this lesson</p>
-          <p className="mt-[10px] text-[15px] leading-[1.55] text-[#516786]">{selectedLessonCopy.about}</p>
-        </div>
-        <div className="grid gap-[12px] rounded-[18px] border border-[#dbe4f3] bg-white px-[18px] py-[16px] shadow-[0_12px_24px_rgba(54,78,123,0.05)]">
-          <div className="flex items-center gap-[10px] text-[15px] text-[#516786]">
-            <Clock3 className="h-[18px] w-[18px] text-[#7a90b7]" />
-            <span>{formatDurationLabel(selectedLessonEntry?.lesson.durationMinutes || 0)}</span>
+        <section className="grid gap-[14px] xl:grid-cols-[minmax(0,1.1fr)_260px]">
+          <div className="rounded-[18px] border border-[#dbe4f3] bg-white px-[18px] py-[16px] shadow-[0_12px_24px_rgba(54,78,123,0.05)]">
+            <p className="text-[16px] font-semibold text-[#1b2d50]">About this lesson</p>
+            <p className="mt-[10px] text-[15px] leading-[1.55] text-[#516786]">{selectedLessonCopy.about}</p>
           </div>
-          <div className="flex items-center gap-[10px] text-[15px] text-[#516786]">
-            <Video className="h-[18px] w-[18px] text-[#7a90b7]" />
-            <span>{selectedCourse?.level || selectedLessonLabels[0] || 'Course Lesson'}</span>
+          <div className="grid gap-[12px] rounded-[18px] border border-[#dbe4f3] bg-white px-[18px] py-[16px] shadow-[0_12px_24px_rgba(54,78,123,0.05)]">
+            <div className="flex items-center gap-[10px] text-[15px] text-[#516786]">
+              <Clock3 className="h-[18px] w-[18px] text-[#7a90b7]" />
+              <span>{formatDurationLabel(selectedLessonEntry?.lesson.durationMinutes || 0)}</span>
+            </div>
+            <div className="flex items-center gap-[10px] text-[15px] text-[#516786]">
+              <Video className="h-[18px] w-[18px] text-[#7a90b7]" />
+              <span>{selectedCourse?.level || selectedLessonLabels[0] || 'Course Lesson'}</span>
+            </div>
           </div>
-        </div>
-      </section>
+        </section>
 
-      <section className="grid gap-[14px] xl:grid-cols-[minmax(0,1.1fr)_minmax(0,0.7fr)]">
-        <div className="rounded-[18px] border border-[#dbe4f3] bg-white px-[18px] py-[16px] shadow-[0_12px_24px_rgba(54,78,123,0.05)]">
-          <p className="text-[16px] font-semibold text-[#1b2d50]">Key Takeaways</p>
-          <div className="mt-[14px] space-y-[10px]">
-            {selectedLessonCopy.takeaways.map((point) => (
-              <div key={point} className="flex items-start gap-[10px] text-[15px] leading-[1.48] text-[#32466c]">
-                <CheckCircle2 className="mt-[2px] h-[18px] w-[18px] shrink-0 text-[#2d6ee5]" />
-                <span>{point}</span>
-              </div>
-            ))}
+        <section className="grid gap-[14px] xl:grid-cols-[minmax(0,1.1fr)_minmax(0,0.7fr)]">
+          <div className="rounded-[18px] border border-[#dbe4f3] bg-white px-[18px] py-[16px] shadow-[0_12px_24px_rgba(54,78,123,0.05)]">
+            <p className="text-[16px] font-semibold text-[#1b2d50]">Key Takeaways</p>
+            <div className="mt-[14px] space-y-[10px]">
+              {selectedLessonCopy.takeaways.map((point) => (
+                <div key={point} className="flex items-start gap-[10px] text-[15px] leading-[1.48] text-[#32466c]">
+                  <CheckCircle2 className="mt-[2px] h-[18px] w-[18px] shrink-0 text-[#2d6ee5]" />
+                  <span>{point}</span>
+                </div>
+              ))}
+            </div>
           </div>
-        </div>
 
-        <div className="rounded-[18px] border border-[#dbe4f3] bg-white px-[18px] py-[16px] shadow-[0_12px_24px_rgba(54,78,123,0.05)]">
-          <p className="text-[16px] font-semibold text-[#1b2d50]">Need Help?</p>
-          <p className="mt-[10px] text-[15px] leading-[1.55] text-[#516786]">
-            {selectedLessonHasCbt
-              ? 'Complete the lesson CBT after the video, then open the explanation to finish the lesson flow.'
-              : 'This lesson currently has no linked CBT or explanation. Use the lesson video, notes, and doubts for this topic.'}
-          </p>
-          <div className="mt-[16px] flex flex-wrap gap-[10px]">
-            {selectedLessonHasCbt ? (
-              <>
-                <button
-                  type="button"
-                  data-testid="course-player-start-cbt"
-                  onClick={startLessonExam}
-                  disabled={!isLessonReadyForExam}
-                  className={cn(
-                    'rounded-[10px] px-[16px] py-[10px] text-[14px] font-semibold transition',
-                    isLessonReadyForExam
-                      ? 'bg-[#2d6ee5] text-white'
-                      : 'cursor-not-allowed border border-[#dbe4f3] bg-[#eef3fb] text-[#91a4c2]',
-                  )}
-                >
-                  Open CBT Exam
-                </button>
-                <button
-                  type="button"
-                  data-testid="course-player-watch-explanation"
-                  onClick={openLessonExplanation}
-                  disabled={!isExplanationUnlocked}
-                  className={cn(
-                    'rounded-[10px] px-[16px] py-[10px] text-[14px] font-semibold transition',
-                    isExplanationUnlocked
-                      ? 'bg-[#103b91] text-white'
-                      : 'cursor-not-allowed border border-[#dbe4f3] bg-[#eef3fb] text-[#91a4c2]',
-                  )}
-                >
-                  Watch Explanation
-                </button>
-              </>
-            ) : null}
-            <button
-              type="button"
-              onClick={() => scrollToLessonSection('course-lesson-doubts-section')}
-              className="rounded-[10px] border border-[#dbe4f3] bg-white px-[16px] py-[10px] text-[14px] font-semibold text-[#2d6ee5]"
-            >
-              Ask Doubts
-            </button>
+          <div className="rounded-[18px] border border-[#dbe4f3] bg-white px-[18px] py-[16px] shadow-[0_12px_24px_rgba(54,78,123,0.05)]">
+            <p className="text-[16px] font-semibold text-[#1b2d50]">Need Help?</p>
+            <p className="mt-[10px] text-[15px] leading-[1.55] text-[#516786]">
+              {selectedLessonHasCbt
+                ? 'Complete the lesson CBT after the video, then open the explanation to finish the lesson flow.'
+                : 'This lesson currently has no linked CBT or explanation. Use the lesson video, notes, and doubts for this topic.'}
+            </p>
+            <div className="mt-[16px] flex flex-wrap gap-[10px]">
+              {selectedLessonHasCbt ? (
+                <>
+                  <button
+                    type="button"
+                    data-testid="course-player-start-cbt"
+                    onClick={startLessonExam}
+                    disabled={!isLessonReadyForExam}
+                    className={cn(
+                      'rounded-[10px] px-[16px] py-[10px] text-[14px] font-semibold transition',
+                      isLessonReadyForExam
+                        ? 'bg-[#2d6ee5] text-white'
+                        : 'cursor-not-allowed border border-[#dbe4f3] bg-[#eef3fb] text-[#91a4c2]',
+                    )}
+                  >
+                    Open CBT Exam
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="course-player-watch-explanation"
+                    onClick={openLessonExplanation}
+                    disabled={!isExplanationUnlocked}
+                    className={cn(
+                      'rounded-[10px] px-[16px] py-[10px] text-[14px] font-semibold transition',
+                      isExplanationUnlocked
+                        ? 'bg-[#103b91] text-white'
+                        : 'cursor-not-allowed border border-[#dbe4f3] bg-[#eef3fb] text-[#91a4c2]',
+                    )}
+                  >
+                    Watch Explanation
+                  </button>
+                </>
+              ) : null}
+              <button
+                type="button"
+                onClick={() => scrollToLessonSection('course-lesson-doubts-section')}
+                className="rounded-[10px] border border-[#dbe4f3] bg-white px-[16px] py-[10px] text-[14px] font-semibold text-[#2d6ee5]"
+              >
+                Ask Doubts
+              </button>
+            </div>
           </div>
-        </div>
-      </section>
-    </div>
-  );
+        </section>
+      </div>
+    );
   };
 
   const renderQuizPanel = () => {
@@ -5944,17 +5986,17 @@ export const CourseFigmaTab = ({
           onClick={() => toggleSupportPanel('notes')}
           className="flex w-full items-start justify-between gap-[10px] text-left"
         >
-        <div className="flex items-start gap-[10px]">
-          <div className="mt-[2px] flex h-[30px] w-[30px] items-center justify-center rounded-[10px] bg-[#edf4ff] text-[#2d6ee5]">
-            <FileText className="h-[14px] w-[14px]" />
+          <div className="flex items-start gap-[10px]">
+            <div className="mt-[2px] flex h-[30px] w-[30px] items-center justify-center rounded-[10px] bg-[#edf4ff] text-[#2d6ee5]">
+              <FileText className="h-[14px] w-[14px]" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className={cn(isDesktop ? 'text-[16px]' : 'text-[14px]', 'font-semibold text-[#17305c]')}>Notes</p>
+              <p className={cn(isDesktop ? 'text-[13px]' : 'text-[12px]', 'mt-[4px] leading-[1.45] text-[#5d7092]')}>
+                {isExpanded ? 'Revision notes are open under the video.' : 'Expand notes only when you want a quick recap.'}
+              </p>
+            </div>
           </div>
-          <div className="min-w-0 flex-1">
-            <p className={cn(isDesktop ? 'text-[16px]' : 'text-[14px]', 'font-semibold text-[#17305c]')}>Notes</p>
-            <p className={cn(isDesktop ? 'text-[13px]' : 'text-[12px]', 'mt-[4px] leading-[1.45] text-[#5d7092]')}>
-              {isExpanded ? 'Revision notes are open under the video.' : 'Expand notes only when you want a quick recap.'}
-            </p>
-          </div>
-        </div>
           <span className="rounded-full border border-[#dbe4f3] bg-white px-[12px] py-[6px] text-[11px] font-semibold text-[#2d6ee5]">
             {isExpanded ? 'Collapse' : 'Expand'}
           </span>
@@ -6022,21 +6064,21 @@ export const CourseFigmaTab = ({
           onClick={() => toggleSupportPanel('doubts')}
           className="flex w-full items-start justify-between gap-[10px] text-left"
         >
-        <div className="flex items-start gap-[10px]">
-          <div className="mt-[2px] flex h-[30px] w-[30px] items-center justify-center rounded-[10px] bg-[#edf4ff] text-[#2d6ee5]">
-            <MessageSquare className="h-[14px] w-[14px]" />
+          <div className="flex items-start gap-[10px]">
+            <div className="mt-[2px] flex h-[30px] w-[30px] items-center justify-center rounded-[10px] bg-[#edf4ff] text-[#2d6ee5]">
+              <MessageSquare className="h-[14px] w-[14px]" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className={cn(isDesktop ? 'text-[16px]' : 'text-[14px]', 'font-semibold text-[#17305c]')}>{threadTitle}</p>
+              <p className={cn(isDesktop ? 'text-[13px]' : 'text-[12px]', 'mt-[4px] leading-[1.45] text-[#5d7092]')}>
+                {isExpanded
+                  ? isAdminViewer
+                    ? 'Select a learner thread and reply right from this lesson.'
+                    : selectedLessonCopy.discussionPrompt
+                  : 'Open the lesson question thread only when you need it.'}
+              </p>
+            </div>
           </div>
-          <div className="min-w-0 flex-1">
-            <p className={cn(isDesktop ? 'text-[16px]' : 'text-[14px]', 'font-semibold text-[#17305c]')}>{threadTitle}</p>
-            <p className={cn(isDesktop ? 'text-[13px]' : 'text-[12px]', 'mt-[4px] leading-[1.45] text-[#5d7092]')}>
-              {isExpanded
-                ? isAdminViewer
-                  ? 'Select a learner thread and reply right from this lesson.'
-                  : selectedLessonCopy.discussionPrompt
-                : 'Open the lesson question thread only when you need it.'}
-            </p>
-          </div>
-        </div>
           <span className="rounded-full border border-[#dbe4f3] bg-white px-[12px] py-[6px] text-[11px] font-semibold text-[#2d6ee5]">
             {isExpanded ? 'Collapse' : 'Expand'}
           </span>
@@ -6263,13 +6305,13 @@ export const CourseFigmaTab = ({
                     <p data-testid="lesson-report-ticket-id" className="text-[12px] font-semibold text-[#17305c]">{report._id}</p>
                     <span className="rounded-full bg-white px-[10px] py-[4px] text-[10px] font-semibold uppercase tracking-[0.08em] text-[#d46b23]">{report.status}</span>
                   </div>
-                <p className="mt-[6px] text-[12px] leading-[1.5] text-[#607394]">{report.description}</p>
-                {report.adminReply && <p className="mt-[6px] text-[12px] font-medium text-[#227a42]">Reply: {report.adminReply}</p>}
-                {renderSupportAttachmentLinks(report.attachments)}
-                {renderSupportAttachmentLinks(report.adminAttachments)}
-              </div>
-            ))}
-          </div>
+                  <p className="mt-[6px] text-[12px] leading-[1.5] text-[#607394]">{report.description}</p>
+                  {report.adminReply && <p className="mt-[6px] text-[12px] font-medium text-[#227a42]">Reply: {report.adminReply}</p>}
+                  {renderSupportAttachmentLinks(report.attachments)}
+                  {renderSupportAttachmentLinks(report.adminAttachments)}
+                </div>
+              ))}
+            </div>
           </div>
         )}
       </section>
@@ -6430,7 +6472,7 @@ export const CourseFigmaTab = ({
             </div>
           )}
 
-              <div data-testid="lesson-doubt-panel" className="mt-[12px] rounded-[16px] border border-[#dbe4f3] bg-[#f9fbff] px-[12px] py-[12px]">
+          <div data-testid="lesson-doubt-panel" className="mt-[12px] rounded-[16px] border border-[#dbe4f3] bg-[#f9fbff] px-[12px] py-[12px]">
             <p className="text-[12px] font-semibold text-[#17305c]">{isAdminViewer ? 'Reply in this thread' : 'Ask a quick doubt'}</p>
             <div className="mt-[10px] flex items-center gap-[8px]">
               <input
@@ -6474,7 +6516,7 @@ export const CourseFigmaTab = ({
         : activeLessonTab === 'Explanation'
           ? mobileLessonStageOverride || 'explanation'
           : mobileLessonStageOverride
-            || (!isVideoReplayMode && (selectedLessonStoredProgress?.completed || hasCompletedLessonVideo) ? 'completed' : 'watch');
+          || (!isVideoReplayMode && (selectedLessonStoredProgress?.completed || hasCompletedLessonVideo) ? 'completed' : 'watch');
     const actualLessonMedia = renderActualLessonMedia('mobile');
 
     const renderMobileVideoPill = () => (
@@ -6699,7 +6741,7 @@ export const CourseFigmaTab = ({
       }
 
       return (
-          <section data-testid="lesson-report-panel" className="rounded-[16px] border border-[#d7e3f2] bg-white px-[14px] py-[14px] shadow-[0_14px_30px_rgba(47,111,228,0.08)]">
+        <section data-testid="lesson-report-panel" className="rounded-[16px] border border-[#d7e3f2] bg-white px-[14px] py-[14px] shadow-[0_14px_30px_rgba(47,111,228,0.08)]">
           <div className="flex items-center justify-between gap-[12px]">
             <div>
               <p className="text-[14px] font-extrabold text-[#17233d]">Report Issue</p>
@@ -6991,19 +7033,19 @@ export const CourseFigmaTab = ({
                   </p>
                 </div>
                 {canRewatchLessonVideo ? (
-                <button
-                  type="button"
-                  data-testid="course-player-rewatch-video"
-                  onClick={startLessonVideoReplay}
-                  className="inline-flex h-[32px] shrink-0 items-center justify-center rounded-[10px] border border-[#d7e3f5] bg-white px-[12px] text-[11px] font-semibold text-[#2d6ee5]"
-                >
-                  Rewatch
-                </button>
-              ) : (
-                <span data-testid="course-player-rewatch-limit" className="inline-flex h-[26px] shrink-0 items-center rounded-full bg-[#eef3fb] px-[10px] text-[10px] font-medium text-[#7287a8]">
-                  Limit reached
-                </span>
-              )}
+                  <button
+                    type="button"
+                    data-testid="course-player-rewatch-video"
+                    onClick={startLessonVideoReplay}
+                    className="inline-flex h-[32px] shrink-0 items-center justify-center rounded-[10px] border border-[#d7e3f5] bg-white px-[12px] text-[11px] font-semibold text-[#2d6ee5]"
+                  >
+                    Rewatch
+                  </button>
+                ) : (
+                  <span data-testid="course-player-rewatch-limit" className="inline-flex h-[26px] shrink-0 items-center rounded-full bg-[#eef3fb] px-[10px] text-[10px] font-medium text-[#7287a8]">
+                    Limit reached
+                  </span>
+                )}
               </div>
             </div>
           </div>
@@ -7347,190 +7389,190 @@ export const CourseFigmaTab = ({
     }
 
     return (
-    <div
-      data-testid="course-figma-page"
-      data-course-view="lesson"
-      className="overflow-hidden rounded-[30px] border border-white/70 bg-[linear-gradient(180deg,#f9fbff_0%,#eef3ff_100%)] shadow-[0_30px_90px_rgba(33,51,97,0.13)]"
-    >
-      <header className="flex flex-col gap-[18px] border-b border-[#dde5f5] bg-[linear-gradient(180deg,#ffffff_0%,#f8fbff_100%)] px-[24px] py-[20px] xl:flex-row xl:items-center xl:justify-between">
-        <div className="flex items-center gap-[10px] text-[15px] text-[#5e7397]">
-          <button type="button" onClick={() => setScreen('course')} className="flex items-center gap-[10px]">
-            <ChevronLeft className="h-[18px] w-[18px]" />
-          </button>
-          <span>{breadcrumbLabel}</span>
-        </div>
-        <HeaderTools
-          searchValue={searchQuery}
-          onSearchChange={setSearchQuery}
-          placeholder="Search playlist..."
-        />
-      </header>
-
-      <div className="grid gap-[18px] px-[24px] py-[20px] xl:grid-cols-[minmax(0,1fr)_320px]">
-        <div className="min-w-0">
-          <div className="flex flex-col gap-[16px]">
-            <div className="flex flex-col gap-[12px] xl:flex-row xl:items-center xl:justify-between">
-              <h1 data-testid="course-player-heading" className="text-[24px] font-semibold tracking-[-0.03em] text-[#1c2d4c]">
-                {selectedLessonEntry?.lesson.title}
-              </h1>
-            </div>
-
-            <div className="flex flex-col gap-[12px] border-b border-[#e0e8f6] pb-[12px] xl:flex-row xl:items-end xl:justify-between">
-              <div className="flex items-center gap-[10px]">
-                <button
-                  type="button"
-                  data-testid="course-player-tab-video"
-                  onClick={() => handleLessonTabSelect('Video')}
-                  className={cn(
-                    'relative inline-flex items-center rounded-full px-[12px] py-[8px] text-[15px] transition',
-                    activeLessonTab === 'Video'
-                      ? 'bg-[#e8f0ff] font-semibold text-[#1b49d6]'
-                      : 'border border-[#dbe4f3] bg-white font-medium text-[#4c6086]',
-                  )}
-                >
-                  Video
-                  {activeLessonTab === 'Video' && <span className="absolute bottom-0 left-[10px] right-[10px] h-[3px] rounded-full bg-[#3c83ef]" />}
-                </button>
-                <span className="text-[13px] text-[#6d7c93]">
-                  {selectedLessonReplayStatusLabel}
-                </span>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-[12px]">
-                <button
-                  type="button"
-                  data-testid="course-player-mark-complete"
-                  onClick={handlePrimaryLessonAction}
-                  disabled={primaryLessonActionDisabled}
-                  className={cn(
-                    'inline-flex h-[40px] items-center gap-[8px] rounded-[12px] border px-[16px] text-[15px] font-medium transition',
-                    primaryLessonActionDisabled
-                      ? 'cursor-not-allowed border-[#dbe4f3] bg-[#f2f6fd] text-[#90a4c3]'
-                      : 'border-[#dbe4f3] bg-[#ffffff] text-[#2d6ee5]',
-                  )}
-                >
-                  <ClipboardCheck className="h-[16px] w-[16px]" />
-                  {primaryLessonActionLabel}
-                </button>
-                <button
-                  type="button"
-                  data-testid="course-player-bookmark"
-                  onClick={() => selectedCourse && selectedLessonEntry && onToggleSavedTopic(selectedCourse._id, selectedLessonEntry.lesson.id)}
-                  className="flex h-[40px] w-[40px] items-center justify-center rounded-[12px] border border-[#dbe4f3] bg-white text-[#2d6ee5]"
-                >
-                  <Bookmark className={cn('h-[18px] w-[18px]', selectedLessonSaved && 'fill-current')} />
-                </button>
-              </div>
-            </div>
-
-            {activeLessonTab === 'Video' && renderVideoPanel()}
-            {activeLessonTab === 'CBT Exam' && renderQuizPanel()}
-            {activeLessonTab === 'Explanation' && renderExplanationPanel()}
+      <div
+        data-testid="course-figma-page"
+        data-course-view="lesson"
+        className="overflow-hidden rounded-[30px] border border-white/70 bg-[linear-gradient(180deg,#f9fbff_0%,#eef3ff_100%)] shadow-[0_30px_90px_rgba(33,51,97,0.13)]"
+      >
+        <header className="flex flex-col gap-[18px] border-b border-[#dde5f5] bg-[linear-gradient(180deg,#ffffff_0%,#f8fbff_100%)] px-[24px] py-[20px] xl:flex-row xl:items-center xl:justify-between">
+          <div className="flex items-center gap-[10px] text-[15px] text-[#5e7397]">
+            <button type="button" onClick={() => setScreen('course')} className="flex items-center gap-[10px]">
+              <ChevronLeft className="h-[18px] w-[18px]" />
+            </button>
+            <span>{breadcrumbLabel}</span>
           </div>
-        </div>
+          <HeaderTools
+            searchValue={searchQuery}
+            onSearchChange={setSearchQuery}
+            placeholder="Search playlist..."
+          />
+        </header>
 
-        <aside className="space-y-[12px]">
-          <button
-            type="button"
-            data-testid="course-back-to-lessons"
-            onClick={() => setScreen('course')}
-            className="inline-flex items-center gap-[8px] rounded-[12px] bg-[#eef4ff] px-[16px] py-[12px] text-[15px] font-medium text-[#2d6ee5]"
-          >
-            <ChevronLeft className="h-[16px] w-[16px]" />
-            Back to Lessons
-          </button>
-
-          <section className="rounded-[22px] bg-white px-[18px] py-[16px] shadow-[0_16px_34px_rgba(54,78,123,0.08)]">
-            <p className="text-[16px] font-medium text-[#1c2d4c]">Course Progress</p>
-            <div className="mt-[16px]">
-              <ProgressDonut percent={selectedCourseSnapshot.progressPercent} title="Completed" testId="course-progress-percent" />
-            </div>
-            <div className="mt-[14px] grid grid-cols-2 gap-y-[8px] text-[14px] text-[#5d7092]">
-              <span data-testid="course-progress-lessons-completed">{selectedCourseVideoCompletedDisplayCount} Lessons Completed</span>
-              {selectedCourseCbtEligibleCount > 0 ? <span>{selectedCourseExamAttempts} CBT Done</span> : <span>Video only</span>}
-              {selectedCourseCbtEligibleCount > 0 ? <span>{Math.max(selectedCourseCbtEligibleCount - selectedCourseExamAttempts, 0)} CBT Left</span> : <span>No CBT linked</span>}
-              <span className="text-[#7a90b7]">{selectedCourseSnapshot.totalLessons} Total</span>
-            </div>
-          </section>
-
-          <section className="rounded-[22px] bg-white px-[18px] py-[16px] shadow-[0_16px_34px_rgba(54,78,123,0.08)]">
-            <div className="flex items-center justify-between gap-[12px]">
-              <div>
-                <p className="text-[16px] font-medium text-[#1c2d4c]">Auto play next video</p>
-                <p className="mt-[6px] text-[14px] leading-[1.45] text-[#5d7092]">Automatically play the next lesson when the current one ends.</p>
+        <div className="grid gap-[18px] px-[24px] py-[20px] xl:grid-cols-[minmax(0,1fr)_320px]">
+          <div className="min-w-0">
+            <div className="flex flex-col gap-[16px]">
+              <div className="flex flex-col gap-[12px] xl:flex-row xl:items-center xl:justify-between">
+                <h1 data-testid="course-player-heading" className="text-[24px] font-semibold tracking-[-0.03em] text-[#1c2d4c]">
+                  {selectedLessonEntry?.lesson.title}
+                </h1>
               </div>
-              <ToggleSwitch checked={autoplayEnabled} onToggle={() => setAutoplayEnabled((current) => !current)} testId="course-player-autoplay-toggle" />
-            </div>
-          </section>
 
-          {nextStepDescriptor && renderNextStepCard('desktop')}
-
-          <section className="rounded-[22px] bg-white px-[14px] py-[14px] shadow-[0_16px_34px_rgba(54,78,123,0.08)]">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-[8px] text-[16px] font-medium text-[#1c2d4c]">
-                <FileText className="h-[16px] w-[16px] text-[#7a90b7]" />
-                <span>Lesson Playlist</span>
-              </div>
-            </div>
-            <div className="mt-[12px] space-y-[8px]">
-              {filteredCourseSections.map((section, index) => {
-                const expanded = currentExpandedSections.includes(section.id);
-                return (
-                  <div key={section.id} className="overflow-hidden rounded-[16px] border border-[#e7edf7]">
-                    <button
-                      type="button"
-                      onClick={() => toggleSection(section.id)}
-                      className="flex h-[48px] w-full items-center justify-between px-[12px] text-left"
-                    >
-                      <div className="flex items-center gap-[6px]">
-                        <span className="text-[15px] font-semibold text-[#1b2d50]">{section.label}:</span>
-                        <span className="text-[15px] text-[#44597f]">{section.title}</span>
-                      </div>
-                      <ChevronDown className={cn('h-[16px] w-[16px] text-[#7a8eae] transition', expanded ? 'rotate-180' : '')} />
-                    </button>
-                    {expanded && (
-                      <div className={cn(index === 0 ? 'border-l-[4px] border-l-[#4a8ef5]' : 'border-l-[4px] border-l-transparent')}>
-                        {section.lessons.map((entry) => {
-                          const completed = Boolean(selectedCourseProgressMap.get(entry.lesson.id)?.completed);
-                          const unlocked = Boolean(unlockMap.get(entry.lesson.id)?.unlocked);
-                          return (
-                            <button
-                              key={entry.lesson.id}
-                              type="button"
-                              onClick={() => unlocked && openLesson(entry.lesson.id)}
-                              className={cn(
-                                'flex w-full items-center gap-[10px] px-[10px] py-[10px] text-left',
-                                selectedLessonEntry?.lesson.id === entry.lesson.id ? 'bg-[linear-gradient(90deg,rgba(64,125,233,0.09)_0%,rgba(255,255,255,0.96)_100%)]' : 'bg-white',
-                              )}
-                            >
-                              <div className="flex h-[30px] w-[30px] items-center justify-center rounded-full border border-[#d1ddf4] bg-[#eef3fe] text-[#7092c8]">
-                                {unlocked ? <Play className="ml-[1px] h-[15px] w-[15px] fill-current" /> : <Lock className="h-[13px] w-[13px]" />}
-                              </div>
-                              <div className="min-w-0 flex-1">
-                                <p className={cn('truncate text-[14px] leading-[1.15]', selectedLessonEntry?.lesson.id === entry.lesson.id ? 'font-medium text-[#1b49d6]' : 'text-[#23385f]')}>
-                                  {entry.lesson.title}
-                                </p>
-                                <p className="mt-[4px] text-[12px] text-[#6e80a1]">{formatDurationLabel(entry.lesson.durationMinutes)}</p>
-                              </div>
-                              {completed ? (
-                                <CheckCircle2 className="h-[16px] w-[16px] shrink-0 text-[#26c085]" />
-                              ) : !unlocked ? (
-                                <Lock className="h-[14px] w-[14px] shrink-0 text-[#8fa2c3]" />
-                              ) : null}
-                            </button>
-                          );
-                        })}
-                      </div>
+              <div className="flex flex-col gap-[12px] border-b border-[#e0e8f6] pb-[12px] xl:flex-row xl:items-end xl:justify-between">
+                <div className="flex items-center gap-[10px]">
+                  <button
+                    type="button"
+                    data-testid="course-player-tab-video"
+                    onClick={() => handleLessonTabSelect('Video')}
+                    className={cn(
+                      'relative inline-flex items-center rounded-full px-[12px] py-[8px] text-[15px] transition',
+                      activeLessonTab === 'Video'
+                        ? 'bg-[#e8f0ff] font-semibold text-[#1b49d6]'
+                        : 'border border-[#dbe4f3] bg-white font-medium text-[#4c6086]',
                     )}
-                  </div>
-                );
-              })}
-            </div>
-          </section>
+                  >
+                    Video
+                    {activeLessonTab === 'Video' && <span className="absolute bottom-0 left-[10px] right-[10px] h-[3px] rounded-full bg-[#3c83ef]" />}
+                  </button>
+                  <span className="text-[13px] text-[#6d7c93]">
+                    {selectedLessonReplayStatusLabel}
+                  </span>
+                </div>
 
-        </aside>
+                <div className="flex flex-wrap items-center gap-[12px]">
+                  <button
+                    type="button"
+                    data-testid="course-player-mark-complete"
+                    onClick={handlePrimaryLessonAction}
+                    disabled={primaryLessonActionDisabled}
+                    className={cn(
+                      'inline-flex h-[40px] items-center gap-[8px] rounded-[12px] border px-[16px] text-[15px] font-medium transition',
+                      primaryLessonActionDisabled
+                        ? 'cursor-not-allowed border-[#dbe4f3] bg-[#f2f6fd] text-[#90a4c3]'
+                        : 'border-[#dbe4f3] bg-[#ffffff] text-[#2d6ee5]',
+                    )}
+                  >
+                    <ClipboardCheck className="h-[16px] w-[16px]" />
+                    {primaryLessonActionLabel}
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="course-player-bookmark"
+                    onClick={() => selectedCourse && selectedLessonEntry && onToggleSavedTopic(selectedCourse._id, selectedLessonEntry.lesson.id)}
+                    className="flex h-[40px] w-[40px] items-center justify-center rounded-[12px] border border-[#dbe4f3] bg-white text-[#2d6ee5]"
+                  >
+                    <Bookmark className={cn('h-[18px] w-[18px]', selectedLessonSaved && 'fill-current')} />
+                  </button>
+                </div>
+              </div>
+
+              {activeLessonTab === 'Video' && renderVideoPanel()}
+              {activeLessonTab === 'CBT Exam' && renderQuizPanel()}
+              {activeLessonTab === 'Explanation' && renderExplanationPanel()}
+            </div>
+          </div>
+
+          <aside className="space-y-[12px]">
+            <button
+              type="button"
+              data-testid="course-back-to-lessons"
+              onClick={() => setScreen('course')}
+              className="inline-flex items-center gap-[8px] rounded-[12px] bg-[#eef4ff] px-[16px] py-[12px] text-[15px] font-medium text-[#2d6ee5]"
+            >
+              <ChevronLeft className="h-[16px] w-[16px]" />
+              Back to Lessons
+            </button>
+
+            <section className="rounded-[22px] bg-white px-[18px] py-[16px] shadow-[0_16px_34px_rgba(54,78,123,0.08)]">
+              <p className="text-[16px] font-medium text-[#1c2d4c]">Course Progress</p>
+              <div className="mt-[16px]">
+                <ProgressDonut percent={selectedCourseSnapshot.progressPercent} title="Completed" testId="course-progress-percent" />
+              </div>
+              <div className="mt-[14px] grid grid-cols-2 gap-y-[8px] text-[14px] text-[#5d7092]">
+                <span data-testid="course-progress-lessons-completed">{selectedCourseVideoCompletedDisplayCount} Lessons Completed</span>
+                {selectedCourseCbtEligibleCount > 0 ? <span>{selectedCourseExamAttempts} CBT Done</span> : <span>Video only</span>}
+                {selectedCourseCbtEligibleCount > 0 ? <span>{Math.max(selectedCourseCbtEligibleCount - selectedCourseExamAttempts, 0)} CBT Left</span> : <span>No CBT linked</span>}
+                <span className="text-[#7a90b7]">{selectedCourseSnapshot.totalLessons} Total</span>
+              </div>
+            </section>
+
+            <section className="rounded-[22px] bg-white px-[18px] py-[16px] shadow-[0_16px_34px_rgba(54,78,123,0.08)]">
+              <div className="flex items-center justify-between gap-[12px]">
+                <div>
+                  <p className="text-[16px] font-medium text-[#1c2d4c]">Auto play next video</p>
+                  <p className="mt-[6px] text-[14px] leading-[1.45] text-[#5d7092]">Automatically play the next lesson when the current one ends.</p>
+                </div>
+                <ToggleSwitch checked={autoplayEnabled} onToggle={() => setAutoplayEnabled((current) => !current)} testId="course-player-autoplay-toggle" />
+              </div>
+            </section>
+
+            {nextStepDescriptor && renderNextStepCard('desktop')}
+
+            <section className="rounded-[22px] bg-white px-[14px] py-[14px] shadow-[0_16px_34px_rgba(54,78,123,0.08)]">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-[8px] text-[16px] font-medium text-[#1c2d4c]">
+                  <FileText className="h-[16px] w-[16px] text-[#7a90b7]" />
+                  <span>Lesson Playlist</span>
+                </div>
+              </div>
+              <div className="mt-[12px] space-y-[8px]">
+                {filteredCourseSections.map((section, index) => {
+                  const expanded = currentExpandedSections.includes(section.id);
+                  return (
+                    <div key={section.id} className="overflow-hidden rounded-[16px] border border-[#e7edf7]">
+                      <button
+                        type="button"
+                        onClick={() => toggleSection(section.id)}
+                        className="flex h-[48px] w-full items-center justify-between px-[12px] text-left"
+                      >
+                        <div className="flex items-center gap-[6px]">
+                          <span className="text-[15px] font-semibold text-[#1b2d50]">{section.label}:</span>
+                          <span className="text-[15px] text-[#44597f]">{section.title}</span>
+                        </div>
+                        <ChevronDown className={cn('h-[16px] w-[16px] text-[#7a8eae] transition', expanded ? 'rotate-180' : '')} />
+                      </button>
+                      {expanded && (
+                        <div className={cn(index === 0 ? 'border-l-[4px] border-l-[#4a8ef5]' : 'border-l-[4px] border-l-transparent')}>
+                          {section.lessons.map((entry) => {
+                            const completed = Boolean(selectedCourseProgressMap.get(entry.lesson.id)?.completed);
+                            const unlocked = Boolean(unlockMap.get(entry.lesson.id)?.unlocked);
+                            return (
+                              <button
+                                key={entry.lesson.id}
+                                type="button"
+                                onClick={() => unlocked && openLesson(entry.lesson.id)}
+                                className={cn(
+                                  'flex w-full items-center gap-[10px] px-[10px] py-[10px] text-left',
+                                  selectedLessonEntry?.lesson.id === entry.lesson.id ? 'bg-[linear-gradient(90deg,rgba(64,125,233,0.09)_0%,rgba(255,255,255,0.96)_100%)]' : 'bg-white',
+                                )}
+                              >
+                                <div className="flex h-[30px] w-[30px] items-center justify-center rounded-full border border-[#d1ddf4] bg-[#eef3fe] text-[#7092c8]">
+                                  {unlocked ? <Play className="ml-[1px] h-[15px] w-[15px] fill-current" /> : <Lock className="h-[13px] w-[13px]" />}
+                                </div>
+                                <div className="min-w-0 flex-1">
+                                  <p className={cn('truncate text-[14px] leading-[1.15]', selectedLessonEntry?.lesson.id === entry.lesson.id ? 'font-medium text-[#1b49d6]' : 'text-[#23385f]')}>
+                                    {entry.lesson.title}
+                                  </p>
+                                  <p className="mt-[4px] text-[12px] text-[#6e80a1]">{formatDurationLabel(entry.lesson.durationMinutes)}</p>
+                                </div>
+                                {completed ? (
+                                  <CheckCircle2 className="h-[16px] w-[16px] shrink-0 text-[#26c085]" />
+                                ) : !unlocked ? (
+                                  <Lock className="h-[14px] w-[14px] shrink-0 text-[#8fa2c3]" />
+                                ) : null}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+
+          </aside>
+        </div>
       </div>
-    </div>
     );
   };
 

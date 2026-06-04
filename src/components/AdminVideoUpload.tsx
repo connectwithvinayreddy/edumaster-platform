@@ -246,6 +246,41 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
 
       setVideoFile(file);
       setUploadStatus({ type: 'info', message: `Selected: ${file.name} (${formatFileSize(file.size)})` });
+
+      // Try to extract duration (in minutes) from the selected file using an offscreen video element
+      try {
+        if (typeof window !== 'undefined' && window.URL && typeof document !== 'undefined') {
+          const objectUrl = URL.createObjectURL(file);
+          const tempVideo = document.createElement('video');
+          tempVideo.preload = 'metadata';
+          tempVideo.src = objectUrl;
+          const handleLoaded = () => {
+            try {
+              const totalSeconds = Math.max(0, Math.floor(tempVideo.duration || 0));
+
+              const minutes = Math.floor(totalSeconds / 60);
+              const seconds = totalSeconds % 60;
+
+              const duration = Number(`${minutes}.${String(seconds).padStart(2, "0")}`);
+              setDurationMinutes(duration);
+            } catch (err) {
+              // ignore parsing errors
+            } finally {
+              URL.revokeObjectURL(objectUrl);
+              tempVideo.removeEventListener('loadedmetadata', handleLoaded);
+              tempVideo.remove();
+            }
+          };
+          tempVideo.addEventListener('loadedmetadata', handleLoaded);
+          // Ensure we revoke if an error occurs
+          tempVideo.addEventListener('error', () => {
+            try { URL.revokeObjectURL(objectUrl); } catch (e) { /* ignore */ }
+            tempVideo.remove();
+          });
+        }
+      } catch (err) {
+        // If anything goes wrong, leave durationMinutes as-is (default 0)
+      }
     }
   };
 
@@ -580,11 +615,8 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
           <div>
             <label className="block text-sm font-semibold text-[var(--ink)] mb-2">Duration (minutes)</label>
             <input
-              type="number"
               value={durationMinutes}
-              onChange={(e) => setDurationMinutes(Number(e.target.value) || 0)}
               min="0"
-              placeholder="0"
               className="w-full rounded-2xl border border-[var(--line)] bg-white px-4 py-3 text-[var(--ink)] outline-none focus:border-[var(--accent-rust)]"
             />
           </div>
@@ -602,13 +634,12 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
 
         {uploadStatus.type && (
           <div
-            className={`flex items-start gap-3 rounded-[20px] p-4 ${
-              uploadStatus.type === 'success'
-                ? 'bg-[var(--success-soft)] text-[var(--success)]'
-                : uploadStatus.type === 'error'
-                  ? 'bg-red-50 text-red-600'
-                  : 'bg-blue-50 text-blue-600'
-            }`}
+            className={`flex items-start gap-3 rounded-[20px] p-4 ${uploadStatus.type === 'success'
+              ? 'bg-[var(--success-soft)] text-[var(--success)]'
+              : uploadStatus.type === 'error'
+                ? 'bg-red-50 text-red-600'
+                : 'bg-blue-50 text-blue-600'
+              }`}
           >
             {uploadStatus.type === 'success' && <CheckCircle className="h-5 w-5 shrink-0 mt-0.5" />}
             {uploadStatus.type === 'error' && <AlertCircle className="h-5 w-5 shrink-0 mt-0.5" />}
@@ -677,11 +708,10 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
               {sortedVideos.map((video) => (
                 <div
                   key={video.id}
-                  className={`flex items-start justify-between gap-4 rounded-[20px] border p-4 ${
-                    isFailedVideo(video)
-                      ? 'border-red-200 bg-red-50/70'
-                      : 'border-[var(--line)] bg-[var(--accent-cream)]'
-                  }`}
+                  className={`flex items-start justify-between gap-4 rounded-[20px] border p-4 ${isFailedVideo(video)
+                    ? 'border-red-200 bg-red-50/70'
+                    : 'border-[var(--line)] bg-[var(--accent-cream)]'
+                    }`}
                 >
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
@@ -692,13 +722,14 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
                         </div>
                       )}
                       <span
-                        className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
-                          video.playbackReady
-                            ? 'bg-[var(--success-soft)] text-[var(--success)]'
+                        className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${video.playbackReady
+                          ? 'bg-[var(--success-soft)] text-[var(--success)]'
+                          : isFallbackPlayableVideo(video)
+                            ? 'bg-blue-100 text-blue-700'
                             : isFailedVideo(video)
                               ? 'bg-red-100 text-red-700'
                               : 'bg-amber-100 text-amber-700'
-                        }`}
+                          }`}
                       >
                         {getStudentVisibilityLabel(video)}
                       </span>

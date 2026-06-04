@@ -52,6 +52,7 @@ const userPassword = process.env.PLATFORM_LOAD_USER_PASSWORD || 'Student@123';
 const courseId = String(process.env.QA_COURSE_ID || process.env.PLATFORM_LOAD_COURSE_ID || 'course_d6cb25587e594d3bbb75b58597770ff2').trim();
 const requestedUsers = Math.max(1, Number(process.env.QA_VIDEO_BROWSER_MANIFEST_USERS || 50));
 const preparationConcurrency = Math.max(1, Number(process.env.QA_VIDEO_BROWSER_MANIFEST_CONCURRENCY || 8));
+const loginConcurrency = Math.max(1, Number(process.env.QA_VIDEO_BROWSER_LOGIN_CONCURRENCY || 2));
 const adminPreparationConcurrency = Math.max(1, Number(process.env.QA_VIDEO_BROWSER_ADMIN_CONCURRENCY || 1));
 const adminListPageSize = Math.max(25, Math.min(100, Number(process.env.QA_VIDEO_BROWSER_ADMIN_PAGE_SIZE || 100)));
 const outputPath = path.resolve(process.cwd(), process.env.QA_VIDEO_BROWSER_MANIFEST_PATH || `reports/video-browser-manifest-${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
@@ -434,7 +435,7 @@ const loadExistingPreparedUsers = async (): Promise<PreparedUser[]> => {
     return selected;
   }
 
-  return mapWithConcurrency(selected, preparationConcurrency, async (user, index) => {
+  return mapWithConcurrency(selected, loginConcurrency, async (user, index) => {
     const loginPayload = await fetchJson<{ token: string; user?: { _id?: string } }>('/backend/api/auth/login', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -482,7 +483,7 @@ const main = async () => {
           name: student.name,
         } satisfies PreparedUser));
       }
-      return mapWithConcurrency(preparedStudents, preparationConcurrency, async ({ index, student }) => {
+      return mapWithConcurrency(preparedStudents, loginConcurrency, async ({ index, student }) => {
         const loginPayload = await loginStudent(student);
         if ((index + 1) % 25 === 0 || index + 1 === preparedStudents.length) {
           console.log(`[prepare] logged in ${index + 1}/${preparedStudents.length} students`);
@@ -506,6 +507,7 @@ const main = async () => {
     sampleEmail: prepared[0]?.email || null,
     userPrefix: syntheticUserPrefix,
     concurrency: preparationConcurrency,
+    loginConcurrency,
     adminPreparationConcurrency,
     reusedExistingUsersFile: existingUsersFile || null,
     refreshExistingTokens,

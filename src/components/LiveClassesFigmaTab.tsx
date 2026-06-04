@@ -5342,6 +5342,8 @@ export const LiveClassesFigmaTab = ({ overview, onRefresh, onMobileModeChange, i
                             <ResilientHlsVideo
                               src={new URL(access.streamUrl, window.location.origin).toString()}
                               title={detailDisplay.title}
+                              playbackMode="live"
+                              streamFormat={access.streamFormat || 'hls'}
                               watermarkText={access.watermarkText || null}
                               className="h-full w-full"
                               autoPlay
@@ -5623,6 +5625,8 @@ export const LiveClassesFigmaTab = ({ overview, onRefresh, onMobileModeChange, i
                             <ResilientHlsVideo
                               src={new URL(access.streamUrl, window.location.origin).toString()}
                               title={detailDisplay.title}
+                              playbackMode="live"
+                              streamFormat={access.streamFormat || 'hls'}
                               watermarkText={access.watermarkText || null}
                               className="h-full w-full"
                               autoPlay

@@ -7,6 +7,7 @@ QA_BASE_URL_VALUE="${QA_BASE_URL:-}"
 TARGETS_FILE_VALUE="${QA_STREAM_CERT_TARGETS_FILE:-${ROOT_DIR}/qa-automation/stream-cert-targets.example.json}"
 RUN_WATCH_LIMIT_VALUE="${RUN_WATCH_LIMIT:-1}"
 PROOF_SCOPE="${PROOF_SCOPE:-functional}"
+TARGETED_PROOF_PLAYBACK_MODE_VALUE="${TARGETED_PROOF_PLAYBACK_MODE:-browser-farm}"
 RUN_ID="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
 REPORT_DIR="${ROOT_DIR}/reports/targeted-functional-proof-${PROOF_SCOPE}-${RUN_ID}"
 TARGET_SUMMARY_JSONL="${REPORT_DIR}/targets.jsonl"
@@ -39,6 +40,10 @@ fi
 
 latest_rootcause_summary() {
   find "${ROOT_DIR}/qa-automation/artifacts" -path '*/analysis/course-playback-rootcause.json' -print 2>/dev/null | sort | tail -n 1
+}
+
+latest_browser_farm_stage_summary() {
+  find "${ROOT_DIR}/reports" -path '*/stage-1-merged.json' -print 2>/dev/null | grep '/browser-farm-video-' | sort | tail -n 1
 }
 
 latest_watch_limit_report() {
@@ -175,35 +180,81 @@ NODE
   fi
 
   desktop_log="${REPORT_DIR}/${target_key}-desktop-rootcause.log"
-  (
-    cd "${ROOT_DIR}"
-    ENV_FILE="${ENV_FILE_PATH}" \
-    QA_BASE_URL="${QA_BASE_URL_VALUE}" \
-    QA_LOGIN_EMAIL="${login_email}" \
-    QA_LOGIN_PASSWORD="${PLATFORM_LOAD_USER_PASSWORD:-${QA_LOGIN_PASSWORD:-Student@123}}" \
-    QA_COURSE_ID="${course_id}" \
-    QA_COURSE_TEXT="${course_text}" \
-    QA_LESSON_ID="${lesson_id}" \
-    QA_LESSON_TEXT="${lesson_text}" \
-    npm --prefix qa-automation run browser:video-auto-back-rootcause-regression
-  ) > "${desktop_log}" 2>&1
-  desktop_summary_path="$(latest_rootcause_summary)"
-
+  desktop_summary_path=""
   mobile_log="${REPORT_DIR}/${target_key}-mobile-rootcause.log"
-  (
-    cd "${ROOT_DIR}"
-    ENV_FILE="${ENV_FILE_PATH}" \
-    QA_BASE_URL="${QA_BASE_URL_VALUE}" \
-    QA_LOGIN_EMAIL="${login_email}" \
-    QA_LOGIN_PASSWORD="${PLATFORM_LOAD_USER_PASSWORD:-${QA_LOGIN_PASSWORD:-Student@123}}" \
-    QA_COURSE_ID="${course_id}" \
-    QA_COURSE_TEXT="${course_text}" \
-    QA_LESSON_ID="${lesson_id}" \
-    QA_LESSON_TEXT="${lesson_text}" \
-    QA_MOBILE_MODE=true \
-    npm --prefix qa-automation run browser:video-auto-back-rootcause-regression
-  ) > "${mobile_log}" 2>&1
-  mobile_summary_path="$(latest_rootcause_summary)"
+  mobile_summary_path=""
+  if [[ "${TARGETED_PROOF_PLAYBACK_MODE_VALUE}" == "browser-farm" ]]; then
+    (
+      cd "${ROOT_DIR}"
+      QA_ADMIN_EMAIL="${QA_ADMIN_EMAIL:-${ADMIN_EMAIL:-}}" \
+      QA_ADMIN_PASSWORD="${QA_ADMIN_PASSWORD:-${ADMIN_PASSWORD:-}}" \
+      ENV_FILE="${ENV_FILE_PATH}" \
+      QA_BASE_URL="${QA_BASE_URL_VALUE}" \
+      QA_COURSE_ID="${course_id}" \
+      QA_COURSE_TEXT="${course_text}" \
+      QA_LESSON_ID="${lesson_id}" \
+      QA_LESSON_TEXT="${lesson_text}" \
+      QA_BROWSER_FARM_MANIFEST="${manifest_path}" \
+      QA_BROWSER_FARM_STAGES=1 \
+      QA_BROWSER_FARM_WORKERS=local \
+      QA_VIDEO_BROWSER_MOBILE_RATIO=0 \
+      BROWSER_FARM_MODE=video \
+      BROWSER_FARM_RUN_CALIBRATION=0 \
+      BROWSER_FARM_WORKER_CAPACITY_OVERRIDE=1 \
+      bash scripts/run-distributed-browser-farm-ladder.sh
+    ) > "${desktop_log}" 2>&1
+    desktop_summary_path="$(latest_browser_farm_stage_summary)"
+
+    (
+      cd "${ROOT_DIR}"
+      QA_ADMIN_EMAIL="${QA_ADMIN_EMAIL:-${ADMIN_EMAIL:-}}" \
+      QA_ADMIN_PASSWORD="${QA_ADMIN_PASSWORD:-${ADMIN_PASSWORD:-}}" \
+      ENV_FILE="${ENV_FILE_PATH}" \
+      QA_BASE_URL="${QA_BASE_URL_VALUE}" \
+      QA_COURSE_ID="${course_id}" \
+      QA_COURSE_TEXT="${course_text}" \
+      QA_LESSON_ID="${lesson_id}" \
+      QA_LESSON_TEXT="${lesson_text}" \
+      QA_BROWSER_FARM_MANIFEST="${manifest_path}" \
+      QA_BROWSER_FARM_STAGES=1 \
+      QA_BROWSER_FARM_WORKERS=local \
+      QA_VIDEO_BROWSER_MOBILE_RATIO=1 \
+      BROWSER_FARM_MODE=video \
+      BROWSER_FARM_RUN_CALIBRATION=0 \
+      BROWSER_FARM_WORKER_CAPACITY_OVERRIDE=1 \
+      bash scripts/run-distributed-browser-farm-ladder.sh
+    ) > "${mobile_log}" 2>&1
+    mobile_summary_path="$(latest_browser_farm_stage_summary)"
+  else
+    (
+      cd "${ROOT_DIR}"
+      ENV_FILE="${ENV_FILE_PATH}" \
+      QA_BASE_URL="${QA_BASE_URL_VALUE}" \
+      QA_LOGIN_EMAIL="${login_email}" \
+      QA_LOGIN_PASSWORD="${PLATFORM_LOAD_USER_PASSWORD:-${QA_LOGIN_PASSWORD:-Student@123}}" \
+      QA_COURSE_ID="${course_id}" \
+      QA_COURSE_TEXT="${course_text}" \
+      QA_LESSON_ID="${lesson_id}" \
+      QA_LESSON_TEXT="${lesson_text}" \
+      npm --prefix qa-automation run browser:video-auto-back-rootcause-regression
+    ) > "${desktop_log}" 2>&1
+    desktop_summary_path="$(latest_rootcause_summary)"
+
+    (
+      cd "${ROOT_DIR}"
+      ENV_FILE="${ENV_FILE_PATH}" \
+      QA_BASE_URL="${QA_BASE_URL_VALUE}" \
+      QA_LOGIN_EMAIL="${login_email}" \
+      QA_LOGIN_PASSWORD="${PLATFORM_LOAD_USER_PASSWORD:-${QA_LOGIN_PASSWORD:-Student@123}}" \
+      QA_COURSE_ID="${course_id}" \
+      QA_COURSE_TEXT="${course_text}" \
+      QA_LESSON_ID="${lesson_id}" \
+      QA_LESSON_TEXT="${lesson_text}" \
+      QA_MOBILE_MODE=true \
+      npm --prefix qa-automation run browser:video-auto-back-rootcause-regression
+    ) > "${mobile_log}" 2>&1
+    mobile_summary_path="$(latest_rootcause_summary)"
+  fi
 
   watch_limit_log=""
   watch_limit_summary_path=""

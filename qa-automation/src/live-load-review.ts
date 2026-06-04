@@ -49,6 +49,9 @@ type LoadSummary = {
 };
 
 type ViewerMode = 'livekit-room' | 'live-stream';
+const livePlaybackMode = String(process.env.QA_LIVE_CERT_PLAYBACK_MODE || process.env.LIVE_LOAD_PLAYBACK_MODE || 'live-stream').trim().toLowerCase() === 'livekit'
+  ? 'livekit'
+  : 'live-stream';
 
 const runId = new Date().toISOString().replace(/[:.]/g, '-');
 const rootDir = process.cwd();
@@ -275,6 +278,16 @@ const requestAbsoluteWithRetry = async (
   throw lastError instanceof Error ? lastError : new Error(String(lastError || 'Unknown absolute request failure'));
 };
 
+const shouldUseViewerAuthForAbsoluteUrl = (targetUrl: string) => {
+  try {
+    const target = new URL(targetUrl);
+    const base = new URL(apiOrigin);
+    return target.origin === base.origin;
+  } catch {
+    return true;
+  }
+};
+
 const waitForStreamReady = async (manifestUrl: string, timeoutMs = 60_000) => {
   const deadline = Date.now() + timeoutMs;
   let lastError: unknown = null;
@@ -403,7 +416,12 @@ const runViewerSoak = async ({
 
         if (viewerMode === 'live-stream' && typeof access.streamUrl === 'string' && access.streamUrl) {
           const manifestUrl = new URL(access.streamUrl, apiOrigin).toString();
-          await requestAbsoluteWithRetry(`GET stream ${liveClassId} [cycle ${cycle}]`, 'GET', manifestUrl, viewer.token);
+          await requestAbsoluteWithRetry(
+            `GET stream ${liveClassId} [cycle ${cycle}]`,
+            'GET',
+            manifestUrl,
+            shouldUseViewerAuthForAbsoluteUrl(manifestUrl) ? viewer.token : undefined,
+          );
         }
 
         await request(
@@ -587,6 +605,7 @@ const main = async () => {
         doubtSolving: true,
         replayAvailable: false,
         description: 'Dedicated live load scenario for 1,000 viewers.',
+        livePlaybackType: livePlaybackMode,
         activePoll: {
           question: 'Which tool are you using today?',
           status: 'live',
@@ -699,6 +718,14 @@ const main = async () => {
           throw new Error(`Unsupported access type for live load: ${accessType}`);
         }
 
+        if (
+          livePlaybackMode === 'live-stream'
+          && accessType === 'live-stream'
+          && (typeof access.streamUrl !== 'string' || !access.streamUrl || /\/backend\/api\/live-classes\/stream\//.test(access.streamUrl))
+        ) {
+          throw new Error(`Live broadcast load certification requires a public live-domain HLS URL, received: ${String(access.streamUrl || 'none')}`);
+        }
+
         if (accessType === 'livekit-room') {
           await request(
             `POST /live-classes/${liveClassId}/session/join`,
@@ -716,7 +743,12 @@ const main = async () => {
           );
         } else if (typeof access.streamUrl === 'string' && access.streamUrl) {
           const manifestUrl = new URL(access.streamUrl, apiOrigin).toString();
-          await requestAbsoluteWithRetry(`GET stream ${liveClassId}`, 'GET', manifestUrl, viewer.token);
+          await requestAbsoluteWithRetry(
+            `GET stream ${liveClassId}`,
+            'GET',
+            manifestUrl,
+            shouldUseViewerAuthForAbsoluteUrl(manifestUrl) ? viewer.token : undefined,
+          );
         }
         await request(
           `GET /live-classes/${liveClassId}/session`,

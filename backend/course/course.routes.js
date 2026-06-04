@@ -14,6 +14,10 @@ const {
 const {
   uploadVideoToModule,
   uploadVideoChunkToModule,
+  initiateMultipartVideoUpload,
+  getMultipartVideoUploadPartUrl,
+  completeMultipartVideoUpload,
+  abortMultipartVideoUpload,
   initiateCloudflareStreamUpload,
   completeCloudflareStreamUpload,
   handleCloudflareStreamWebhook,
@@ -64,6 +68,7 @@ const {
 const { uploadLessonSupportMedia } = require('./support-media.controller.js');
 const { requireAuth, attachAuthIfPresent } = require('../middleware/auth.js');
 const { requireAdmin } = require('../middleware/admin.js');
+const { appConfig } = require('../lib/config.js');
 const upload = require('../lib/multer-config.js');
 const pdfUpload = require('../lib/course-pdf-upload.js');
 const supportMediaUpload = require('../lib/support-media-upload.js');
@@ -94,10 +99,16 @@ router.delete('/:courseId/editorials/:editorialId', requireAuth, requireAdmin, d
 router.post('/:id/lessons/:lessonId/support-media', requireAuth, supportMediaUpload.single('file'), uploadLessonSupportMedia);
 
 // Admin routes - video upload and management
-router.post('/:courseId/modules/:moduleId/videos/cloudflare/direct-upload', requireAuth, requireAdmin, initiateCloudflareStreamUpload);
-router.post('/:courseId/modules/:moduleId/videos/cloudflare/complete', requireAuth, requireAdmin, completeCloudflareStreamUpload);
+if (String(appConfig.videoProcessingProvider || '').toLowerCase() === 'cloudflare-stream') {
+  router.post('/:courseId/modules/:moduleId/videos/cloudflare/direct-upload', requireAuth, requireAdmin, initiateCloudflareStreamUpload);
+  router.post('/:courseId/modules/:moduleId/videos/cloudflare/complete', requireAuth, requireAdmin, completeCloudflareStreamUpload);
+}
 router.post('/:courseId/modules/:moduleId/videos', requireAuth, requireAdmin, upload.single('video'), uploadVideoToModule);
 router.post('/:courseId/modules/:moduleId/videos/chunked', requireAuth, requireAdmin, upload.chunkUpload.single('chunk'), uploadVideoChunkToModule);
+router.post('/:courseId/modules/:moduleId/videos/multipart/initiate', requireAuth, requireAdmin, initiateMultipartVideoUpload);
+router.post('/:courseId/modules/:moduleId/videos/multipart/:uploadSessionId/part-url', requireAuth, requireAdmin, express.json(), getMultipartVideoUploadPartUrl);
+router.post('/:courseId/modules/:moduleId/videos/multipart/:uploadSessionId/complete', requireAuth, requireAdmin, completeMultipartVideoUpload);
+router.delete('/:courseId/modules/:moduleId/videos/multipart/:uploadSessionId', requireAuth, requireAdmin, abortMultipartVideoUpload);
 router.post('/:courseId/modules/:moduleId/videos/:videoId/retry-processing', requireAuth, requireAdmin, retryVideoProcessing);
 router.delete('/:courseId/modules/:moduleId/videos/:videoId', requireAuth, requireAdmin, deleteVideoFromModule);
 router.get('/:courseId/modules/:moduleId/videos', requireAuth, requireAdmin, listVideosInModule);
@@ -108,7 +119,9 @@ router.patch('/admin/lesson-doubts/:threadId/status', requireAuth, requireAdmin,
 router.get('/admin/reports', requireAuth, requireAdmin, getAdminLessonReports);
 router.patch('/admin/reports/:reportId', requireAuth, requireAdmin, patchAdminLessonReport);
 
-router.post('/webhooks/cloudflare-stream', handleCloudflareStreamWebhook);
+if (String(appConfig.videoProcessingProvider || '').toLowerCase() === 'cloudflare-stream') {
+  router.post('/webhooks/cloudflare-stream', handleCloudflareStreamWebhook);
+}
 
 // Public routes
 router.get('/', attachAuthIfPresent, getCourses);

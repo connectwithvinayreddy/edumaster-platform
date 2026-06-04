@@ -17,8 +17,25 @@ For future planning, the target should be:
 
 For the nearer-term certification path to `5000` mixed concurrent users, see:
 
+- `docs/protected-hls-production-deploy-gate.md`
 - `docs/5k-mixed-traffic-readiness-plan.md`
 - `docs/cheapest-practical-5k-infrastructure-plan.md`
+
+## Protected-HLS playback deploy gate
+
+Any production release that changes protected-HLS or recorded-video playback behavior is now blocked until the real-browser `2,000` streaming-user gate passes.
+
+That gate is stricter than the broader `5k` and `10-15k` capacity programs:
+
+- it is playback-only
+- it requires real browser users, not API-only or synthetic-only proof
+- it requires the staged ladder:
+  - `1 -> 3 -> 10 -> 25 -> 50 -> 100 -> 250 -> 500 -> 1000 -> 2000`
+- it still requires explicit user confirmation after the report is green
+
+See:
+
+- `docs/protected-hls-production-deploy-gate.md`
 
 ## Repo evidence behind the verdict
 
@@ -159,7 +176,8 @@ Use staged certification. Do not jump straight to a `10-15k` claim.
 
 ### 1. Current-host browser stabilization gate
 
-- recorded-video real-browser ladder: `50`, then `100`, then `250`
+- protected-HLS deploy gate browser ladder: `1`, `3`, `10`, `25`, `50`, `100`, `250`, `500`, `1000`, `2000`
+- broader stabilization checkpoints can still focus on `50`, then `100`, then `250` once the smaller playback gate stages are already green
 - helper:
 
 ```bash
@@ -169,7 +187,7 @@ QA_BASE_URL=https://app.example.com \
 
 Default stages:
 
-- `QA_VIDEO_BROWSER_STAGES=50,100,250`
+- `QA_VIDEO_BROWSER_STAGES=1,3,10,25,50,100,250,500,1000,2000`
 
 ### 2. Recorded-video synthetic scale gate
 

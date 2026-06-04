@@ -15,6 +15,8 @@ const videoPath = path.resolve(rootDir, process.env.QA_UPLOAD_VIDEO_PATH || 'upl
 const uploadCount = Math.max(1, Number(process.env.QA_UPLOAD_COUNT || 2));
 const hlsWaitMs = Math.max(60_000, Number(process.env.QA_HLS_WAIT_MS || 12 * 60_000));
 const browserWaitMs = Math.max(10_000, Number(process.env.QA_BROWSER_WAIT_MS || 30_000));
+const directVideoUploadLimitBytes = 90 * 1024 * 1024;
+const defaultMultipartPartSizeBytes = 20 * 1024 * 1024;
 const edgeUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0';
 const adminForceLogoutOtherSessions = ['1', 'true', 'yes', 'on'].includes(String(process.env.ADMIN_FORCE_LOGOUT_OTHER_SESSIONS || 'false').toLowerCase());
 const adminTakeoverOnSessionActive = !['0', 'false', 'no', 'off'].includes(String(process.env.ADMIN_TAKEOVER_ON_SESSION_ACTIVE || 'true').toLowerCase());
@@ -78,6 +80,11 @@ const buildAdminLoginPayload = (email: string, password: string, forceLogoutOthe
   forceLogoutOtherSessions,
 });
 
+const isSessionReplacementError = (error: unknown) => {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes('401') && message.toLowerCase().includes('replaced by a newer login');
+};
+
 const buildApprovedPlaybackHeaders = (token: string, deviceId: string) => ({
   ...authHeaders(token),
   accept: 'application/json',
@@ -118,6 +125,33 @@ const loginAdmin = async (env: Record<string, string>) => {
     throw new Error('Admin login succeeded but did not return a token.');
   }
   return { token, user: data.user || data.data?.user || null };
+};
+
+const createAdminSessionManager = async (env: Record<string, string>) => {
+  let current = await loginAdmin(env);
+  return {
+    get token() {
+      return String(current.token);
+    },
+    get user() {
+      return current.user;
+    },
+    async refresh() {
+      current = await loginAdmin(env);
+      return current;
+    },
+    async run<T>(operation: (token: string) => Promise<T>) {
+      try {
+        return await operation(String(current.token));
+      } catch (error) {
+        if (!isSessionReplacementError(error)) {
+          throw error;
+        }
+        current = await loginAdmin(env);
+        return operation(String(current.token));
+      }
+    },
+  };
 };
 
 const createCourse = async (token: string) => {
@@ -176,22 +210,122 @@ const addChapter = async (token: string, courseId: string, moduleId: string) => 
 };
 
 const uploadLesson = async (token: string, courseId: string, moduleId: string, chapterId: string, index: number) => {
-  const buffer = await fs.readFile(videoPath);
-  const file = new File([buffer], `${safe(`qa-playback-${index}`)}.mp4`, { type: 'video/mp4' });
-  const formData = new FormData();
-  formData.append('video', file);
-  formData.append('lessonTitle', `QA Playback Lesson ${String(index).padStart(2, '0')}`);
-  formData.append('durationMinutes', '1');
-  formData.append('isPremium', 'true');
-  formData.append('lessonType', 'private-video');
-  formData.append('chapterId', chapterId);
+  const fileName = path.basename(videoPath) || `${safe(`qa-playback-${index}`)}.mp4`;
+  const lessonTitle = `QA Playback Lesson ${String(index).padStart(2, '0')}`;
+  const stat = await fs.stat(videoPath);
+  if (stat.size <= directVideoUploadLimitBytes) {
+    const buffer = await fs.readFile(videoPath);
+    const file = new File([buffer], fileName, { type: 'video/mp4' });
+    const formData = new FormData();
+    formData.append('video', file);
+    formData.append('lessonTitle', lessonTitle);
+    formData.append('durationMinutes', '1');
+    formData.append('isPremium', 'true');
+    formData.append('lessonType', 'private-video');
+    formData.append('chapterId', chapterId);
 
-  const { data } = await requestJson(`${apiBaseUrl}/courses/${courseId}/modules/${moduleId}/videos`, {
+    const { data } = await requestJson(`${apiBaseUrl}/courses/${courseId}/modules/${moduleId}/videos`, {
+      method: 'POST',
+      headers: authHeaders(token),
+      body: formData,
+    });
+    return data.video;
+  }
+
+  const { data: initData } = await requestJson<{
+    uploadSessionId: string;
+    partSizeBytes?: number;
+    recommendedConcurrency?: number;
+  }>(`${apiBaseUrl}/courses/${courseId}/modules/${moduleId}/videos/multipart/initiate`, {
     method: 'POST',
-    headers: authHeaders(token),
-    body: formData,
+    headers: {
+      ...authHeaders(token),
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      lessonTitle,
+      durationMinutes: 1,
+      isPremium: true,
+      lessonType: 'private-video',
+      chapterId,
+      originalFilename: fileName,
+      mimeType: 'video/mp4',
+      fileSize: stat.size,
+    }),
   });
-  return data.video;
+
+  const uploadSessionId = String(initData.uploadSessionId || '').trim();
+  if (!uploadSessionId) {
+    throw new Error('Multipart upload init did not return an upload session id.');
+  }
+
+  const partSizeBytes = Math.max(Number(initData.partSizeBytes || defaultMultipartPartSizeBytes), 5 * 1024 * 1024);
+  const totalParts = Math.max(1, Math.ceil(stat.size / partSizeBytes));
+  const concurrency = Math.max(1, Math.min(Number(initData.recommendedConcurrency || 4), 6));
+  const fileHandle = await fs.open(videoPath, 'r');
+
+  try {
+    let nextPartNumber = 1;
+    const uploadPartWorker = async () => {
+      while (true) {
+        const currentPartNumber = nextPartNumber;
+        nextPartNumber += 1;
+        if (currentPartNumber > totalParts) {
+          return;
+        }
+
+        const offset = (currentPartNumber - 1) * partSizeBytes;
+        const bytesToRead = Math.min(partSizeBytes, stat.size - offset);
+        const buffer = Buffer.allocUnsafe(bytesToRead);
+        const { bytesRead } = await fileHandle.read(buffer, 0, bytesToRead, offset);
+        const payload = bytesRead === bytesToRead ? buffer : buffer.subarray(0, bytesRead);
+
+        const { data: partData } = await requestJson<{ uploadUrl: string }>(
+          `${apiBaseUrl}/courses/${courseId}/modules/${moduleId}/videos/multipart/${encodeURIComponent(uploadSessionId)}/part-url`,
+          {
+            method: 'POST',
+            headers: {
+              ...authHeaders(token),
+              'content-type': 'application/json',
+            },
+            body: JSON.stringify({ partNumber: currentPartNumber }),
+          },
+        );
+
+        if (!partData.uploadUrl) {
+          throw new Error(`Missing multipart upload URL for part ${currentPartNumber}.`);
+        }
+
+        const partResponse = await fetch(partData.uploadUrl, {
+          method: 'PUT',
+          body: payload,
+        });
+        if (!partResponse.ok) {
+          const bodyText = await partResponse.text().catch(() => '');
+          throw new Error(`Multipart upload failed for part ${currentPartNumber}: ${partResponse.status} ${bodyText.slice(0, 200)}`);
+        }
+      }
+    };
+
+    await Promise.all(Array.from({ length: Math.min(concurrency, totalParts) }, () => uploadPartWorker()));
+
+    const { data: completeData } = await requestJson<JsonRecord>(
+      `${apiBaseUrl}/courses/${courseId}/modules/${moduleId}/videos/multipart/${encodeURIComponent(uploadSessionId)}/complete`,
+      {
+        method: 'POST',
+        headers: authHeaders(token),
+      },
+    );
+    return completeData.video;
+  } catch (error) {
+    await fetch(`${apiBaseUrl}/courses/${courseId}/modules/${moduleId}/videos/multipart/${encodeURIComponent(uploadSessionId)}`, {
+      method: 'DELETE',
+      headers: authHeaders(token),
+    }).catch(() => undefined);
+    throw error;
+  } finally {
+    await fileHandle.close();
+  }
 };
 
 const registerStudent = async (label: string) => {
@@ -245,6 +379,13 @@ const findLessons = async (token: string, courseId: string, moduleId: string) =>
     ...((Array.isArray(moduleEntry?.chapters) ? moduleEntry.chapters : []).flatMap((chapter: JsonRecord) =>
       Array.isArray(chapter.lessons) ? chapter.lessons : [])),
   ];
+};
+
+const listVisibleStudentLessons = async (token: string, courseId: string) => {
+  const { data } = await requestJson<JsonRecord[]>(`${apiBaseUrl}/courses/${courseId}/lessons`, {
+    headers: authHeaders(token),
+  });
+  return Array.isArray(data) ? data : [];
 };
 
 const getPlayer = async (token: string, courseId: string, lessonId: string, deviceId = 'qa-api-player-device') =>
@@ -472,8 +613,7 @@ const verifyBrowserPlayback = async (token: string, courseId: string, lessonId: 
     const text = String(document.body.textContent || '');
     return hasVideoElement
       || text.includes('Video is still preparing')
-      || text.includes('Lesson video unavailable')
-      || text.includes('Protected source playback is temporarily available');
+      || text.includes('Lesson video unavailable');
   }, { timeout: 60_000 });
   const playerScreenshot = await saveScreenshot(page, '02-player-visible');
 
@@ -669,13 +809,13 @@ const run = async () => {
   };
 
   try {
-    const admin = await loginAdmin(env);
+    const admin = await createAdminSessionManager(env);
     const apiStudent = await registerStudent('api');
     const browserStudent = await registerStudent('browser');
-    const course = await createCourse(admin.token);
+    const course = await admin.run((token) => createCourse(token));
     const courseId = course._id || course.id;
-    const moduleEntry = await addModule(admin.token, courseId);
-    const chapter = await addChapter(admin.token, courseId, moduleEntry.id);
+    const moduleEntry = await admin.run((token) => addModule(token, courseId));
+    const chapter = await admin.run((token) => addChapter(token, courseId, moduleEntry.id));
 
     report.course = { id: courseId, title: course.title };
     report.module = moduleEntry;
@@ -694,7 +834,7 @@ const run = async () => {
 
     const uploadedLessons = [];
     for (let index = 1; index <= uploadCount; index += 1) {
-      const lesson = await uploadLesson(admin.token, courseId, moduleEntry.id, chapter.id, index);
+      const lesson = await admin.run((token) => uploadLesson(token, courseId, moduleEntry.id, chapter.id, index));
       uploadedLessons.push(lesson);
       report.uploads.push({
         at: iso(),
@@ -706,11 +846,20 @@ const run = async () => {
       await fs.writeFile(path.join(runDir, `02-upload-${index}.json`), JSON.stringify(lesson, null, 2));
     }
 
-    await assignCourseAccess(admin.token, apiStudent.user._id, courseId);
-    await assignCourseAccess(admin.token, browserStudent.user._id, courseId);
+    await admin.run((token) => assignCourseAccess(token, apiStudent.user._id, courseId));
+    await admin.run((token) => assignCourseAccess(token, browserStudent.user._id, courseId));
 
     const lessonIds = uploadedLessons.map((lesson) => lesson.id);
-    const hlsReady = await waitForLessonsReady(admin.token, courseId, moduleEntry.id, lessonIds);
+    const apiStudentLessonsBeforeReady = await listVisibleStudentLessons(apiStudent.token, courseId);
+    const browserStudentLessonsBeforeReady = await listVisibleStudentLessons(browserStudent.token, courseId);
+    const visibleBeforeReady = lessonIds.filter((lessonId) =>
+      apiStudentLessonsBeforeReady.some((lesson) => lesson.id === lessonId)
+      || browserStudentLessonsBeforeReady.some((lesson) => lesson.id === lessonId));
+    if (visibleBeforeReady.length > 0) {
+      throw new Error(`New lesson(s) became visible to students before HLS was ready: ${visibleBeforeReady.join(', ')}`);
+    }
+
+    const hlsReady = await admin.run((token) => waitForLessonsReady(token, courseId, moduleEntry.id, lessonIds));
     report.hls = {
       readyAt: iso(),
       lessons: hlsReady.lessons.map((lesson: JsonRecord) => ({
@@ -722,6 +871,12 @@ const run = async () => {
       })),
       snapshots: hlsReady.snapshots,
     };
+    const apiStudentLessonsAfterReady = await listVisibleStudentLessons(apiStudent.token, courseId);
+    const missingAfterReady = lessonIds.filter((lessonId) =>
+      !apiStudentLessonsAfterReady.some((lesson) => lesson.id === lessonId));
+    if (missingAfterReady.length > 0) {
+      throw new Error(`Ready lesson(s) stayed hidden from students after HLS completed: ${missingAfterReady.join(', ')}`);
+    }
 
     for (const lessonId of lessonIds) {
       const apiPlayback = await verifyPlaybackApi(apiStudent.token, courseId, lessonId);

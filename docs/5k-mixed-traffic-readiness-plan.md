@@ -21,8 +21,22 @@ With the current production evidence:
 
 See:
 
+- `docs/protected-hls-production-deploy-gate.md`
 - `docs/capacity-verdict-and-10k-mixed-traffic-plan.md`
 - `docs/cheapest-practical-5k-infrastructure-plan.md`
+
+## Protected-HLS deploy gate before any playback rollout
+
+For releases that change protected-HLS or recorded-video playback behavior:
+
+- production deploy is blocked until the real-browser `2,000` streaming-user gate passes
+- API-only and synthetic-only checks are diagnostic only
+- the required protected-HLS browser ladder is:
+  - `1 -> 3 -> 10 -> 25 -> 50 -> 100 -> 250 -> 500 -> 1000 -> 2000`
+
+See:
+
+- `docs/protected-hls-production-deploy-gate.md`
 
 ## Findings-first `2k` gate before `5k`
 
@@ -39,7 +53,7 @@ This stage:
 
 - captures baseline host snapshots for staging and prod
 - runs targeted correctness checks first
-- runs recorded-browser `50 -> 100 -> 250`
+- runs protected-HLS browser `1 -> 3 -> 10 -> 25 -> 50 -> 100 -> 250 -> 500 -> 1000 -> 2000`
 - runs recorded-video synthetic `250 -> 500 -> 750 -> 1000`
 - runs mixed app `500 -> 1000 -> 1500 -> 2000`
 - stops on first failure and records a normalized finding with snapshots, logs, and a fix bucket

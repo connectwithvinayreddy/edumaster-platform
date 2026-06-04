@@ -17,7 +17,14 @@ const uploadConfig = require('../lib/multer-config.js');
 const {
   storePrivateVideoUpload,
   deleteStoredPrivateVideo,
+  getPrivateVideoStorageProvider,
+  createPrivateVideoMultipartUpload,
+  getPrivateVideoMultipartPartUploadUrl,
+  listPrivateVideoMultipartParts,
+  completePrivateVideoMultipartUpload,
+  abortPrivateVideoMultipartUpload,
 } = require('../lib/private-video-storage.js');
+const { getRedisJson, setRedisJson, deleteRedisKey } = require('../lib/redis.js');
 const {
   createInitialVideoDeliveryState,
   scheduleVideoProcessing,
@@ -49,6 +56,9 @@ const validVideoExtensions = new Set(['.mp4', '.webm', '.ogg', '.mov', '.mkv']);
 const maxSize = appConfig.maxVideoUploadMb * 1024 * 1024;
 const uploadRootDirectory = uploadConfig.uploadDir || path.join(__dirname, '../../uploads/videos');
 const chunkUploadRoot = path.join(path.dirname(uploadRootDirectory), 'video-chunks');
+const multipartUploadPartSizeBytes = 20 * 1024 * 1024;
+const multipartUploadRecommendedConcurrency = 4;
+const multipartUploadSessionTtlSeconds = 24 * 60 * 60;
 
 if (!fs.existsSync(chunkUploadRoot)) {
   fs.mkdirSync(chunkUploadRoot, { recursive: true });
@@ -72,6 +82,30 @@ const normalizeChunkUploadId = (value) => {
     throw new ApiError(400, 'uploadId contains invalid characters', { code: 'VALIDATION_ERROR' });
   }
   return normalized;
+};
+
+const buildMultipartUploadSessionKey = (uploadSessionId) => `video-upload:multipart:${String(uploadSessionId || '')}`;
+
+const generateMultipartUploadSessionId = () => `upload_${Date.now()}_${randomUUID().replace(/-/g, '').slice(0, 18)}`;
+
+const loadMultipartUploadSession = async (uploadSessionId) => {
+  const uploadSession = await getRedisJson(buildMultipartUploadSessionKey(uploadSessionId));
+  if (!uploadSession || typeof uploadSession !== 'object') {
+    throw new ApiError(404, 'Multipart upload session not found or expired.', {
+      code: 'VIDEO_MULTIPART_SESSION_NOT_FOUND',
+    });
+  }
+  return uploadSession;
+};
+
+const saveMultipartUploadSession = async (uploadSessionId, payload) => {
+  await setRedisJson(buildMultipartUploadSessionKey(uploadSessionId), payload, {
+    ttlSeconds: multipartUploadSessionTtlSeconds,
+  });
+};
+
+const clearMultipartUploadSession = async (uploadSessionId) => {
+  await deleteRedisKey(buildMultipartUploadSessionKey(uploadSessionId));
 };
 
 const assertVideoInputLooksValid = ({ sourcePath, originalName, mimeType, fileSize }) => {
@@ -116,6 +150,54 @@ const persistUploadedLessonVideo = async ({
     originalName: originalFilename,
     mimeType,
   });
+  try {
+    return await persistStoredLessonVideo({
+      courseId,
+      moduleId,
+      lessonId,
+      lessonTitle,
+      lessonType,
+      durationMinutes,
+      moduleName,
+      moduleDescription,
+      chapterId,
+      chapterTitle,
+      chapterDescription,
+      originalFilename: originalFilename || null,
+      mimeType: mimeType || null,
+      fileSize: fileSize || 0,
+      uploadedBy,
+      isPremium,
+      storedVideo,
+    });
+  } catch (error) {
+    await deleteStoredPrivateVideo({
+      storageProvider: storedVideo.storageProvider,
+      storagePath: storedVideo.storagePath,
+    }).catch(() => undefined);
+    throw error;
+  }
+};
+
+const persistStoredLessonVideo = async ({
+  courseId,
+  moduleId,
+  lessonId,
+  lessonTitle,
+  lessonType,
+  durationMinutes,
+  moduleName,
+  moduleDescription,
+  chapterId,
+  chapterTitle,
+  chapterDescription,
+  originalFilename,
+  mimeType,
+  fileSize,
+  uploadedBy,
+  isPremium,
+  storedVideo,
+}) => {
   const initialDeliveryState = createInitialVideoDeliveryState();
 
   const videoMetadata = {
@@ -202,7 +284,7 @@ const persistUploadedLessonVideo = async ({
   } catch (error) {
     await coursesRepository.updateLesson(courseId, lessonId, (current) => ({
       ...current,
-      sourceFallbackAllowed: true,
+      sourceFallbackAllowed: false,
       playbackReady: false,
       hlsProcessingStatus: 'failed',
       hlsProcessingCompletedAt: new Date().toISOString(),
@@ -215,7 +297,7 @@ const persistUploadedLessonVideo = async ({
   }
 
   return {
-    message: 'Video uploaded successfully. Protected source playback is available while private adaptive HLS encoding finishes.',
+    message: 'Video uploaded successfully. Private adaptive HLS processing has started and the lesson will unlock for students as soon as packaging completes.',
     processingProvider: 'local-hls',
     video: videoMetadata,
     course,
@@ -447,6 +529,209 @@ const uploadVideoToModule = asyncHandler(async (req, res) => {
   });
 
   return created(res, payload);
+});
+
+const initiateMultipartVideoUpload = asyncHandler(async (req, res) => {
+  if (getPrivateVideoStorageProvider() !== 's3') {
+    throw new ApiError(503, 'Direct multipart upload is only available when private video storage uses object storage.', {
+      code: 'VIDEO_MULTIPART_STORAGE_UNAVAILABLE',
+    });
+  }
+
+  const lessonTitle = requireString(req.body?.lessonTitle, 'lessonTitle', { maxLength: 160 });
+  const lessonType = optionalString(req.body?.lessonType, 'private-video', { maxLength: 40 });
+  const durationMinutes = optionalNumber(req.body?.durationMinutes, 0, { min: 0, max: 5000 });
+  const moduleName = optionalString(req.body?.moduleName, 'Untitled Module', { maxLength: 160 });
+  const moduleDescription = optionalString(req.body?.moduleDescription, '', { maxLength: 1500 });
+  const chapterId = optionalString(req.body?.chapterId, '', { maxLength: 120 });
+  const chapterTitle = optionalString(req.body?.chapterTitle, 'Untitled Chapter', { maxLength: 160 });
+  const chapterDescription = optionalString(req.body?.chapterDescription, '', { maxLength: 1500 });
+  const courseId = requireString(req.params.courseId, 'courseId');
+  const moduleId = requireString(req.params.moduleId, 'moduleId');
+  const originalFilename = requireString(req.body?.originalFilename, 'originalFilename', { maxLength: 255 });
+  const mimeType = optionalString(req.body?.mimeType, 'video/mp4', { maxLength: 120 });
+  const fileSize = optionalNumber(req.body?.fileSize, 0, { min: 1, max: maxSize });
+
+  assertVideoInputLooksValid({
+    sourcePath: null,
+    originalName: originalFilename,
+    mimeType,
+    fileSize,
+  });
+
+  const course = await coursesRepository.findById(courseId);
+  if (!course) {
+    throw new ApiError(404, 'Course not found', { code: 'COURSE_NOT_FOUND' });
+  }
+  getModuleVideoSelection(course, moduleId, chapterId);
+
+  const lessonId = generateLessonVideoId();
+  const multipartUpload = await createPrivateVideoMultipartUpload({
+    courseId,
+    moduleId,
+    lessonId,
+    originalName: originalFilename,
+    mimeType,
+  });
+  const uploadSessionId = generateMultipartUploadSessionId();
+  const uploadSession = {
+    uploadSessionId,
+    uploadId: multipartUpload.uploadId,
+    storageProvider: multipartUpload.storageProvider,
+    storagePath: multipartUpload.storagePath,
+    accessPolicy: multipartUpload.accessPolicy,
+    courseId,
+    moduleId,
+    chapterId: chapterId || null,
+    lessonId,
+    lessonTitle,
+    lessonType,
+    durationMinutes,
+    moduleName,
+    moduleDescription,
+    chapterTitle,
+    chapterDescription,
+    originalFilename,
+    mimeType,
+    fileSize,
+    uploadedBy: req.user?.id || 'admin',
+    isPremium: req.body?.isPremium === 'true' || req.body?.isPremium === true,
+    status: 'initiated',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  await saveMultipartUploadSession(uploadSessionId, uploadSession);
+
+  return created(res, {
+    message: 'Multipart upload session created successfully.',
+    processingProvider: 'local-hls',
+    uploadSessionId,
+    lessonId,
+    partSizeBytes: multipartUploadPartSizeBytes,
+    recommendedConcurrency: multipartUploadRecommendedConcurrency,
+  });
+});
+
+const getMultipartVideoUploadPartUrl = asyncHandler(async (req, res) => {
+  const courseId = requireString(req.params.courseId, 'courseId');
+  const moduleId = requireString(req.params.moduleId, 'moduleId');
+  const uploadSessionId = normalizeChunkUploadId(req.params.uploadSessionId);
+  const partNumber = optionalNumber(req.body?.partNumber, 0, { min: 1, max: 10_000, integer: true });
+  const uploadSession = await loadMultipartUploadSession(uploadSessionId);
+
+  if (uploadSession.courseId !== courseId || uploadSession.moduleId !== moduleId) {
+    throw new ApiError(404, 'Multipart upload session not found for this module.', {
+      code: 'VIDEO_MULTIPART_SESSION_NOT_FOUND',
+    });
+  }
+
+  const partUpload = await getPrivateVideoMultipartPartUploadUrl({
+    storagePath: uploadSession.storagePath,
+    uploadId: uploadSession.uploadId,
+    partNumber,
+  });
+
+  return ok(res, {
+    uploadSessionId,
+    partNumber,
+    uploadUrl: partUpload.url,
+    expiresInSeconds: partUpload.expiresInSeconds,
+  });
+});
+
+const completeMultipartVideoUpload = asyncHandler(async (req, res) => {
+  const courseId = requireString(req.params.courseId, 'courseId');
+  const moduleId = requireString(req.params.moduleId, 'moduleId');
+  const uploadSessionId = normalizeChunkUploadId(req.params.uploadSessionId);
+  const uploadSession = await loadMultipartUploadSession(uploadSessionId);
+
+  if (uploadSession.courseId !== courseId || uploadSession.moduleId !== moduleId) {
+    throw new ApiError(404, 'Multipart upload session not found for this module.', {
+      code: 'VIDEO_MULTIPART_SESSION_NOT_FOUND',
+    });
+  }
+
+  const expectedTotalParts = Math.max(1, Math.ceil(Number(uploadSession.fileSize || 0) / multipartUploadPartSizeBytes));
+  const uploadedParts = await listPrivateVideoMultipartParts({
+    storagePath: uploadSession.storagePath,
+    uploadId: uploadSession.uploadId,
+  });
+
+  if (uploadedParts.length !== expectedTotalParts) {
+    throw new ApiError(400, `Multipart upload is incomplete. Expected ${expectedTotalParts} part(s), found ${uploadedParts.length}.`, {
+      code: 'VIDEO_MULTIPART_INCOMPLETE',
+    });
+  }
+
+  await completePrivateVideoMultipartUpload({
+    storagePath: uploadSession.storagePath,
+    uploadId: uploadSession.uploadId,
+    parts: uploadedParts,
+  });
+
+  try {
+    const payload = await persistStoredLessonVideo({
+      courseId: uploadSession.courseId,
+      moduleId: uploadSession.moduleId,
+      lessonId: uploadSession.lessonId,
+      lessonTitle: uploadSession.lessonTitle,
+      lessonType: uploadSession.lessonType,
+      durationMinutes: uploadSession.durationMinutes,
+      moduleName: uploadSession.moduleName,
+      moduleDescription: uploadSession.moduleDescription,
+      chapterId: uploadSession.chapterId,
+      chapterTitle: uploadSession.chapterTitle,
+      chapterDescription: uploadSession.chapterDescription,
+      originalFilename: uploadSession.originalFilename,
+      mimeType: uploadSession.mimeType,
+      fileSize: uploadSession.fileSize,
+      uploadedBy: uploadSession.uploadedBy,
+      isPremium: uploadSession.isPremium,
+      storedVideo: {
+        storageProvider: uploadSession.storageProvider,
+        storagePath: uploadSession.storagePath,
+        accessPolicy: uploadSession.accessPolicy,
+      },
+    });
+    await clearMultipartUploadSession(uploadSessionId);
+    return created(res, {
+      ...payload,
+      uploadSessionId,
+      complete: true,
+    });
+  } catch (error) {
+    await deleteStoredPrivateVideo({
+      storageProvider: uploadSession.storageProvider,
+      storagePath: uploadSession.storagePath,
+    }).catch(() => undefined);
+    await clearMultipartUploadSession(uploadSessionId);
+    throw error;
+  }
+});
+
+const abortMultipartVideoUpload = asyncHandler(async (req, res) => {
+  const courseId = requireString(req.params.courseId, 'courseId');
+  const moduleId = requireString(req.params.moduleId, 'moduleId');
+  const uploadSessionId = normalizeChunkUploadId(req.params.uploadSessionId);
+  const uploadSession = await loadMultipartUploadSession(uploadSessionId);
+
+  if (uploadSession.courseId !== courseId || uploadSession.moduleId !== moduleId) {
+    throw new ApiError(404, 'Multipart upload session not found for this module.', {
+      code: 'VIDEO_MULTIPART_SESSION_NOT_FOUND',
+    });
+  }
+
+  await abortPrivateVideoMultipartUpload({
+    storagePath: uploadSession.storagePath,
+    uploadId: uploadSession.uploadId,
+  }).catch(() => undefined);
+  await clearMultipartUploadSession(uploadSessionId);
+
+  return ok(res, {
+    message: 'Multipart upload aborted successfully.',
+    uploadSessionId,
+  });
 });
 
 const initiateCloudflareStreamUpload = asyncHandler(async (req, res) => {
@@ -901,6 +1186,10 @@ const getVideoMetadata = asyncHandler(async (req, res) => {
 module.exports = {
   uploadVideoToModule,
   uploadVideoChunkToModule,
+  initiateMultipartVideoUpload,
+  getMultipartVideoUploadPartUrl,
+  completeMultipartVideoUpload,
+  abortMultipartVideoUpload,
   initiateCloudflareStreamUpload,
   completeCloudflareStreamUpload,
   handleCloudflareStreamWebhook,

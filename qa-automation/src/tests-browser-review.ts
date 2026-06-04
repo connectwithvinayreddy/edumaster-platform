@@ -16,6 +16,12 @@ const apiOrigin = (() => {
 
 const desktopViewport = { width: 1536, height: 1024 };
 const mobileViewport = { width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 2 };
+const certificationMode = String(process.env.QA_TEST_CERTIFICATION_MODE || '').toLowerCase() === 'true';
+const expectedQuestions = Math.max(0, Number(process.env.QA_TEST_EXPECTED_QUESTIONS || 0));
+const expectedDurationMinutes = Math.max(0, Number(process.env.QA_TEST_EXPECTED_DURATION_MINUTES || 0));
+const targetTestTitle = String(process.env.QA_TEST_TITLE || '').trim();
+const autoSubmitOverrideSeconds = Math.max(0, Number(process.env.QA_TEST_AUTO_SUBMIT_SECONDS || 0));
+const skipMobileReview = String(process.env.QA_TEST_SKIP_MOBILE || '').toLowerCase() === 'true';
 
 const loginAndStoreSession = async (page: puppeteer.Page, email: string, password: string) => {
   const response = await fetch(new URL('/backend/api/auth/login', apiOrigin), {
@@ -171,6 +177,30 @@ const clickFirstAvailable = async (page: puppeteer.Page, selectorList: string[],
   return false;
 };
 
+const clickTestByTitle = async (page: puppeteer.Page, title: string) => page.evaluate((targetTitle) => {
+  const normalizedTarget = targetTitle.toLowerCase().trim();
+  const candidates = [...document.querySelectorAll('button')] as HTMLElement[];
+  for (const candidate of candidates) {
+    const text = (candidate.textContent || '').toLowerCase();
+    if (!text.includes(normalizedTarget)) {
+      continue;
+    }
+
+    const style = window.getComputedStyle(candidate);
+    const rect = candidate.getBoundingClientRect();
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0' || rect.width <= 0 || rect.height <= 0) {
+      continue;
+    }
+
+    candidate.click();
+    return true;
+  }
+
+  return false;
+}, title);
+
+const getVisibleBodyText = async (page: puppeteer.Page) => page.evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').trim());
+
 const getVisibleText = async (page: puppeteer.Page, selector: string) => page.evaluate((targetSelector) => {
   const elements = [...document.querySelectorAll(targetSelector)] as HTMLElement[];
   for (const element of elements) {
@@ -297,6 +327,15 @@ const hasVisibleSelection = async (page: puppeteer.Page) => page.evaluate(() => 
 const goToBaseAndLogin = async (page: puppeteer.Page) => {
   await page.goto(config.baseUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await loginAndStoreSession(page, process.env.QA_LOGIN_EMAIL || config.loginEmail, process.env.QA_LOGIN_PASSWORD || config.loginPassword);
+  if (autoSubmitOverrideSeconds > 0) {
+    await page.evaluate((seconds) => {
+      window.localStorage.setItem('qa.mock_test_timer_override_seconds', String(seconds));
+    }, autoSubmitOverrideSeconds);
+  } else {
+    await page.evaluate(() => {
+      window.localStorage.removeItem('qa.mock_test_timer_override_seconds');
+    });
+  }
   await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForSelector(selectors.shellReady, { timeout: 30000 });
 };
@@ -319,6 +358,94 @@ const captureStep = async (
     timestamp: new Date().toISOString(),
   });
   return screenshotPath;
+};
+
+const verifyConfirmationExpectations = async (
+  page: puppeteer.Page,
+  failures: FailureRecord[],
+  stepId: string,
+  screenshotPath: string,
+) => {
+  if (!certificationMode) {
+    return;
+  }
+
+  const text = await getVisibleBodyText(page);
+  if (expectedQuestions > 0 && !new RegExp(`\\b${expectedQuestions}\\b`).test(text)) {
+    recordFailure(
+      failures,
+      stepId,
+      'Expected question count is not visible on confirmation',
+      `The confirmation screen should clearly show ${expectedQuestions} questions for the certification mock.`,
+      screenshotPath,
+    );
+  }
+
+  if (expectedDurationMinutes > 0 && !new RegExp(`\\b${expectedDurationMinutes}\\b`).test(text)) {
+    recordFailure(
+      failures,
+      stepId,
+      'Expected duration is not visible on confirmation',
+      `The confirmation screen should clearly show ${expectedDurationMinutes} minutes for the certification mock.`,
+      screenshotPath,
+    );
+  }
+};
+
+const jumpToQuestion = async (page: puppeteer.Page, selector: string) => {
+  const clicked = await page.evaluate((targetSelector) => {
+    const target = document.querySelector(targetSelector) as HTMLElement | null;
+    if (!target) {
+      return false;
+    }
+    target.click();
+    return true;
+  }, selector);
+
+  if (clicked) {
+    await sleep(300);
+  }
+
+  return clicked;
+};
+
+const waitForRankTransition = async (
+  page: puppeteer.Page,
+  rankSelector: string,
+  percentileSelector: string,
+  failures: FailureRecord[],
+  stepId: string,
+  screenshotPath: string,
+) => {
+  if (!certificationMode) {
+    return;
+  }
+
+  const rankBefore = await getVisibleText(page, rankSelector);
+  if (!/pending/i.test(rankBefore)) {
+    return;
+  }
+
+  const ready = await page.waitForFunction(
+    (rankSel, percentileSel) => {
+      const rankText = (document.querySelector(rankSel)?.textContent || '').trim();
+      const percentileText = (document.querySelector(percentileSel)?.textContent || '').trim();
+      return rankText.startsWith('#') || /\d+(\.\d+)?%/.test(percentileText);
+    },
+    { timeout: 15000 },
+    rankSelector,
+    percentileSelector,
+  ).then(() => true).catch(() => false);
+
+  if (!ready) {
+    recordFailure(
+      failures,
+      stepId,
+      'Pending rank never became ready on the result screen',
+      'The result screen should refresh from pending to ready once async ranking finishes.',
+      screenshotPath,
+    );
+  }
 };
 
 const reviewDesktopFlow = async (
@@ -344,7 +471,10 @@ const reviewDesktopFlow = async (
     );
   }
 
-  await clickFirstAvailable(page, [selectors.testsOpenPrimary, selectors.firstTestCard], [/open exam instructions/i, /resume now/i, /start now/i]);
+  const clickedTargetTest = targetTestTitle ? await clickTestByTitle(page, targetTestTitle) : false;
+  if (!clickedTargetTest) {
+    await clickFirstAvailable(page, [selectors.testsOpenPrimary, selectors.firstTestCard], [/open exam instructions/i, /resume now/i, /start now/i]);
+  }
   await sleep(700);
 
   const hasDetail = Boolean(await page.$(selectors.testsDetailDesktop));
@@ -380,6 +510,7 @@ const reviewDesktopFlow = async (
 
   const hasConfirmation = Boolean(await page.$(selectors.testsConfirmationDesktop)) || Boolean(await page.$('input[type="checkbox"]'));
   const confirmationShot = await captureStep(page, ctx, captures, 'tests-confirmation-desktop', 'tests-confirmation-desktop');
+  await verifyConfirmationExpectations(page, failures, 'tests-confirmation-desktop', confirmationShot);
   if (!hasConfirmation || !(await page.$(selectors.testsConfirmationDesktop))) {
     recordFailure(
       failures,
@@ -420,9 +551,21 @@ const reviewDesktopFlow = async (
     { timeout: 5000 },
     selectors.testsConfirmationBeginDesktop,
   );
+  if (certificationMode && await page.$(selectors.testsExamTimerDesktop)) {
+    recordFailure(
+      failures,
+      'tests-confirmation-timer-desktop',
+      'Desktop timer appeared before the learner began the exam',
+      'The countdown should not render on the confirmation screen before "I am ready to begin" is clicked.',
+      confirmationShot,
+    );
+  }
   await clickFirstAvailable(page, [selectors.testsConfirmationBeginDesktop], [/i am ready to begin/i, /ready to begin/i]);
   await sleep(900);
   await waitForAnySelector(page, [selectors.testsExamDesktop, selectors.testsExamSubmitDesktop]);
+  if (certificationMode) {
+    await page.waitForSelector(selectors.testsExamTimerDesktop, { timeout: 5000 }).catch(() => undefined);
+  }
 
   const examShot = await captureStep(page, ctx, captures, 'tests-exam-desktop', 'tests-exam-desktop');
   if (!(await page.$(selectors.testsExamDesktop))) {
@@ -437,10 +580,23 @@ const reviewDesktopFlow = async (
 
   const questionCount = await getVisibleQuestionCount(page, 'tests-desktop-jump-');
   const runAdvancedDesktopParityChecks = questionCount > 1;
-  const clickedDesktopOption = await selectFirstVisibleAnswer(page);
+  if (certificationMode && autoSubmitOverrideSeconds === 0 && questionCount >= 100) {
+    const navigatedToSixty = await jumpToQuestion(page, '[data-testid="tests-desktop-jump-60"]');
+    const navigatedToLast = await jumpToQuestion(page, `[data-testid="tests-desktop-jump-${questionCount}"]`);
+    if (!navigatedToSixty || !navigatedToLast) {
+      recordFailure(
+        failures,
+        'tests-exam-desktop-large-navigation',
+        'Large-paper desktop navigation did not reach deep questions',
+        `The certification mock should allow direct palette navigation deep into the paper; expected question 60 and question ${questionCount}.`,
+        examShot,
+      );
+    }
+  }
+  const clickedDesktopOption = autoSubmitOverrideSeconds > 0 ? true : await selectFirstVisibleAnswer(page);
   await sleep(250);
   const selectedDesktopShot = await captureStep(page, ctx, captures, 'tests-exam-desktop-selected', 'tests-exam-desktop-selected');
-  const hasDesktopSelection = await hasVisibleSelection(page);
+  const hasDesktopSelection = autoSubmitOverrideSeconds > 0 ? true : await hasVisibleSelection(page);
   if (runAdvancedDesktopParityChecks && (!clickedDesktopOption || !hasDesktopSelection)) {
     recordFailure(
       failures,
@@ -451,7 +607,7 @@ const reviewDesktopFlow = async (
     );
   }
 
-  if (runAdvancedDesktopParityChecks) {
+  if (runAdvancedDesktopParityChecks && autoSubmitOverrideSeconds === 0) {
     await clickFirstAvailable(page, [], [/save & next/i]);
     await sleep(400);
     const savedDesktopShot = await captureStep(page, ctx, captures, 'tests-exam-desktop-saved-next', 'tests-exam-desktop-saved-next');
@@ -489,7 +645,7 @@ const reviewDesktopFlow = async (
     }
   }
 
-  if (runAdvancedDesktopParityChecks) {
+  if (runAdvancedDesktopParityChecks && autoSubmitOverrideSeconds === 0) {
     await clickFirstAvailable(page, [selectors.testsDesktopOpenSymbols], [/symbols/i]);
     await sleep(300);
     const symbolsDesktopShot = await captureStep(page, ctx, captures, 'tests-symbols-desktop', 'tests-symbols-desktop');
@@ -532,8 +688,12 @@ const reviewDesktopFlow = async (
     await clickFirstAvailable(page, [selectors.testsDesktopOpenSummary], [/overall test summary/i]);
     await sleep(250);
   }
-  await clickFirstAvailable(page, [selectors.testsExamSubmitDesktop], [/submit test/i, /submit/i]);
-  await sleep(800);
+  if (autoSubmitOverrideSeconds > 0) {
+    await page.waitForSelector(selectors.testsResultDesktop, { timeout: 10000 }).catch(() => undefined);
+  } else {
+    await clickFirstAvailable(page, [selectors.testsExamSubmitDesktop], [/submit test/i, /submit/i]);
+    await sleep(800);
+  }
 
   const resultDesktopShot = await captureStep(page, ctx, captures, 'tests-result-desktop', 'tests-result-desktop');
   if (!(await page.$(selectors.testsResultDesktop))) {
@@ -545,6 +705,15 @@ const reviewDesktopFlow = async (
       resultDesktopShot,
     );
   }
+
+  await waitForRankTransition(
+    page,
+    selectors.testsResultRankDesktop,
+    selectors.testsResultPercentileDesktop,
+    failures,
+    'tests-result-rank-desktop',
+    resultDesktopShot,
+  );
 
   await clickFirstAvailable(page, [selectors.testsViewSolutionsDesktop], [/view solutions/i, /view analysis/i, /solutions/i]);
   await sleep(700);
@@ -583,7 +752,10 @@ const reviewMobileFlow = async (
     );
   }
 
-  await clickFirstAvailable(page, [selectors.testsOpenPrimary, selectors.firstTestCard], [/open exam instructions/i, /resume now/i, /start now/i]);
+  const clickedTargetTest = targetTestTitle ? await clickTestByTitle(page, targetTestTitle) : false;
+  if (!clickedTargetTest) {
+    await clickFirstAvailable(page, [selectors.testsOpenPrimary, selectors.firstTestCard], [/open exam instructions/i, /resume now/i, /start now/i]);
+  }
   await sleep(700);
 
   const hasDetail = Boolean(await page.$(selectors.testsDetailMobile));
@@ -617,6 +789,7 @@ const reviewMobileFlow = async (
   await sleep(500);
   await waitForAnySelector(page, [selectors.testsConfirmationMobile, selectors.testsConfirmationDesktop, 'input[type="checkbox"]']);
   const confirmationShot = await captureStep(page, ctx, captures, 'tests-confirmation-mobile', 'tests-confirmation-mobile');
+  await verifyConfirmationExpectations(page, failures, 'tests-confirmation-mobile', confirmationShot);
   if (!(await page.$(selectors.testsConfirmationMobile))) {
     recordFailure(
       failures,
@@ -636,9 +809,21 @@ const reviewMobileFlow = async (
     { timeout: 5000 },
     selectors.testsConfirmationBeginMobile,
   );
+  if (certificationMode && await page.$(selectors.testsExamTimerMobile)) {
+    recordFailure(
+      failures,
+      'tests-confirmation-timer-mobile',
+      'Mobile timer appeared before the learner began the exam',
+      'The countdown should not render on mobile before "I am ready to begin" is clicked.',
+      confirmationShot,
+    );
+  }
   await clickFirstAvailable(page, [selectors.testsConfirmationBeginMobile], [/i am ready to begin/i, /ready to begin/i]);
   await sleep(900);
   await waitForAnySelector(page, [selectors.testsExamMobile, selectors.testsExamSubmitMobile]);
+  if (certificationMode) {
+    await page.waitForSelector(selectors.testsExamTimerMobile, { timeout: 5000 }).catch(() => undefined);
+  }
 
   const mobileQuestionCount = await getVisibleQuestionCount(page, 'tests-mobile-jump-');
   await selectFirstVisibleAnswer(page);
@@ -706,6 +891,15 @@ const reviewMobileFlow = async (
     );
   }
 
+  await waitForRankTransition(
+    page,
+    selectors.testsResultRankMobile,
+    selectors.testsResultPercentileMobile,
+    failures,
+    'tests-result-rank-mobile',
+    resultShot,
+  );
+
   await clickFirstAvailable(page, [selectors.testsViewSolutions], [/view solutions/i, /view analysis/i, /solutions/i]);
   await sleep(700);
   const solutionsShot = await captureStep(page, ctx, captures, 'tests-solutions-mobile', 'tests-solutions-mobile');
@@ -740,9 +934,11 @@ export const runTestsReview = async (): Promise<{ captures: CaptureRecord[]; fai
     await reviewDesktopFlow(desktopPage, ctx, captures, failures);
     await desktopPage.close();
 
-    const mobilePage = await browser.newPage();
-    await reviewMobileFlow(mobilePage, ctx, captures, failures);
-    await mobilePage.close();
+    if (!skipMobileReview) {
+      const mobilePage = await browser.newPage();
+      await reviewMobileFlow(mobilePage, ctx, captures, failures);
+      await mobilePage.close();
+    }
 
     await writeJson(path.join(ctx.analysisDir, 'summary.json'), { captures, failures });
     await writeText(

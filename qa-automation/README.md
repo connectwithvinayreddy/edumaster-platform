@@ -162,12 +162,23 @@ This runner:
 - captures baseline host snapshots for staging and prod
 - logs stray restarting or unhealthy containers before load
 - runs targeted recorded-video correctness checks on staging
-- runs recorded-browser stages `50 -> 100 -> 250`
+- runs protected-HLS browser stages `1 -> 3 -> 10 -> 25 -> 50 -> 100 -> 250 -> 500 -> 1000 -> 2000`
 - runs recorded-video synthetic stages `250 -> 500 -> 750 -> 1000`
 - runs mixed app stages `500 -> 1000 -> 1500 -> 2000`
 - stops on the first failing stage
 - classifies failures into app/API, media path, DB, Redis, browser-only, or staging-host-exhaustion buckets
 - runs production smoke only after staging is green
+
+For protected-HLS or recorded-video playback releases, production deploy is blocked until this runner produces:
+
+- `reports/.../protected-hls-playback-deploy-gate-summary.json`
+- exact real-browser count `>= 2000`
+- exact synthetic/API diagnostic count `= 0`
+- a verdict eligible for manual production approval
+
+See:
+
+- `docs/protected-hls-production-deploy-gate.md`
 
 The course video load runner supports:
 

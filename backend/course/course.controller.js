@@ -163,7 +163,7 @@ const isHlsSegmentPath = (value) => HLS_SEGMENT_EXTENSIONS.has(getExtension(valu
 
 const getSharedSegmentTokenExpiresAt = () => {
   const ttlMs = Math.max(Number(appConfig.privateVideoHlsSegmentTokenTtlSeconds || 3600), 300) * 1000;
-  return Math.ceil((Date.now() + 1000) / ttlMs) * ttlMs;
+  return Date.now() + ttlMs;
 };
 
 const isMediaManifestText = (manifestText) => {
@@ -243,7 +243,7 @@ const setMemoryCacheValue = (cache, key, value, ttlSeconds) => {
 
 const getSharedManifestTokenExpiresAt = () => {
   const ttlMs = Math.max(Number(appConfig.privateVideoHlsSegmentTokenTtlSeconds || 3600), 300) * 1000;
-  return Math.ceil((Date.now() + 1000) / ttlMs) * ttlMs;
+  return Date.now() + ttlMs;
 };
 
 const encodeCompactAssetPath = (assetPath) => String(assetPath || '')
@@ -262,7 +262,8 @@ const setHlsCacheHeaders = (res, assetPath, payload = {}, options = {}) => {
   const cacheScope = payload.cacheScope || '';
 
   res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Vary', 'Accept-Encoding');
+  res.setHeader('Vary', 'Accept-Encoding, Cookie');
+  res.setHeader('X-Edumaster-Auth-Bound', 'hls-grant-cookie');
 
   if (isHlsManifestPath(assetPath)) {
     if (cacheScope === 'shared-hls-manifest') {

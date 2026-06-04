@@ -211,7 +211,7 @@ const decodeCompactAssetPath = (assetPath) => String(assetPath || '')
 
 const getSharedCompactAssetExpiresAt = (ttlSeconds = appConfig.privateVideoHlsSegmentTokenTtlSeconds) => {
   const ttlMs = Math.max(Number(ttlSeconds || 3600), 300) * 1000;
-  return Math.ceil((Date.now() + 1000) / ttlMs) * ttlMs;
+  return Date.now() + ttlMs;
 };
 
 const buildCompactAssetUrl = (payload, options = {}) => {

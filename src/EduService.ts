@@ -179,6 +179,15 @@ type CloudflareStreamUploadSession = {
   message?: string;
 };
 
+type MultipartVideoUploadSession = {
+  uploadSessionId: string;
+  lessonId: string;
+  partSizeBytes: number;
+  recommendedConcurrency?: number;
+  processingProvider?: string;
+  message?: string;
+};
+
 const extractUploadErrorMessage = (responseText: string, fallbackMessage: string) => {
   const normalizedText = String(responseText || '').trim();
   if (!normalizedText) {
@@ -272,6 +281,34 @@ const patchTusChunk = (
   xhr.setRequestHeader('Upload-Offset', String(offset));
   xhr.setRequestHeader('Content-Type', 'application/offset+octet-stream');
   xhr.send(chunk);
+});
+
+const uploadBlobToSignedUrl = (
+  uploadUrl: string,
+  blob: Blob,
+  onProgress?: (loadedBytes: number) => void,
+) => new Promise<void>((resolve, reject) => {
+  const xhr = new XMLHttpRequest();
+  xhr.upload.onprogress = (event) => {
+    if (!event.lengthComputable) {
+      return;
+    }
+    onProgress?.(event.loaded);
+  };
+  xhr.onload = () => {
+    if (xhr.status >= 200 && xhr.status < 300) {
+      onProgress?.(blob.size);
+      resolve();
+      return;
+    }
+    reject(new Error(extractUploadErrorMessage(
+      xhr.responseText,
+      `Multipart upload failed (${xhr.status})`,
+    )));
+  };
+  xhr.onerror = () => reject(new Error('Multipart upload failed'));
+  xhr.open('PUT', uploadUrl);
+  xhr.send(blob);
 });
 
 const getTusUploadOffset = (uploadURL: string) => new Promise<number | null>((resolve) => {
@@ -2105,7 +2142,6 @@ export const EduService = {
     },
   ) => {
     const onProgress = options?.onProgress;
-    const formData = new FormData();
     const appendSharedFields = (target: FormData) => {
       target.append('lessonTitle', lessonTitle);
       target.append('durationMinutes', String(durationMinutes || 0));
@@ -2117,6 +2153,7 @@ export const EduService = {
     };
 
     if (file.size <= DIRECT_VIDEO_UPLOAD_LIMIT_BYTES) {
+      const formData = new FormData();
       formData.append('video', file);
       appendSharedFields(formData);
 
@@ -2143,66 +2180,117 @@ export const EduService = {
       return response.json();
     }
 
-    const uploadId = buildVideoUploadId();
-    const totalChunks = Math.ceil(file.size / VIDEO_UPLOAD_CHUNK_SIZE_BYTES);
-    let lastPayload: unknown = null;
+    const multipartInitResponse = await fetch(resolveRootPath(`/backend/api/courses/${courseId}/modules/${moduleId}/videos/multipart/initiate`), {
+      method: 'POST',
+      headers: {
+        ...buildAuthHeaders(),
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        lessonTitle,
+        durationMinutes: Number(durationMinutes || 0),
+        isPremium: Boolean(isPremium),
+        lessonType: 'video',
+        chapterId: chapterId || '',
+        originalFilename: file.name,
+        mimeType: file.type || 'video/mp4',
+        fileSize: file.size,
+      }),
+    });
 
-    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
-      const start = chunkIndex * VIDEO_UPLOAD_CHUNK_SIZE_BYTES;
-      const end = Math.min(start + VIDEO_UPLOAD_CHUNK_SIZE_BYTES, file.size);
-      const chunkBlob = file.slice(start, end, file.type || 'application/octet-stream');
-      let response: Response | null = null;
-      let lastError: Error | null = null;
+    if (!multipartInitResponse.ok) {
+      const error = await multipartInitResponse.json().catch(() => ({}));
+      throw new Error(error.message || 'Multipart upload initialization failed');
+    }
 
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        const chunkFormData = new FormData();
-        chunkFormData.append('chunk', chunkBlob, file.name);
-        appendSharedFields(chunkFormData);
-        chunkFormData.append('uploadId', uploadId);
-        chunkFormData.append('chunkIndex', String(chunkIndex));
-        chunkFormData.append('totalChunks', String(totalChunks));
-        chunkFormData.append('originalFilename', file.name);
-        chunkFormData.append('mimeType', file.type || 'video/mp4');
-        chunkFormData.append('fileSize', String(file.size));
+    const multipartSession = await multipartInitResponse.json() as MultipartVideoUploadSession;
+    const uploadSessionId = String(multipartSession.uploadSessionId || '').trim();
+    const partSizeBytes = Math.max(Number(multipartSession.partSizeBytes || VIDEO_UPLOAD_CHUNK_SIZE_BYTES), 5 * 1024 * 1024);
+    const totalParts = Math.ceil(file.size / partSizeBytes);
+    const concurrency = Math.max(1, Math.min(Number(multipartSession.recommendedConcurrency || 4), 6));
+    const uploadedBytesByPart = Array.from({ length: totalParts }, () => 0);
+    const updateAggregateProgress = (partIndex: number, loadedBytes: number) => {
+      uploadedBytesByPart[partIndex] = Math.min(Math.max(0, loadedBytes), file.slice(partIndex * partSizeBytes, Math.min((partIndex + 1) * partSizeBytes, file.size)).size);
+      onProgress?.({
+        uploadedBytes: uploadedBytesByPart.reduce((sum, current) => sum + current, 0),
+        totalBytes: file.size,
+        chunkIndex: partIndex,
+        totalChunks: totalParts,
+      });
+    };
 
-        try {
-          response = await fetch(resolveRootPath(`/backend/api/courses/${courseId}/modules/${moduleId}/videos/chunked`), {
+    if (!uploadSessionId) {
+      throw new Error('Multipart upload initialization did not return an upload session id.');
+    }
+
+    try {
+      let nextPartIndex = 0;
+      const uploadPartWorker = async () => {
+        while (nextPartIndex < totalParts) {
+          const currentPartIndex = nextPartIndex;
+          nextPartIndex += 1;
+          const partNumber = currentPartIndex + 1;
+          const start = currentPartIndex * partSizeBytes;
+          const end = Math.min(start + partSizeBytes, file.size);
+          const partBlob = file.slice(start, end, file.type || 'application/octet-stream');
+
+          const partUrlResponse = await fetch(resolveRootPath(`/backend/api/courses/${courseId}/modules/${moduleId}/videos/multipart/${encodeURIComponent(uploadSessionId)}/part-url`), {
             method: 'POST',
             headers: {
               ...buildAuthHeaders(),
+              'content-type': 'application/json',
             },
-            body: chunkFormData,
+            body: JSON.stringify({ partNumber }),
           });
 
-          if (response.ok) {
-            break;
+          if (!partUrlResponse.ok) {
+            const error = await partUrlResponse.json().catch(() => ({}));
+            throw new Error(error.message || `Failed to get upload URL for part ${partNumber}`);
           }
 
-          const error = await response.json().catch(() => ({}));
-          lastError = new Error(error.message || `Upload failed on chunk ${chunkIndex + 1}`);
-        } catch (error) {
-          lastError = error instanceof Error ? error : new Error(`Upload failed on chunk ${chunkIndex + 1}`);
+          const { uploadUrl } = await partUrlResponse.json() as { uploadUrl?: string };
+          if (!uploadUrl) {
+            throw new Error(`Upload URL missing for part ${partNumber}`);
+          }
+
+          await uploadBlobToSignedUrl(uploadUrl, partBlob, (loadedBytes) => {
+            updateAggregateProgress(currentPartIndex, loadedBytes);
+          });
+          updateAggregateProgress(currentPartIndex, partBlob.size);
         }
+      };
 
-        if (attempt < 2) {
-          await delay(700 * (attempt + 1));
-        }
-      }
+      await Promise.all(Array.from({ length: Math.min(concurrency, totalParts) }, () => uploadPartWorker()));
 
-      if (!response?.ok) {
-        throw lastError || new Error('Upload failed');
-      }
-
-      lastPayload = await response.json();
-      onProgress?.({
-        uploadedBytes: end,
-        totalBytes: file.size,
-        chunkIndex,
-        totalChunks,
+      const multipartCompleteResponse = await fetch(resolveRootPath(`/backend/api/courses/${courseId}/modules/${moduleId}/videos/multipart/${encodeURIComponent(uploadSessionId)}/complete`), {
+        method: 'POST',
+        headers: {
+          ...buildAuthHeaders(),
+        },
       });
-    }
 
-    return lastPayload;
+      if (!multipartCompleteResponse.ok) {
+        const error = await multipartCompleteResponse.json().catch(() => ({}));
+        throw new Error(error.message || 'Multipart upload completion failed');
+      }
+
+      onProgress?.({
+        uploadedBytes: file.size,
+        totalBytes: file.size,
+        chunkIndex: totalParts - 1,
+        totalChunks: totalParts,
+      });
+
+      return multipartCompleteResponse.json();
+    } catch (error) {
+      await fetch(resolveRootPath(`/backend/api/courses/${courseId}/modules/${moduleId}/videos/multipart/${encodeURIComponent(uploadSessionId)}`), {
+        method: 'DELETE',
+        headers: {
+          ...buildAuthHeaders(),
+        },
+      }).catch(() => undefined);
+      throw error;
+    }
   },
 
   getProtectedLessonPlayback: async (courseId: string, lessonId: string, options: { forceRefresh?: boolean } = {}) => {

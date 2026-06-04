@@ -8,6 +8,11 @@ const {
   GetObjectCommand,
   HeadObjectCommand,
   ListObjectsV2Command,
+  CreateMultipartUploadCommand,
+  UploadPartCommand,
+  ListPartsCommand,
+  CompleteMultipartUploadCommand,
+  AbortMultipartUploadCommand,
 } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { appConfig } = require('./config.js');
@@ -73,7 +78,7 @@ const getS3Client = () => {
 
 const getSharedSignedUrlExpiresAtMs = () => {
   const ttlMs = Math.max(Number(appConfig.privateVideoDeliveryUrlTtlSeconds || 900), 60) * 1000;
-  return Math.ceil((Date.now() + 1000) / ttlMs) * ttlMs;
+  return Date.now() + ttlMs;
 };
 
 const getSignedPrivateUrlCacheKey = ({ storagePath, mimeType }) => [
@@ -84,6 +89,159 @@ const getSignedPrivateUrlCacheKey = ({ storagePath, mimeType }) => [
 
 const buildStorageKeyFromUpload = ({ courseId, moduleId, lessonId, originalName }) =>
   buildPrivateVideoStorageKey({ courseId, moduleId, lessonId, originalName });
+
+const createPrivateVideoMultipartUpload = async ({
+  courseId,
+  moduleId,
+  lessonId,
+  originalName,
+  mimeType,
+}) => {
+  assertS3StorageConfigured();
+  const storageKey = buildStorageKeyFromUpload({
+    courseId,
+    moduleId,
+    lessonId,
+    originalName,
+  });
+
+  const response = await getS3Client().send(new CreateMultipartUploadCommand({
+    Bucket: appConfig.storageBucket,
+    Key: storageKey,
+    ContentType: mimeType || 'video/mp4',
+  }));
+
+  if (!response.UploadId) {
+    throw new Error('Multipart upload could not be initialized.');
+  }
+
+  return {
+    storageProvider: 's3',
+    storagePath: storageKey,
+    uploadId: String(response.UploadId),
+    accessPolicy: {
+      type: 'signed-object-url',
+      drmReady: Boolean(appConfig.privateVideoDrmEnabled),
+    },
+  };
+};
+
+const getPrivateVideoMultipartPartUploadUrl = async ({
+  storagePath,
+  uploadId,
+  partNumber,
+}) => {
+  assertS3StorageConfigured();
+  if (!storagePath || !uploadId) {
+    throw new Error('storagePath and uploadId are required for multipart upload.');
+  }
+
+  const normalizedPartNumber = Number(partNumber);
+  if (!Number.isInteger(normalizedPartNumber) || normalizedPartNumber < 1 || normalizedPartNumber > 10_000) {
+    throw new Error('Multipart upload partNumber must be between 1 and 10000.');
+  }
+
+  const expiresInSeconds = Math.max(Number(process.env.VIDEO_MULTIPART_UPLOAD_URL_TTL_SECONDS || 900), 60);
+  const command = new UploadPartCommand({
+    Bucket: appConfig.storageBucket,
+    Key: storagePath,
+    UploadId: String(uploadId),
+    PartNumber: normalizedPartNumber,
+  });
+
+  const url = await getSignedUrl(getS3Client(), command, { expiresIn: expiresInSeconds });
+  return {
+    url,
+    expiresInSeconds,
+  };
+};
+
+const listPrivateVideoMultipartParts = async ({ storagePath, uploadId }) => {
+  assertS3StorageConfigured();
+  if (!storagePath || !uploadId) {
+    throw new Error('storagePath and uploadId are required to list multipart upload parts.');
+  }
+
+  const allParts = [];
+  let partNumberMarker = undefined;
+  let continuation = true;
+
+  while (continuation) {
+    const response = await getS3Client().send(new ListPartsCommand({
+      Bucket: appConfig.storageBucket,
+      Key: storagePath,
+      UploadId: String(uploadId),
+      PartNumberMarker: partNumberMarker,
+    }));
+
+    const parts = Array.isArray(response.Parts) ? response.Parts : [];
+    parts.forEach((part) => {
+      if (part?.PartNumber && part?.ETag) {
+        allParts.push({
+          PartNumber: Number(part.PartNumber),
+          ETag: String(part.ETag),
+        });
+      }
+    });
+
+    continuation = Boolean(response.IsTruncated);
+    partNumberMarker = response.NextPartNumberMarker ? Number(response.NextPartNumberMarker) : undefined;
+  }
+
+  return allParts.sort((left, right) => left.PartNumber - right.PartNumber);
+};
+
+const completePrivateVideoMultipartUpload = async ({
+  storagePath,
+  uploadId,
+  parts,
+}) => {
+  assertS3StorageConfigured();
+  if (!storagePath || !uploadId) {
+    throw new Error('storagePath and uploadId are required to complete multipart upload.');
+  }
+
+  const normalizedParts = (Array.isArray(parts) ? parts : [])
+    .filter((part) => Number.isInteger(Number(part?.PartNumber)) && String(part?.ETag || '').trim())
+    .map((part) => ({
+      PartNumber: Number(part.PartNumber),
+      ETag: String(part.ETag),
+    }))
+    .sort((left, right) => left.PartNumber - right.PartNumber);
+
+  if (normalizedParts.length === 0) {
+    throw new Error('Multipart upload has no uploaded parts to complete.');
+  }
+
+  await getS3Client().send(new CompleteMultipartUploadCommand({
+    Bucket: appConfig.storageBucket,
+    Key: storagePath,
+    UploadId: String(uploadId),
+    MultipartUpload: {
+      Parts: normalizedParts,
+    },
+  }));
+
+  return true;
+};
+
+const abortPrivateVideoMultipartUpload = async ({
+  storagePath,
+  uploadId,
+}) => {
+  assertS3StorageConfigured();
+  if (!storagePath || !uploadId) {
+    throw new Error('storagePath and uploadId are required to abort multipart upload.');
+  }
+
+  await getS3Client().send(new AbortMultipartUploadCommand({
+    Bucket: appConfig.storageBucket,
+    Key: storagePath,
+    UploadId: String(uploadId),
+  }));
+
+  return true;
+};
 
 const storePrivateVideoUpload = async ({
   tempFilePath,
@@ -386,6 +544,11 @@ module.exports = {
   isS3Provider,
   getPrivateVideoStorageProvider,
   buildStorageKeyFromUpload,
+  createPrivateVideoMultipartUpload,
+  getPrivateVideoMultipartPartUploadUrl,
+  listPrivateVideoMultipartParts,
+  completePrivateVideoMultipartUpload,
+  abortPrivateVideoMultipartUpload,
   storePrivateVideoUpload,
   deleteStoredPrivateVideo,
   deleteStoredPrivateVideoPrefix,

@@ -8,6 +8,13 @@ import {
   normalizeRecordedDeliveryPath,
   type RecordedDeliveryPath,
 } from './recorded-delivery-path.js';
+import {
+  assignDeviceClass,
+  assignVideoViewerPersona,
+  describeVideoPersona,
+  type DeviceClass,
+  type VideoViewerPersona,
+} from './browser-load-personas.js';
 import { selectors } from './selectors.js';
 import { artifactPath, createRunContext, sleep, writeJson, writeText } from './utils.js';
 
@@ -17,6 +24,11 @@ type PreparedUser = {
   token: string;
   userId: string | null;
   name: string;
+  persona?: VideoViewerPersona;
+  deviceClass?: DeviceClass;
+  shardId?: string | null;
+  targetCourseId?: string | null;
+  targetLessonId?: string | null;
 };
 
 type ViewerNetworkSample = {
@@ -85,7 +97,10 @@ type ViewerFailurePhase = 'boot' | 'route' | 'player' | 'playback' | 'unknown';
 type ViewerResult = {
   viewerId: number;
   email: string;
-  viewport: 'desktop' | 'mobile';
+  viewport: DeviceClass;
+  persona: VideoViewerPersona;
+  personaDescription: string;
+  shardId: string | null;
   ok: boolean;
   stage: number;
   currentTimeStart: number | null;
@@ -109,7 +124,7 @@ type ViewerResult = {
   bootTelemetryPath?: string;
   deliveryPath: RecordedDeliveryPath | null;
   midStreamEvidence?: {
-    screenshotPath: string;
+    screenshotPath: string | null;
     currentTime: number | null;
     duration: number | null;
     paused: boolean | null;
@@ -128,6 +143,8 @@ type ViewerResult = {
 
 type StageSummary = {
   viewers: number;
+  workerLabel: string;
+  shardId: string | null;
   startedAt: string;
   completedAt?: string;
   ok: boolean;
@@ -146,10 +163,13 @@ type StageSummary = {
   p99ProgressSeconds: number | null;
   midStreamRequirementSatisfied: boolean;
   midStreamEvidence: {
+    desktopEvidenceViewers: string[];
+    mobileEvidenceViewers: string[];
     desktopScreenshots: string[];
     mobileScreenshots: string[];
   };
   resultsPath: string;
+  artifactManifestPath: string;
   screenshotDir: string;
 };
 
@@ -162,6 +182,8 @@ type RunSummary = {
   watchWindowMs: number;
   stageConcurrencyCap: number;
   captureMidStreamScreenshots: boolean;
+  workerLabel: string;
+  shardId: string | null;
   overallOk: boolean;
   notes: string[];
 };
@@ -183,6 +205,7 @@ const stageViewerCounts = String(process.env.QA_VIDEO_BROWSER_STAGES || '1,3,10,
   .map((value) => Number(value.trim()))
   .filter((value) => Number.isFinite(value) && value > 0);
 const screenshotSample = Math.max(1, Number(process.env.QA_VIDEO_BROWSER_SCREENSHOT_SAMPLE || 5));
+const screenshotAllViewers = ['1', 'true', 'yes', 'on'].includes(String(process.env.QA_VIDEO_BROWSER_SCREENSHOT_ALL || '').toLowerCase());
 const stageConcurrencyCap = Math.max(1, Number(process.env.QA_VIDEO_BROWSER_STAGE_CONCURRENCY || 50));
 const mobileRatio = Math.max(0, Math.min(1, Number(process.env.QA_VIDEO_BROWSER_MOBILE_RATIO || 0.4)));
 const separateBrowserPerViewer = process.env.QA_VIDEO_BROWSER_SEPARATE_BROWSER === '1';
@@ -191,8 +214,25 @@ const screenshotTimeoutMs = Math.max(5_000, Number(process.env.QA_VIDEO_BROWSER_
 const viewerLaunchStaggerMs = Math.max(0, Number(process.env.QA_VIDEO_BROWSER_VIEWER_STAGGER_MS || 250));
 const viewerSetupRetries = Math.max(0, Number(process.env.QA_VIDEO_BROWSER_SETUP_RETRIES || 1));
 const captureMidStreamScreenshots = ['1', 'true', 'yes', 'on'].includes(String(process.env.QA_VIDEO_BROWSER_CAPTURE_MID_STREAM_SCREENSHOTS || '').toLowerCase());
+const forceLoginRefresh = ['1', 'true', 'yes', 'on'].includes(String(process.env.QA_VIDEO_BROWSER_FORCE_LOGIN_REFRESH || '').toLowerCase());
+const fullPageScreenshots = ['1', 'true', 'yes', 'on'].includes(String(process.env.QA_BROWSER_FULL_PAGE_SCREENSHOTS || '').toLowerCase());
+const workerLabel = String(process.env.QA_BROWSER_WORKER_LABEL || process.env.HOSTNAME || 'local-worker').trim() || 'local-worker';
+const shardId = String(process.env.QA_BROWSER_SHARD_ID || '').trim() || null;
 const hlsPattern = /\/backend\/api\/course-manifests\/|\/backend\/api\/courses\/stream\/|\.m3u8(?:\?|$)|\.(?:ts|m4s|mp4)(?:\?|$)/i;
 const nonEssentialResourceTypes = new Set(['image', 'font']);
+const preparedSessionTokenCache = new Map<string, string>();
+
+const buildStablePlaybackIdentity = (user: PreparedUser) => {
+  const stableSeed = String(user.userId || user.email || user.index || 'viewer')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48) || 'viewer';
+  return {
+    deviceId: `qa-browser-device-${stableSeed}`,
+    playbackTabId: `qa-browser-tab-${stableSeed}`,
+  };
+};
 
 const percentile = (values: number[], target: number) => {
   if (!values.length) {
@@ -367,6 +407,48 @@ const classifyViewerFailure = (params: {
 const lessonUrl = `${baseUrl}/?tab=courses&courseId=${encodeURIComponent(courseId)}&lessonId=${encodeURIComponent(lessonId)}`;
 const apiOrigin = new URL(baseUrl).origin;
 
+const selectStageUsers = <T>(users: T[], viewers: number) => {
+  if (viewers >= users.length) {
+    return users.slice(0, viewers);
+  }
+  if (viewers <= 1) {
+    return users.slice(0, viewers);
+  }
+
+  const selected: T[] = [];
+  const usedIndexes = new Set<number>();
+  const maxIndex = users.length - 1;
+  for (let ordinal = 0; ordinal < viewers; ordinal += 1) {
+    const rawIndex = Math.round((ordinal * maxIndex) / (viewers - 1));
+    let index = Math.max(0, Math.min(maxIndex, rawIndex));
+    while (usedIndexes.has(index) && index < maxIndex) {
+      index += 1;
+    }
+    while (usedIndexes.has(index) && index > 0) {
+      index -= 1;
+    }
+    if (usedIndexes.has(index)) {
+      continue;
+    }
+    usedIndexes.add(index);
+    selected.push(users[index]);
+  }
+
+  if (selected.length === viewers) {
+    return selected;
+  }
+
+  for (let index = 0; index < users.length && selected.length < viewers; index += 1) {
+    if (usedIndexes.has(index)) {
+      continue;
+    }
+    usedIndexes.add(index);
+    selected.push(users[index]);
+  }
+
+  return selected;
+};
+
 const loadUsers = async () => {
   if (!manifestPath) {
     throw new Error('PLATFORM_LOAD_USERS_FILE or COURSE_LOAD_USERS_FILE is required.');
@@ -375,7 +457,17 @@ const loadUsers = async () => {
   if (!Array.isArray(users) || !users.length) {
     throw new Error(`Prepared user manifest is empty: ${manifestPath}`);
   }
-  return users;
+  return users.map((user, index) => {
+    const stableOrdinal = Number.isFinite(Number(user.index)) ? Number(user.index) : index;
+    return ({
+    ...user,
+    persona: user.persona || assignVideoViewerPersona(stableOrdinal),
+    deviceClass: user.deviceClass || assignDeviceClass(stableOrdinal, mobileRatio),
+    shardId: user.shardId || shardId,
+    targetCourseId: user.targetCourseId || courseId,
+    targetLessonId: user.targetLessonId || lessonId,
+    });
+  });
 };
 
 const loginPreparedUser = async (email: string, viewerId: number) => {
@@ -396,19 +488,54 @@ const loginPreparedUser = async (email: string, viewerId: number) => {
   return String(payload.token);
 };
 
-const getViewport = (viewerId: number): 'desktop' | 'mobile' => {
-  if (mobileRatio <= 0) {
-    return 'desktop';
+const ensurePreparedUserToken = async (user: PreparedUser, viewerId: number) => {
+  const email = String(user.email || '').trim();
+  const cachedToken = preparedSessionTokenCache.get(email);
+  if (cachedToken && !forceLoginRefresh) {
+    return cachedToken;
   }
-  const mobileEvery = Math.max(1, Math.round(1 / Math.max(mobileRatio, 0.01)));
-  return viewerId % mobileEvery === 0 ? 'mobile' : 'desktop';
+
+  const candidateToken = !forceLoginRefresh ? String(user.token || '').trim() : '';
+  if (candidateToken) {
+    const response = await fetch(new URL('/backend/api/auth/session', apiOrigin), {
+      headers: {
+        authorization: `Bearer ${candidateToken}`,
+      },
+    }).catch(() => null);
+    if (response?.ok) {
+      preparedSessionTokenCache.set(email, candidateToken);
+      return candidateToken;
+    }
+  }
+
+  const freshToken = await loginPreparedUser(email, viewerId);
+  preparedSessionTokenCache.set(email, freshToken);
+  return freshToken;
 };
 
-const setPreparedSession = async (page: Page, token: string) => {
-  await page.evaluateOnNewDocument((authToken) => {
+const getViewport = (user: PreparedUser, viewerId: number): DeviceClass =>
+  user.deviceClass || assignDeviceClass(Math.max(0, viewerId - 1), mobileRatio);
+
+const setPreparedSession = async (
+  page: Page,
+  token: string,
+  deviceId: string,
+  playbackTabId: string,
+) => {
+  await page.evaluateOnNewDocument((authToken, nextDeviceId, nextPlaybackTabId) => {
     window.localStorage.setItem('edumaster.jwt', authToken);
-  }, token);
+    window.localStorage.setItem('edumaster.device.id', nextDeviceId);
+    window.sessionStorage.setItem('edumaster.playback.tab.id', nextPlaybackTabId);
+  }, token, deviceId, playbackTabId);
+  await page.evaluate((authToken, nextDeviceId, nextPlaybackTabId) => {
+    window.localStorage.setItem('edumaster.jwt', authToken);
+    window.localStorage.setItem('edumaster.device.id', nextDeviceId);
+    window.sessionStorage.setItem('edumaster.playback.tab.id', nextPlaybackTabId);
+  }, token, deviceId, playbackTabId).catch(() => undefined);
 };
+
+const hasAuthSessionFailure = (networkFailures: Array<{ status: number; url: string }>) =>
+  networkFailures.some((failure) => failure.status === 401 && /\/backend\/api\/auth\/session(?:\?|$)/.test(failure.url));
 
 const waitForSelectorOptional = async (page: Page, selector: string, timeoutMs: number) => page
   .waitForSelector(selector, { timeout: timeoutMs })
@@ -605,7 +732,7 @@ const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number, label: str
 const takeShot = async (page: Page, root: string, label: string) => {
   const target = artifactPath(root, 'course-video-browser-concurrency', label, 'png');
   await withTimeout(
-    page.screenshot({ path: target, fullPage: true }),
+    page.screenshot({ path: target, fullPage: fullPageScreenshots }),
     screenshotTimeoutMs,
     `Screenshot ${label}`,
   );
@@ -623,6 +750,188 @@ const takeShotBestEffort = async (
   } catch (error) {
     warnings.push(error instanceof Error ? error.message : String(error));
     return '';
+  }
+};
+
+const shouldCaptureViewerScreenshots = (viewerId: number) =>
+  screenshotAllViewers || viewerId <= screenshotSample;
+
+const hasUsableMidStreamEvidence = (result: Pick<ViewerResult, 'midStreamEvidence'>) =>
+  Number(result.midStreamEvidence?.currentTime || 0) > 0
+  && !result.midStreamEvidence?.playbackConflictVisible
+  && !result.midStreamEvidence?.unavailableVisible
+  && result.midStreamEvidence?.paused === false;
+
+const waitForPlaybackReady = async (page: Page) => {
+  await page.waitForFunction(() => {
+    const videos = Array.from(document.querySelectorAll('video')) as HTMLVideoElement[];
+    return videos.some((video) => Boolean(video && !video.paused && video.readyState >= 2));
+  }, { timeout: 15_000 }).catch(() => undefined);
+};
+
+const applySpeedPreference = async (page: Page, speedValue: string) => {
+  await page.evaluate((value, speedSelector) => {
+    const select = document.querySelector(speedSelector) as HTMLSelectElement | null;
+    const video = Array.from(document.querySelectorAll('video')).find(Boolean) as HTMLVideoElement | undefined;
+    if (select && Array.from(select.options).some((option) => option.value === value)) {
+      select.value = value;
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    if (video) {
+      video.playbackRate = Number(value) || 1;
+    }
+  }, speedValue, selectors.coursePlayerSpeed);
+  await sleep(500);
+};
+
+const applyQualityPreference = async (page: Page, strategy: 'highest' | 'lowest') => {
+  const changed = await page.evaluate((qualitySelector, qualityStatusSelector, selectionStrategy) => {
+    const select = document.querySelector(qualitySelector) as HTMLSelectElement | null;
+    const statusText = (document.querySelector(qualityStatusSelector)?.textContent || '').trim().toLowerCase();
+    if (!select || select.options.length <= 1 || /auto quality only/.test(statusText)) {
+      return { changed: false, value: null, reason: 'quality-not-supported' };
+    }
+    const options = Array.from(select.options)
+      .map((option) => {
+        const numeric = Number(option.value || option.textContent || 0);
+        return {
+          value: option.value,
+          numeric: Number.isFinite(numeric) ? numeric : 0,
+        };
+      })
+      .filter((option) => option.value);
+    if (!options.length) {
+      return { changed: false, value: null, reason: 'no-options' };
+    }
+    options.sort((left, right) => left.numeric - right.numeric);
+    const selected = selectionStrategy === 'highest' ? options[options.length - 1] : options[0];
+    if (!selected?.value) {
+      return { changed: false, value: null, reason: 'invalid-selection' };
+    }
+    select.value = selected.value;
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    return { changed: true, value: selected.value, reason: null };
+  }, selectors.coursePlayerQuality, selectors.coursePlayerQualityStatus, strategy);
+  await sleep(changed.changed ? 1_250 : 250);
+  return changed;
+};
+
+const clickRewatchIfVisible = async (page: Page) =>
+  page.evaluate((rewatchSelector) => {
+    const button = document.querySelector(rewatchSelector) as HTMLButtonElement | null;
+    if (!button) {
+      return false;
+    }
+    button.click();
+    return true;
+  }, selectors.coursePlayerRewatchVideo).catch(() => false);
+
+const runPersonaFlow = async (
+  page: Page,
+  user: PreparedUser,
+  persona: VideoViewerPersona,
+  viewerId: number,
+  stage: number,
+  screenshotRoot: string,
+  screenshots: string[],
+  consoleErrors: string[],
+  navigationSnapshots: ViewerNavigationSnapshot[],
+  watchStartState: { duration: number | null; currentTime: number | null },
+) => {
+  switch (persona) {
+    case 'speed_1_5':
+      await applySpeedPreference(page, '1.5');
+      if (shouldCaptureViewerScreenshots(viewerId)) {
+        screenshots.push(await takeShotBestEffort(page, screenshotRoot, `stage-${stage}-viewer-${viewerId}-speed-1-5x`, consoleErrors));
+      }
+      break;
+    case 'quality_high':
+      await applyQualityPreference(page, 'highest');
+      if (shouldCaptureViewerScreenshots(viewerId)) {
+        screenshots.push(await takeShotBestEffort(page, screenshotRoot, `stage-${stage}-viewer-${viewerId}-quality-high`, consoleErrors));
+      }
+      break;
+    case 'quality_low':
+      await applyQualityPreference(page, 'lowest');
+      if (shouldCaptureViewerScreenshots(viewerId)) {
+        screenshots.push(await takeShotBestEffort(page, screenshotRoot, `stage-${stage}-viewer-${viewerId}-quality-low`, consoleErrors));
+      }
+      break;
+    case 'seek_middle':
+      await page.evaluate((explicitDuration) => {
+        const video = Array.from(document.querySelectorAll('video')).find(Boolean) as HTMLVideoElement | undefined;
+        if (!video) {
+          return;
+        }
+        const duration = Number.isFinite(video.duration) ? video.duration : explicitDuration;
+        if (!duration || duration <= 0) {
+          return;
+        }
+        video.currentTime = Math.max(5, Math.min(duration / 2, duration - 5));
+      }, watchStartState.duration);
+      await waitForPlaybackReady(page);
+      if (shouldCaptureViewerScreenshots(viewerId)) {
+        screenshots.push(await takeShotBestEffort(page, screenshotRoot, `stage-${stage}-viewer-${viewerId}-seek-middle`, consoleErrors));
+      }
+      break;
+    case 'pause_resume':
+      await toggleVideoPlayback(page, true);
+      await sleep(1_250);
+      if (shouldCaptureViewerScreenshots(viewerId)) {
+        screenshots.push(await takeShotBestEffort(page, screenshotRoot, `stage-${stage}-viewer-${viewerId}-paused`, consoleErrors));
+      }
+      await toggleVideoPlayback(page, false);
+      await waitForPlaybackReady(page);
+      if (shouldCaptureViewerScreenshots(viewerId)) {
+        screenshots.push(await takeShotBestEffort(page, screenshotRoot, `stage-${stage}-viewer-${viewerId}-resumed`, consoleErrors));
+      }
+      break;
+    case 'refresh_resume':
+      await refreshLessonAndResume(page, user, navigationSnapshots);
+      if (shouldCaptureViewerScreenshots(viewerId)) {
+        screenshots.push(await takeShotBestEffort(page, screenshotRoot, `stage-${stage}-viewer-${viewerId}-after-refresh`, consoleErrors));
+      }
+      break;
+    case 'partial_rewatch':
+      await sleep(3_000);
+      await page.evaluate(() => {
+        const video = Array.from(document.querySelectorAll('video')).find(Boolean) as HTMLVideoElement | undefined;
+        if (!video) {
+          return;
+        }
+        video.currentTime = 5;
+      });
+      await waitForPlaybackReady(page);
+      if (shouldCaptureViewerScreenshots(viewerId)) {
+        screenshots.push(await takeShotBestEffort(page, screenshotRoot, `stage-${stage}-viewer-${viewerId}-partial-rewatch`, consoleErrors));
+      }
+      break;
+    case 'end_seek_rewatch': {
+      const endTarget = typeof watchStartState.duration === 'number' && watchStartState.duration > 12
+        ? watchStartState.duration - 6
+        : null;
+      if (endTarget != null) {
+        await page.evaluate((target) => {
+          const video = Array.from(document.querySelectorAll('video')).find(Boolean) as HTMLVideoElement | undefined;
+          if (video) {
+            video.currentTime = target;
+          }
+        }, endTarget);
+        await sleep(5_000);
+      }
+      const clicked = await clickRewatchIfVisible(page);
+      if (!clicked) {
+        await refreshLessonAndResume(page, user, navigationSnapshots);
+      }
+      await waitForPlaybackReady(page);
+      if (shouldCaptureViewerScreenshots(viewerId)) {
+        screenshots.push(await takeShotBestEffort(page, screenshotRoot, `stage-${stage}-viewer-${viewerId}-rewatch-cycle`, consoleErrors));
+      }
+      break;
+    }
+    case 'standard_auto':
+    default:
+      break;
   }
 };
 
@@ -1131,7 +1440,8 @@ const runViewer = async (
   viewerId: number,
   stage: number,
 ): Promise<ViewerResult> => {
-  const viewport = getViewport(viewerId);
+  const viewport = getViewport(user, viewerId);
+  const persona = user.persona || assignVideoViewerPersona(Math.max(0, viewerId - 1));
   const ownedBrowser = browser ? null : await puppeteer.launch({
     executablePath: chromePath,
     headless: true,
@@ -1166,7 +1476,7 @@ const runViewer = async (
   const failureSourcePath = path.join(ctx.sourceDir, `course-video-browser-stage-${stage}-viewer-${viewerId}-failure.html`);
   const startedAt = new Map<string, number>();
   const screenshots: string[] = [];
-  const shouldCapture = viewerId <= screenshotSample;
+  const shouldCapture = shouldCaptureViewerScreenshots(viewerId);
   let playStartedAt: number | null = null;
   let midStreamEvidence: ViewerResult['midStreamEvidence'] = null;
 
@@ -1250,14 +1560,24 @@ const runViewer = async (
       }
     });
 
-    const freshToken = await loginPreparedUser(user.email, viewerId);
-    await setPreparedSession(page, freshToken);
+    const preparedToken = await ensurePreparedUserToken(user, viewerId);
+    const playbackIdentity = buildStablePlaybackIdentity(user);
+    await setPreparedSession(page, preparedToken, playbackIdentity.deviceId, playbackIdentity.playbackTabId);
     videoEvents = await installVideoEventProbe(page);
     await gotoWithRecovery(page, lessonUrl, navigationSnapshots, 'lesson-direct');
-    const usedInteractiveLogin = await loginIfNeeded(page, user.email);
+    let usedInteractiveLogin = await loginIfNeeded(page, user.email);
     if (usedInteractiveLogin) {
       navigationSnapshots.push(await readNavigationSnapshot(page, 'after-login'));
       await gotoWithRecovery(page, lessonUrl, navigationSnapshots, 'lesson-direct-after-login');
+    } else if (hasAuthSessionFailure(networkFailures)) {
+      const freshToken = await loginPreparedUser(user.email, viewerId);
+      await setPreparedSession(page, freshToken, playbackIdentity.deviceId, playbackIdentity.playbackTabId);
+      await gotoWithRecovery(page, lessonUrl, navigationSnapshots, 'lesson-direct-after-session-refresh');
+      usedInteractiveLogin = await loginIfNeeded(page, user.email);
+      if (usedInteractiveLogin) {
+        navigationSnapshots.push(await readNavigationSnapshot(page, 'after-login'));
+        await gotoWithRecovery(page, lessonUrl, navigationSnapshots, 'lesson-direct-after-login');
+      }
     }
     await openPlayableLesson(page, navigationSnapshots);
     if (shouldCapture) {
@@ -1300,68 +1620,43 @@ const runViewer = async (
       if (typeof firstProgressState.currentTime === 'number') {
         maxCurrentTimeObserved = Math.max(maxCurrentTimeObserved || 0, firstProgressState.currentTime);
       }
+      midStreamEvidence = {
+        screenshotPath: null,
+        currentTime: firstProgressState.currentTime,
+        duration: firstProgressState.duration,
+        paused: firstProgressState.paused,
+        readyState: firstProgressState.readyState,
+        playbackConflictVisible: firstProgressState.playbackConflictVisible,
+        unavailableVisible: firstProgressState.unavailableVisible,
+      };
       if (captureMidStreamScreenshots && shouldCapture) {
         const midStreamScreenshotPath = await takeShotBestEffort(page, ctx.screenshotDir, `stage-${stage}-viewer-${viewerId}-mid-stream`, consoleErrors);
         if (midStreamScreenshotPath) {
-          midStreamEvidence = {
-            screenshotPath: midStreamScreenshotPath,
-            currentTime: firstProgressState.currentTime,
-            duration: firstProgressState.duration,
-            paused: firstProgressState.paused,
-            readyState: firstProgressState.readyState,
-            playbackConflictVisible: firstProgressState.playbackConflictVisible,
-            unavailableVisible: firstProgressState.unavailableVisible,
-          };
+          midStreamEvidence.screenshotPath = midStreamScreenshotPath;
           screenshots.push(midStreamScreenshotPath);
         }
       }
-      await seekVideo(page, 45);
-      if (shouldCapture) {
-        screenshots.push(await takeShotBestEffort(page, ctx.screenshotDir, `stage-${stage}-viewer-${viewerId}-seek-forward`, consoleErrors));
-      }
-      await sleep(Math.round(watchWindowMs / 3));
+      await runPersonaFlow(
+        page,
+        user,
+        persona,
+        viewerId,
+        stage,
+        ctx.screenshotDir,
+        screenshots,
+        consoleErrors,
+        navigationSnapshots,
+        {
+          duration: firstProgressState.duration,
+          currentTime: firstProgressState.currentTime,
+        },
+      );
+
+      await sleep(Math.max(4_000, Math.round(watchWindowMs / 5)));
       const secondProgressState = await readVideoState(page);
       if (typeof secondProgressState.currentTime === 'number') {
         maxCurrentTimeObserved = Math.max(maxCurrentTimeObserved || 0, secondProgressState.currentTime);
       }
-      await seekVideo(page, -30);
-      if (shouldCapture) {
-        screenshots.push(await takeShotBestEffort(page, ctx.screenshotDir, `stage-${stage}-viewer-${viewerId}-seek-backward`, consoleErrors));
-      }
-      await sleep(Math.max(2_000, Math.round(watchWindowMs / 8)));
-
-      await toggleVideoPlayback(page, true);
-      await sleep(1_000);
-      if (shouldCapture) {
-        screenshots.push(await takeShotBestEffort(page, ctx.screenshotDir, `stage-${stage}-viewer-${viewerId}-paused`, consoleErrors));
-      }
-
-      const beforePauseResumeState = await readVideoState(page);
-      const beforePauseResumeTime = typeof beforePauseResumeState.currentTime === 'number'
-        ? beforePauseResumeState.currentTime
-        : 0;
-      await toggleVideoPlayback(page, false);
-      await page.waitForFunction((resumeFloor) => {
-        const videos = Array.from(document.querySelectorAll('video')) as HTMLVideoElement[];
-        return videos.some((video) => Boolean(
-          video
-          && !video.paused
-          && video.readyState >= 2
-          && video.currentTime >= resumeFloor,
-        ));
-      }, { timeout: 15_000 }, Math.max(beforePauseResumeTime, 1)).catch(() => undefined);
-      if (shouldCapture) {
-        screenshots.push(await takeShotBestEffort(page, ctx.screenshotDir, `stage-${stage}-viewer-${viewerId}-resumed`, consoleErrors));
-      }
-
-      await sleep(Math.max(2_000, Math.round(watchWindowMs / 8)));
-
-      await refreshLessonAndResume(page, user, navigationSnapshots);
-      if (shouldCapture) {
-        screenshots.push(await takeShotBestEffort(page, ctx.screenshotDir, `stage-${stage}-viewer-${viewerId}-after-refresh`, consoleErrors));
-      }
-
-      await sleep(Math.max(5_000, watchWindowMs - Math.round((watchWindowMs / 3) * 2)));
     }
 
     const finalState = await readVideoState(page);
@@ -1431,6 +1726,9 @@ const runViewer = async (
       viewerId,
       email: user.email,
       viewport,
+      persona,
+      personaDescription: describeVideoPersona(persona),
+      shardId: user.shardId || shardId,
       ok,
       stage,
       currentTimeStart: normalizedCurrentTimeStart,
@@ -1546,6 +1844,9 @@ const runViewer = async (
       viewerId,
       email: user.email,
       viewport,
+      persona,
+      personaDescription: describeVideoPersona(persona),
+      shardId: user.shardId || shardId,
       ok: false,
       stage,
       currentTimeStart,
@@ -1587,6 +1888,9 @@ const runViewer = async (
       viewerId,
       email: user.email,
       viewport,
+      persona,
+      personaDescription: describeVideoPersona(persona),
+      shardId: user.shardId || shardId,
       deliveryPath: loggedDeliveryPath,
       midStreamEvidence,
       consoleErrors,
@@ -1614,7 +1918,7 @@ const runStage = async (
   viewers: number,
 ): Promise<StageSummary> => {
   const stageStartedAt = new Date().toISOString();
-  const stageUsers = users.slice(0, viewers);
+  const stageUsers = selectStageUsers(users, viewers);
   const queue = stageUsers.map((user, index) => ({ user, viewerId: index + 1 }));
   const results: ViewerResult[] = [];
 
@@ -1631,7 +1935,23 @@ const runStage = async (
   await Promise.all(Array.from({ length: Math.min(stageConcurrencyCap, viewers) }, worker));
 
   const resultsPath = path.join(ctx.analysisDir, `course-video-browser-stage-${viewers}-results.json`);
+  const artifactManifestPath = path.join(ctx.analysisDir, `course-video-browser-stage-${viewers}-artifact-manifest.json`);
   await writeJson(resultsPath, results);
+  await writeJson(artifactManifestPath, {
+    stage: viewers,
+    workerLabel,
+    shardId,
+    users: results.map((result) => ({
+      viewerId: result.viewerId,
+      email: result.email,
+      persona: result.persona,
+      viewport: result.viewport,
+      shardId: result.shardId,
+      ok: result.ok,
+      screenshots: result.screenshots,
+      resultsPath,
+    })),
+  });
 
   const successes = results.filter((result) => result.ok);
   const startupDelays = successes.map((result) => result.startupDelayMs).filter((value): value is number => typeof value === 'number');
@@ -1650,33 +1970,28 @@ const runStage = async (
     summary[result.deliveryPath || 'unknown'] += 1;
     return summary;
   }, createDeliveryPathBreakdown());
-  const desktopMidStreamScreenshots = results
-    .filter((result) =>
-      result.viewport === 'desktop'
-      && Boolean(result.midStreamEvidence?.screenshotPath)
-      && Number(result.midStreamEvidence?.currentTime || 0) > 0
-      && !result.midStreamEvidence?.playbackConflictVisible
-      && !result.midStreamEvidence?.unavailableVisible
-      && result.midStreamEvidence?.paused === false,
-    )
+  const desktopMidStreamEvidenceResults = results.filter((result) =>
+    result.viewport === 'desktop' && hasUsableMidStreamEvidence(result),
+  );
+  const mobileMidStreamEvidenceResults = results.filter((result) =>
+    result.viewport === 'mobile' && hasUsableMidStreamEvidence(result),
+  );
+  const desktopMidStreamScreenshots = desktopMidStreamEvidenceResults
     .map((result) => String(result.midStreamEvidence?.screenshotPath || ''))
     .filter(Boolean);
-  const mobileMidStreamScreenshots = results
-    .filter((result) =>
-      result.viewport === 'mobile'
-      && Boolean(result.midStreamEvidence?.screenshotPath)
-      && Number(result.midStreamEvidence?.currentTime || 0) > 0
-      && !result.midStreamEvidence?.playbackConflictVisible
-      && !result.midStreamEvidence?.unavailableVisible
-      && result.midStreamEvidence?.paused === false,
-    )
+  const mobileMidStreamScreenshots = mobileMidStreamEvidenceResults
     .map((result) => String(result.midStreamEvidence?.screenshotPath || ''))
     .filter(Boolean);
+  const hasDesktopParticipants = results.some((result) => result.viewport === 'desktop');
+  const hasMobileParticipants = results.some((result) => result.viewport === 'mobile');
   const midStreamRequirementSatisfied = !captureMidStreamScreenshots
-    || (desktopMidStreamScreenshots.length > 0 && mobileMidStreamScreenshots.length > 0);
+    || ((!hasDesktopParticipants || desktopMidStreamEvidenceResults.length > 0)
+      && (!hasMobileParticipants || mobileMidStreamEvidenceResults.length > 0));
 
   return {
     viewers,
+    workerLabel,
+    shardId,
     startedAt: stageStartedAt,
     completedAt: new Date().toISOString(),
     ok: results.every((result) => result.ok) && midStreamRequirementSatisfied,
@@ -1695,10 +2010,13 @@ const runStage = async (
     p99ProgressSeconds: percentile(progressedSeconds, 99),
     midStreamRequirementSatisfied,
     midStreamEvidence: {
+      desktopEvidenceViewers: desktopMidStreamEvidenceResults.map((result) => result.viewerId),
+      mobileEvidenceViewers: mobileMidStreamEvidenceResults.map((result) => result.viewerId),
       desktopScreenshots: desktopMidStreamScreenshots,
       mobileScreenshots: mobileMidStreamScreenshots,
     },
     resultsPath,
+    artifactManifestPath,
     screenshotDir: ctx.screenshotDir,
   };
 };
@@ -1751,6 +2069,8 @@ const main = async () => {
     watchWindowMs,
     stageConcurrencyCap,
     captureMidStreamScreenshots,
+    workerLabel,
+    shardId,
     overallOk,
     notes,
   };
@@ -1770,6 +2090,8 @@ const main = async () => {
       `- Playback activation timeout: ${playbackActivationTimeoutMs} ms`,
       `- First-frame timeout: ${firstFrameTimeoutMs} ms`,
       `- Stage concurrency cap: ${stageConcurrencyCap}`,
+      `- Worker label: ${workerLabel}`,
+      `- Shard id: ${shardId || 'none'}`,
       `- Mid-stream screenshots enabled: ${captureMidStreamScreenshots ? 'yes' : 'no'}`,
       `- Separate browser per viewer: ${separateBrowserPerViewer ? 'yes' : 'no'}`,
       `- Overall result: ${overallOk ? 'passed' : 'failed'}`,
@@ -1785,9 +2107,12 @@ const main = async () => {
         `- Startup delay avg/p95/p99: ${stage.averageStartupDelayMs ?? 'n/a'} / ${stage.p95StartupDelayMs ?? 'n/a'} / ${stage.p99StartupDelayMs ?? 'n/a'} ms`,
         `- Progress avg/p95/p99: ${stage.averageProgressSeconds ?? 'n/a'} / ${stage.p95ProgressSeconds ?? 'n/a'} / ${stage.p99ProgressSeconds ?? 'n/a'} s`,
         `- Mid-stream evidence requirement: ${stage.midStreamRequirementSatisfied ? 'satisfied' : 'missing'}`,
+        `- Mid-stream desktop evidence viewers: ${stage.midStreamEvidence.desktopEvidenceViewers.length ? stage.midStreamEvidence.desktopEvidenceViewers.join(', ') : 'none'}`,
+        `- Mid-stream mobile evidence viewers: ${stage.midStreamEvidence.mobileEvidenceViewers.length ? stage.midStreamEvidence.mobileEvidenceViewers.join(', ') : 'none'}`,
         `- Mid-stream desktop screenshots: ${stage.midStreamEvidence.desktopScreenshots.length ? stage.midStreamEvidence.desktopScreenshots.join(', ') : 'none'}`,
         `- Mid-stream mobile screenshots: ${stage.midStreamEvidence.mobileScreenshots.length ? stage.midStreamEvidence.mobileScreenshots.join(', ') : 'none'}`,
         `- Results: ${stage.resultsPath}`,
+        `- Artifact manifest: ${stage.artifactManifestPath}`,
       ].join('\n')),
       '',
       'Notes:',
@@ -1802,8 +2127,12 @@ const main = async () => {
 };
 
 if (process.argv[1]?.endsWith('course-video-browser-concurrency-review.ts')) {
-  void main().catch((error) => {
-    console.error(error instanceof Error ? error.stack || error.message : String(error));
-    process.exitCode = 1;
-  });
+  void main()
+    .catch((error) => {
+      console.error(error instanceof Error ? error.stack || error.message : String(error));
+      process.exitCode = 1;
+    })
+    .finally(() => {
+      process.exit(process.exitCode || 0);
+    });
 }

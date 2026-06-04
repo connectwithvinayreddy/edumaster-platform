@@ -5,6 +5,7 @@ import { selectors } from './selectors.js';
 import { createRunContext, sleep, writeJson, writeText } from './utils.js';
 
 const desktopViewport = { width: 1536, height: 1024 };
+const targetTestTitle = String(process.env.QA_TEST_TITLE || '').trim();
 
 const apiOrigin = (() => {
   const url = new URL(process.env.QA_BASE_URL || config.baseUrl);
@@ -89,6 +90,28 @@ const clickButtonMatching = async (page: puppeteer.Page, matcher: RegExp) => {
   }
 };
 
+const clickTestByTitle = async (page: puppeteer.Page, title: string) => page.evaluate((targetTitle) => {
+  const normalizedTarget = targetTitle.toLowerCase().trim();
+  const nodes = [...document.querySelectorAll('button')] as HTMLElement[];
+  for (const node of nodes) {
+    const text = (node.textContent || '').toLowerCase();
+    if (!text.includes(normalizedTarget)) {
+      continue;
+    }
+
+    const style = window.getComputedStyle(node);
+    const rect = node.getBoundingClientRect();
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0' || rect.width <= 0 || rect.height <= 0) {
+      continue;
+    }
+
+    node.click();
+    return true;
+  }
+
+  return false;
+}, title);
+
 const ensureChecked = async (page: puppeteer.Page, selector: string) => {
   await page.waitForSelector(selector, { timeout: 30000 });
   await page.evaluate((targetSelector) => {
@@ -146,7 +169,10 @@ const run = async () => {
     await waitForAnySelector(page, [selectors.testsFigmaPage, selectors.testsHomeDesktop]);
     await sleep(700);
 
-    await clickVisible(page, selectors.testsOpenPrimary);
+    const clickedTargetTest = targetTestTitle ? await clickTestByTitle(page, targetTestTitle) : false;
+    if (!clickedTargetTest) {
+      await clickVisible(page, selectors.testsOpenPrimary);
+    }
     await sleep(700);
 
     if (await page.$(selectors.testsDetailDesktop)) {

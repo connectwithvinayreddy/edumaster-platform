@@ -388,6 +388,29 @@ const formatMetricValue = (value: number) => {
   return value.toFixed(2).replace(/\.?0+$/, '');
 };
 
+const getQaMockTimerOverrideSeconds = () => {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+
+  const rawValue = window.localStorage.getItem('qa.mock_test_timer_override_seconds');
+  if (!rawValue) {
+    return null;
+  }
+
+  const parsed = Number(rawValue);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null;
+};
+
+const getInitialTimeLeftForTest = (test: MockTest | null | undefined) => {
+  const overrideSeconds = getQaMockTimerOverrideSeconds();
+  if (overrideSeconds !== null) {
+    return overrideSeconds;
+  }
+
+  return Math.max(Number(test?.durationMinutes || 0), 0) * 60;
+};
+
 const getDraftStorageKey = (userId?: string | null) => `${TEST_SERIES_DRAFT_STORAGE_PREFIX}:${userId || 'anonymous'}`;
 
 const getSafeIsoTimestamp = (value: string | null | undefined) => {
@@ -1203,6 +1226,14 @@ export const TestSeriesFigmaTab = ({
     ?? (overview.dashboard.latestMockTest && selectedTest?._id && overview.dashboard.latestMockTest.testId === selectedTest._id
       ? overview.dashboard.latestMockTest.rank
       : null);
+  const resultPercentile = currentSubmittedAttempt?.percentile
+    ?? (overview.dashboard.latestMockTest && selectedTest?._id && overview.dashboard.latestMockTest.testId === selectedTest._id
+      ? overview.dashboard.latestMockTest.percentile
+      : null);
+  const resultRankStatus = currentSubmittedAttempt?.rankStatus
+    ?? (resultRank !== null || resultPercentile !== null ? 'ready' : 'pending');
+  const resultNegativeMarking = formatMetricValue(Number(selectedTest?.negativeMarking || 0));
+  const resultMarksPerQuestion = formatMetricValue(Number(questions[0]?.marks || selectedTest?.questions?.[0]?.marks || 1));
   const solutionFilterSummary = [
     { id: 'all', label: `All (${attemptResults.length})`, tone: 'active' as const },
     { id: 'correct', label: `Correct (${correctCount})`, tone: 'success' as const },
@@ -1400,7 +1431,7 @@ export const TestSeriesFigmaTab = ({
     setAnswers({});
     setReview({});
     setCurrentIndex(0);
-    setTimeLeft(Math.max(Number(selectedTest?.durationMinutes || 0), 0) * 60);
+    setTimeLeft(getInitialTimeLeftForTest(selectedTest));
     setDefaultLanguage('English');
     setSelectedLanguage('English');
     setConfirmationAccepted(false);
@@ -1409,7 +1440,7 @@ export const TestSeriesFigmaTab = ({
     setQuestionZoom(0);
     setDraftAnswer([]);
     setDraftReview(false);
-  }, [attemptSessions, selectedTest?._id, selectedTest?.durationMinutes]);
+  }, [attemptSessions, selectedTest]);
 
   useEffect(() => {
     setDraftAnswer(answers[currentIndex] ?? []);
@@ -1439,6 +1470,14 @@ export const TestSeriesFigmaTab = ({
 
     return () => window.clearInterval(timer);
   }, [screen]);
+
+  useEffect(() => {
+    if (screen !== 'exam' || timeLeft > 0 || submittingExam || currentSubmittedAttempt) {
+      return;
+    }
+
+    void submitExam();
+  }, [currentSubmittedAttempt, screen, submittingExam, timeLeft]);
 
   useEffect(() => {
     if (screen !== 'exam' || currentAttemptStatus !== 'in-progress') {
@@ -1488,12 +1527,66 @@ export const TestSeriesFigmaTab = ({
     visitedQuestions,
   ]);
 
+  useEffect(() => {
+    if (
+      !currentTestId
+      || !currentSubmittedAttempt
+      || currentSubmittedAttempt.rankStatus !== 'pending'
+      || !['result', 'solutions'].includes(screen)
+    ) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    let timeoutId = 0;
+
+    const pollAttempt = async () => {
+      try {
+        const attempts = await EduService.listMockTestAttempts();
+        if (cancelled) {
+          return;
+        }
+
+        const nextAttempt = attempts.find((attempt) => attempt.testId === currentTestId) || null;
+        if (nextAttempt) {
+          setSubmittedAttempts((current) => ({
+            ...current,
+            [nextAttempt.testId]: nextAttempt,
+          }));
+        }
+
+        await onRefresh();
+
+        if (!cancelled && nextAttempt?.rankStatus === 'pending') {
+          timeoutId = window.setTimeout(() => {
+            void pollAttempt();
+          }, 2000);
+        }
+      } catch {
+        if (!cancelled) {
+          timeoutId = window.setTimeout(() => {
+            void pollAttempt();
+          }, 3500);
+        }
+      }
+    };
+
+    timeoutId = window.setTimeout(() => {
+      void pollAttempt();
+    }, 1500);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+    };
+  }, [currentSubmittedAttempt, currentTestId, onRefresh, screen]);
+
   const resetAttemptState = () => {
     setVisitedQuestions({});
     setAnswers({});
     setReview({});
     setCurrentIndex(0);
-    setTimeLeft(Math.max(Number(selectedTest?.durationMinutes || 0), 0) * 60);
+    setTimeLeft(getInitialTimeLeftForTest(selectedTest));
     setDefaultLanguage('English');
     setSelectedLanguage('English');
     setConfirmationAccepted(false);
@@ -1735,7 +1828,7 @@ export const TestSeriesFigmaTab = ({
       ? existingSession.visitedQuestions
       : { 0: true });
     setCurrentIndex(existingSession?.currentIndex ?? 0);
-    setTimeLeft(existingSession?.timeLeft ?? Math.max(Number(selectedTest?.durationMinutes || 0), 0) * 60);
+    setTimeLeft(existingSession?.timeLeft ?? getInitialTimeLeftForTest(selectedTest));
     setScreen('exam');
   };
 
@@ -2131,9 +2224,9 @@ export const TestSeriesFigmaTab = ({
           <ol className="mt-4 list-decimal space-y-3 pl-6 text-[13px] leading-8 text-slate-800">
             <li>The test contains {examMeta.totalQuestions} total questions.</li>
             <li>Each question has 4 Options out of which only one is correct.</li>
-            <li>You have to finish the test in 120 minutes.</li>
+            <li>You have to finish the test in {selectedTest?.durationMinutes || 0} minutes.</li>
             <li>Try not to guess the answer as there is negative marking.</li>
-            <li>You will be awarded 3 mark for each correct answer and 1 will be deducted for each wrong answer.</li>
+            <li>You will be awarded {resultMarksPerQuestion} mark for each correct answer and {resultNegativeMarking} will be deducted for each wrong answer.</li>
             <li>There is no negative marking for the questions that you have not attempted.</li>
             <li>You can submit this test only once. If you leave before submitting, your test stays paused and you can resume it later.</li>
           </ol>
@@ -2359,7 +2452,7 @@ export const TestSeriesFigmaTab = ({
           </button>
           <div className="px-1 text-right">
             <p className="text-[11px] font-semibold text-slate-800">Time Left</p>
-            <p className="mt-1 bg-[#fff36d] px-3 py-1 text-[17px] font-bold tracking-[0.08em] text-red-600">{formatClock(timeLeft)}</p>
+            <p data-testid="tests-exam-timer-desktop" className="mt-1 bg-[#fff36d] px-3 py-1 text-[17px] font-bold tracking-[0.08em] text-red-600">{formatClock(timeLeft)}</p>
           </div>
           <div className="flex gap-2">
             <div className="w-[78px] text-center">
@@ -3008,16 +3101,16 @@ export const TestSeriesFigmaTab = ({
       <div className="mt-[14px] rounded-[18px] border border-[#ebeef6] bg-white px-[18px] py-[22px] shadow-[0_10px_24px_rgba(18,39,74,0.06)]">
         <h1 className="text-center text-[20px] font-semibold text-[#1f2737]">{examMeta.examTitle}</h1>
         <div className="mt-[18px] grid gap-[14px] text-[13px]">
-          <div className="flex items-center gap-[10px]"><Clock3 className="h-4 w-4 text-[#7c889d]" /><div><p className="font-semibold text-[#1f2737]">Duration</p><p className="text-[#7c889d]">120 Minutes</p></div></div>
+          <div className="flex items-center gap-[10px]"><Clock3 className="h-4 w-4 text-[#7c889d]" /><div><p className="font-semibold text-[#1f2737]">Duration</p><p className="text-[#7c889d]">{selectedTest?.durationMinutes || 0} Minutes</p></div></div>
           <div className="flex items-center gap-[10px]"><FileText className="h-4 w-4 text-[#2f8df4]" /><div><p className="font-semibold text-[#1f2737]">Total Questions</p><p className="text-[#7c889d]">{examMeta.totalQuestions}</p></div></div>
           <div className="flex items-center gap-[10px]"><Users className="h-4 w-4 text-[#f4a33b]" /><div><p className="font-semibold text-[#1f2737]">Maximum Marks</p><p className="text-[#7c889d]">{examMeta.marks}</p></div></div>
         </div>
         <ol className="mt-[18px] list-decimal space-y-[8px] pl-[18px] text-[13px] leading-[1.8] text-[#1f2737]">
           <li>The test contains {examMeta.totalQuestions} total questions.</li>
           <li>Each question has 4 options out of which only one is correct.</li>
-          <li>You have to finish the test in 120 minutes.</li>
+          <li>You have to finish the test in {selectedTest?.durationMinutes || 0} minutes.</li>
           <li>Try not to guess the answer as there is negative marking.</li>
-          <li>You will be awarded 3 mark for each correct answer and 1 will be deducted for each wrong answer.</li>
+          <li>You will be awarded {resultMarksPerQuestion} mark for each correct answer and {resultNegativeMarking} will be deducted for each wrong answer.</li>
           <li>There is no negative marking for the questions that you have not attempted.</li>
           <li>You can submit this test only once. If you leave before submitting, your test stays paused and you can resume it later.</li>
         </ol>
@@ -3065,7 +3158,7 @@ export const TestSeriesFigmaTab = ({
         <button className="text-[#17a53b]">PART-A</button>
         <div className="ml-auto text-right">
           <p className="text-[10px] text-[#7c889d]">Time Left</p>
-          <p className="text-[22px] font-bold leading-none text-[#f02020]">{formatClock(timeLeft)}</p>
+          <p data-testid="tests-exam-timer-mobile" className="text-[22px] font-bold leading-none text-[#f02020]">{formatClock(timeLeft)}</p>
         </div>
       </div>
 
@@ -3179,6 +3272,21 @@ export const TestSeriesFigmaTab = ({
           <div className="rounded-[12px] border border-[#edf2f7] p-[10px]"><p className="text-[11px] text-[#7c889d]">Accuracy</p><p className="mt-[6px] text-[18px] font-semibold text-[#1f2737]">{resultAccuracy}%</p></div>
           <div className="rounded-[12px] border border-[#edf2f7] p-[10px]"><p className="text-[11px] text-[#7c889d]">Correct / Wrong</p><p className="mt-[6px] text-[18px] font-semibold text-[#1f2737]">{correctCount} / {incorrectCount}</p></div>
         </div>
+        <div className="mt-[10px] grid grid-cols-2 gap-[10px]">
+          <div className="rounded-[12px] border border-[#edf2f7] p-[10px]">
+            <p className="text-[11px] text-[#7c889d]">Rank</p>
+            <p data-testid="tests-result-rank-mobile" className="mt-[6px] text-[18px] font-semibold text-[#1f2737]">{resultRankStatus === 'ready' && resultRank !== null ? `#${resultRank}` : 'Pending'}</p>
+          </div>
+          <div className="rounded-[12px] border border-[#edf2f7] p-[10px]">
+            <p className="text-[11px] text-[#7c889d]">Percentile</p>
+            <p data-testid="tests-result-percentile-mobile" className="mt-[6px] text-[18px] font-semibold text-[#1f2737]">{resultRankStatus === 'ready' && resultPercentile !== null ? `${formatMetricValue(resultPercentile)}%` : 'Pending'}</p>
+          </div>
+        </div>
+        <p className="mt-[12px] text-[12px] text-[#7c889d]">
+          {resultRankStatus === 'ready'
+            ? 'Ranking is finalized for this mock.'
+            : 'Ranking is being finalized in the background.'}
+        </p>
         <div className="mt-[18px] grid grid-cols-2 gap-[10px]">
         <button type="button" data-testid="tests-view-solutions" onClick={() => setScreen('solutions')} className="flex h-[40px] items-center justify-center rounded-[8px] border border-[#2f8df4] text-[13px] font-semibold text-[#2f8df4]">View Solutions</button>
           <button type="button" onClick={() => setScreen('solutions')} className="flex h-[40px] items-center justify-center rounded-[8px] bg-[#2f8df4] text-[13px] font-semibold text-white">View Analysis</button>
@@ -3201,6 +3309,14 @@ export const TestSeriesFigmaTab = ({
         <button type="button" onClick={() => setScreen('result')} className="text-[#1f2737]"><ChevronLeft className="h-5 w-5" /></button>
         <p className="text-[16px] font-semibold text-[#1f2737]">Solutions</p>
         <button type="button" onClick={() => setScreen('detail')} className="text-[11px] font-semibold text-[#2f8df4]">Tests</button>
+      </div>
+      <div className="mt-[12px] rounded-[14px] border border-[#ebeef6] bg-white px-[14px] py-[12px] text-[12px] text-[#47556d] shadow-[0_10px_24px_rgba(18,39,74,0.06)]">
+        <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-[#7c889d]">Ranking</p>
+        <p data-testid="tests-solutions-rank-mobile" className="mt-[6px] font-semibold text-[#1f2737]">
+          {resultRankStatus === 'ready' && resultRank !== null
+            ? `Rank #${resultRank} · Percentile ${resultPercentile !== null ? `${formatMetricValue(resultPercentile)}%` : 'Pending'}`
+            : 'Pending while the background ranking job finishes.'}
+        </p>
       </div>
         <div className="mt-[16px] flex gap-[8px] text-[11px] font-semibold">
         {solutionFilterSummary.map((item) => (
@@ -3274,7 +3390,17 @@ export const TestSeriesFigmaTab = ({
         <div className="mt-[20px] grid grid-cols-3 gap-[14px]">
           <div className="rounded-[14px] border border-[#edf2f7] p-[14px]"><p className="text-[11px] text-[#7c889d]">Score</p><p className="mt-[8px] text-[22px] font-semibold text-[#1f2737]">{formatMetricValue(resultScore)} / {formatMetricValue(resultTotalMarks)}</p></div>
           <div className="rounded-[14px] border border-[#edf2f7] p-[14px]"><p className="text-[11px] text-[#7c889d]">Accuracy</p><p className="mt-[8px] text-[22px] font-semibold text-[#1f2737]">{resultAccuracy}%</p></div>
-          <div className="rounded-[14px] border border-[#edf2f7] p-[14px]"><p className="text-[11px] text-[#7c889d]">Rank</p><p className="mt-[8px] text-[22px] font-semibold text-[#1f2737]">{resultRank ? `#${resultRank}` : `${correctCount} / ${questions.length} correct`}</p></div>
+          <div className="rounded-[14px] border border-[#edf2f7] p-[14px]"><p className="text-[11px] text-[#7c889d]">Rank</p><p data-testid="tests-result-rank-desktop" className="mt-[8px] text-[22px] font-semibold text-[#1f2737]">{resultRankStatus === 'ready' && resultRank !== null ? `#${resultRank}` : 'Pending'}</p></div>
+        </div>
+        <div className="mt-[14px] grid grid-cols-2 gap-[14px]">
+          <div className="rounded-[14px] border border-[#edf2f7] p-[14px]">
+            <p className="text-[11px] text-[#7c889d]">Percentile</p>
+            <p data-testid="tests-result-percentile-desktop" className="mt-[8px] text-[22px] font-semibold text-[#1f2737]">{resultRankStatus === 'ready' && resultPercentile !== null ? `${formatMetricValue(resultPercentile)}%` : 'Pending'}</p>
+          </div>
+          <div className="rounded-[14px] border border-[#edf2f7] p-[14px]">
+            <p className="text-[11px] text-[#7c889d]">Ranking status</p>
+            <p className="mt-[8px] text-[16px] font-semibold text-[#1f2737]">{resultRankStatus === 'ready' ? 'Ready' : 'Pending'}</p>
+          </div>
         </div>
         <div className="mt-[20px] flex justify-center gap-[10px]">
           <button type="button" data-testid="tests-view-solutions-desktop" onClick={() => setScreen('solutions')} className="flex h-[42px] items-center justify-center rounded-[8px] border border-[#2f8df4] px-[18px] text-[13px] font-semibold text-[#2f8df4]">View Solutions</button>
@@ -3293,6 +3419,14 @@ export const TestSeriesFigmaTab = ({
             <button type="button" onClick={() => setScreen('detail')} className="text-[13px] font-semibold text-[#2f8df4]">Go to tests</button>
             <button type="button" onClick={() => setScreen('result')} className="text-[13px] font-semibold text-[#2f8df4]">Back to result</button>
           </div>
+        </div>
+        <div className="mt-[12px] rounded-[14px] border border-[#edf2f7] bg-[#fafcff] px-[14px] py-[12px]">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-[#7c889d]">Ranking</p>
+          <p data-testid="tests-solutions-rank-desktop" className="mt-[6px] text-[15px] font-semibold text-[#1f2737]">
+            {resultRankStatus === 'ready' && resultRank !== null
+              ? `Rank #${resultRank} · Percentile ${resultPercentile !== null ? `${formatMetricValue(resultPercentile)}%` : 'Pending'}`
+              : 'Pending while the background ranking job finishes.'}
+          </p>
         </div>
         <div className="mt-[14px] flex flex-wrap gap-[8px] text-[11px] font-semibold">
           {solutionFilterSummary.map((item) => (

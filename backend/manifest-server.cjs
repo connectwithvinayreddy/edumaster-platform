@@ -18,13 +18,14 @@ const {
   resolvePrivateHlsPath,
   getProtectedAssetStorageRoot,
 } = require('./lib/private-video.js');
-const { sessionRepository } = require('./lib/repositories.js');
+const { sessionRepository, videoPlaybackRepository } = require('./lib/repositories.js');
 const {
-  getPrivateStorageObjectBuffer,
+  getSignedPrivateVideoUrl,
   isS3Provider,
 } = require('./lib/private-video-storage.js');
 const { getHlsAssetMimeType } = require('./lib/hls-manifest.js');
 const { loadManifestBundle } = require('./lib/manifest-bundle.js');
+const { buildSecurePlaybackClientContext } = require('./lib/secure-playback.js');
 const {
   beginManifestRequest,
   recordBundleCacheStatus,
@@ -45,6 +46,7 @@ const parseCorsOrigin = (value) => {
 };
 
 const MANIFEST_ROUTE_PREFIX = '/course-manifests/b/';
+const INTERNAL_SIGNED_SEGMENT_PROXY_PREFIX = '/__signed_r2_segment_proxy';
 const parseRequestCookies = (req) => String(req.headers.cookie || '')
   .split(';')
   .map((entry) => entry.trim())
@@ -61,6 +63,15 @@ const parseRequestCookies = (req) => String(req.headers.cookie || '')
     return accumulator;
   }, {});
 
+const requestMatchesPlaybackContext = (req, payload = {}) => {
+  if (!payload?.userAgentHash) {
+    return true;
+  }
+
+  const requestContext = buildSecurePlaybackClientContext(req);
+  return String(requestContext.userAgentHash || '') === String(payload.userAgentHash || '');
+};
+
 const getValidHlsGrantFromRequest = async (req, storageRoot) => {
   const cookieToken = parseRequestCookies(req)[HLS_ACCESS_COOKIE_NAME] || '';
   const payload = verifyPlaybackToken(cookieToken);
@@ -70,7 +81,28 @@ const getValidHlsGrantFromRequest = async (req, storageRoot) => {
 
   if (payload.sessionId && payload.userId) {
     const activeSessionId = await sessionRepository.getActiveSessionId(String(payload.userId), String(payload.sessionId));
-    if (activeSessionId !== payload.sessionId) {
+    if (activeSessionId !== payload.sessionId && !(payload.userId && payload.playbackSessionId)) {
+      return null;
+    }
+  }
+
+  if (!requestMatchesPlaybackContext(req, payload)) {
+    return null;
+  }
+
+  if (payload.userId && payload.playbackSessionId) {
+    const requestContext = buildSecurePlaybackClientContext(req);
+    const activePlaybackSession = await videoPlaybackRepository.validatePlaybackSession({
+      userId: String(payload.userId),
+      playbackSessionId: String(payload.playbackSessionId),
+      authSessionId: payload.sessionId || null,
+      courseId: payload.courseId || null,
+      videoId: payload.videoId || null,
+      videoType: payload.videoType || null,
+      requestContext,
+    });
+
+    if (!activePlaybackSession || String(activePlaybackSession.status || '').toLowerCase() === 'locked') {
       return null;
     }
   }
@@ -118,12 +150,27 @@ const parseBundleRequest = (capturedPath) => {
   };
 };
 
+const buildInternalSignedSegmentProxyPath = (signedUrl) => {
+  try {
+    const parsedUrl = new URL(String(signedUrl || ''));
+    const upstreamScheme = parsedUrl.protocol.replace(/:$/, '').toLowerCase();
+    if (upstreamScheme !== 'https' && upstreamScheme !== 'http') {
+      return null;
+    }
+    return `${INTERNAL_SIGNED_SEGMENT_PROXY_PREFIX}/${upstreamScheme}/${parsedUrl.host}${parsedUrl.pathname}${parsedUrl.search || ''}`;
+  } catch {
+    return null;
+  }
+};
+
 const setManifestCacheHeaders = (res, assetPath, cacheStatus) => {
   const isManifest = path.extname(String(assetPath || '')).toLowerCase() === '.m3u8';
   res.setHeader('X-Manifest-Bundle-Cache', cacheStatus || (isManifest ? 'miss' : 'n/a'));
   res.setHeader('X-Cache-Status', cacheStatus || (isManifest ? 'miss' : 'n/a'));
   res.setHeader('X-Cache-Detail', isManifest ? 'manifest-bundle' : 'manifest-segment');
   res.setHeader('X-Manifest-Asset-Kind', isManifest ? 'manifest' : 'segment');
+  res.setHeader('Vary', 'Accept-Encoding, Cookie');
+  res.setHeader('X-Edumaster-Auth-Bound', 'hls-grant-cookie');
   if (isManifest) {
     const ttl = Math.max(Number(appConfig.privateVideoHlsManifestCacheSeconds || 60), 60);
     res.setHeader('Cache-Control', `public, max-age=${ttl}, s-maxage=${ttl}, stale-while-revalidate=${ttl * 10}, stale-if-error=86400`);
@@ -221,19 +268,28 @@ app.get(['/api/course-manifests/b/*', '/backend/api/course-manifests/b/*'], asyn
 
     const storagePath = path.posix.join(parsed.bundlePath, parsed.assetPath);
     if (isS3Provider(parsed.storageProvider)) {
-      const assetBuffer = await getPrivateStorageObjectBuffer({
+      const signedUrl = await getSignedPrivateVideoUrl({
         storageProvider: parsed.storageProvider,
         storagePath,
+        mimeType: getHlsAssetMimeType(parsed.assetPath),
       });
 
-      if (!assetBuffer) {
+      if (!signedUrl) {
         res.status(404).json({ message: 'HLS segment is unavailable.' });
         finish({ authLatencyMs });
         return;
       }
 
-      setManifestCacheHeaders(res, parsed.assetPath, 'segment-proxy');
-      res.send(assetBuffer);
+      const internalProxyPath = buildInternalSignedSegmentProxyPath(signedUrl);
+      if (!internalProxyPath) {
+        res.status(500).json({ message: 'HLS segment could not be proxied.' });
+        finish({ authLatencyMs });
+        return;
+      }
+
+      setManifestCacheHeaders(res, parsed.assetPath, 'segment-accel-proxy');
+      res.setHeader('X-Accel-Redirect', internalProxyPath);
+      res.status(200).end();
       finish({ authLatencyMs });
       return;
     }

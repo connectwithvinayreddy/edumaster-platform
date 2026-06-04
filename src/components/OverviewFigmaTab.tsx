@@ -920,7 +920,9 @@ export const OverviewFigmaTab = ({
             </div>
             <div className="text-right">
               <p className="text-[12px] text-[#53647d]">Rank</p>
-              <p className="mt-[4px] text-[16px] font-semibold text-[#17233d]">#{formatNumber(latestMock.rank)}</p>
+              <p className="mt-[4px] text-[16px] font-semibold text-[#17233d]">
+                {latestMock.rankStatus === 'ready' && latestMock.rank !== null ? `#${formatNumber(latestMock.rank)}` : 'Pending'}
+              </p>
             </div>
           </div>
 

@@ -42,7 +42,14 @@ let classification = 'app_api_saturation';
 let requiredFixBucket = 'app_api_bottleneck';
 let rerunVerdict = 'rerun_same_stage_after_fix';
 
-if (hasAny(/manifest|m3u8|segment|hls|playback stopped|source_fallback|deliverypath|streamurl|direct_cloudflare_stream|cloudflarestream|videodelivery\.net|video is still preparing|media/i)) {
+if (hasAny(/browser_farm_capacity_exhausted|worker capacity|available_workers|required_workers/i)) {
+  classification = 'browser_farm_capacity_exhaustion';
+  requiredFixBucket = 'architecture_mismatch';
+  rerunVerdict = 'add_or_resize_browser_workers_before_rerun';
+} else if (hasAny(/watch-limit|grace_cycle|restart_new_cycle|replaystate|revisionbufferusedseconds|completedfullwatches/i)) {
+  classification = 'watch_limit_playback_state_regression';
+  requiredFixBucket = 'recorded_video_path';
+} else if (hasAny(/manifest|m3u8|segment|hls|playback stopped|source_fallback|deliverypath|streamurl|direct_cloudflare_stream|cloudflarestream|videodelivery\.net|video is still preparing|media/i)) {
   classification = 'recorded_video_media_path_failure';
   requiredFixBucket = 'recorded_video_path';
 } else if (hasAny(/postgres|postgre|pg_|connection slot|too many clients|deadlock|sqlstate|pool/i)) {
@@ -51,6 +58,9 @@ if (hasAny(/manifest|m3u8|segment|hls|playback stopped|source_fallback|deliveryp
 } else if (hasAny(/redis|maxclients|readonly|noauth|bullmq|queue/i)) {
   classification = 'redis_bottleneck';
   requiredFixBucket = 'db_redis_bottleneck';
+} else if (hasAny(/auth_failure|unable to refresh qa browser session|login/i)) {
+  classification = 'auth_session_failure';
+  requiredFixBucket = 'app_api_bottleneck';
 } else if (hasAny(/playwright|selector|browser|navigation timeout|target closed|page crashed|context/i)) {
   classification = 'browser_only_playback_issue';
   requiredFixBucket = 'recorded_video_path';

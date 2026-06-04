@@ -95,18 +95,6 @@ const isProcessingVideo = (video: Video): boolean => {
     || ['queued', 'processing'].includes(processingStatus);
 };
 
-const hasSourceFallbackProtection = (video: Video): boolean =>
-  Boolean(video.sourceFallbackAllowed)
-  && String(video.deliveryStrategy || '').toLowerCase() !== 'cloudflare-stream';
-
-const isFallbackPlayableVideo = (video: Video): boolean => {
-  if (!hasSourceFallbackProtection(video)) {
-    return false;
-  }
-  const processingStatus = String(video.hlsProcessingStatus || '').toLowerCase();
-  return ['queued', 'processing', 'failed'].includes(processingStatus);
-};
-
 const getVideoProcessingProvider = (video: Video): ProcessingProvider => {
   const storageProvider = String(video.storageProvider || '').toLowerCase();
   const streamProvider = String(video.streamProvider || '').toLowerCase();
@@ -137,7 +125,7 @@ const getVideoProcessingProvider = (video: Video): ProcessingProvider => {
 const getProviderLabel = (video: Video): string => {
   const provider = getVideoProcessingProvider(video);
   if (provider === 'cloudflare-stream') {
-    return 'Cloudflare Stream';
+    return 'Legacy Cloudflare Stream';
   }
   if (provider === 'local-hls') {
     return 'Private adaptive HLS';
@@ -148,12 +136,9 @@ const getProviderLabel = (video: Video): string => {
 const getProcessingNotice = (video: Video): string => {
   const provider = getVideoProcessingProvider(video);
   if (provider === 'cloudflare-stream') {
-    return 'Students will not see this topic until Cloudflare Stream finishes encoding and marks it ready.';
+    return 'This lesson still uses the legacy Cloudflare Stream path and should be migrated to the private adaptive HLS pipeline.';
   }
   if (provider === 'local-hls') {
-    if (isFallbackPlayableVideo(video)) {
-      return 'Students can open this topic immediately with protected source playback while adaptive HLS packaging finishes or recovers.';
-    }
     return 'Adaptive HLS packaging is running. Students will see the topic as soon as secure playback becomes available.';
   }
   return 'Students will not see this topic until video processing finishes.';
@@ -162,9 +147,6 @@ const getProcessingNotice = (video: Video): string => {
 const getStudentVisibilityLabel = (video: Video): string => {
   if (video.playbackReady) {
     return 'Visible to students';
-  }
-  if (isFallbackPlayableVideo(video)) {
-    return 'Visible via source fallback';
   }
   if (isFailedVideo(video)) {
     return 'Hidden from students';
@@ -280,7 +262,7 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
     setUploadStatus({
       type: 'info',
       message: videoFile.size > 90 * 1024 * 1024
-        ? `Uploading topic in chunks... 0% (0 Bytes / ${formatFileSize(videoFile.size)})`
+        ? `Uploading topic directly to private storage... 0% (0 Bytes / ${formatFileSize(videoFile.size)})`
         : 'Uploading topic...',
     });
     try {
@@ -297,7 +279,7 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
             const percentage = totalBytes > 0 ? Math.min(100, Math.round((uploadedBytes / totalBytes) * 100)) : 0;
             setUploadStatus({
               type: 'info',
-              message: `Uploading topic... ${percentage}% (${formatFileSize(uploadedBytes)} / ${formatFileSize(totalBytes)}) • chunk ${chunkIndex + 1} of ${totalChunks}`,
+              message: `Uploading topic... ${percentage}% (${formatFileSize(uploadedBytes)} / ${formatFileSize(totalBytes)}) • part ${chunkIndex + 1} of ${totalChunks}`,
             });
           },
         },
@@ -713,8 +695,6 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
                         className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
                           video.playbackReady
                             ? 'bg-[var(--success-soft)] text-[var(--success)]'
-                            : isFallbackPlayableVideo(video)
-                              ? 'bg-blue-100 text-blue-700'
                             : isFailedVideo(video)
                               ? 'bg-red-100 text-red-700'
                               : 'bg-amber-100 text-amber-700'
@@ -764,7 +744,7 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
                     ) : null}
                     {getVideoProcessingProvider(video) === 'cloudflare-stream' ? (
                       <p className="mt-2 text-xs font-medium text-amber-700">
-                        Legacy Cloudflare Stream lesson detected. New uploads should use the private adaptive HLS pipeline instead.
+                        Legacy Cloudflare Stream lesson detected. Migrate this lesson to the private adaptive HLS pipeline before using it as a staging baseline.
                       </p>
                     ) : null}
                     {isFailedVideo(video) ? (
@@ -775,11 +755,6 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
                     {isProcessingVideo(video) ? (
                       <p className="mt-2 text-xs font-medium text-amber-700">
                         {getProcessingNotice(video)}
-                      </p>
-                    ) : null}
-                    {isFallbackPlayableVideo(video) ? (
-                      <p className="mt-2 text-xs font-medium text-blue-700">
-                        Students can use protected source playback while adaptive HLS finishes or recovers.
                       </p>
                     ) : null}
                   </div>
@@ -832,7 +807,7 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
         <ul className="space-y-1 list-disc list-inside">
           <li>Select a course, then choose the subject and optional chapter where you want to add topics</li>
           <li>Upload your recorded session file here and the backend stores it in private hosting outside public lesson URLs</li>
-          <li>New uploads start protected source playback first, then background HLS packaging converts them into private adaptive playback</li>
+          <li>New uploads start background HLS packaging immediately after upload, and students can watch only after the private adaptive stream is ready</li>
           <li>Students receive only short-lived signed playback links from the secure backend API</li>
           <li>Mark topics as premium so only enrolled students can request playback tokens and access the stream</li>
           <li>Leave premium turned off when you want a demo preview video visible before the course is purchased</li>

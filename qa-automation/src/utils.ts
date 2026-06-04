@@ -12,7 +12,8 @@ export const ensureDir = async (dir: string) => {
 };
 
 export const createRunContext = async (): Promise<RunContext> => {
-  const runId = new Date().toISOString().replace(/[:.]/g, '-');
+  const runId = (process.env.QA_RUN_ID_OVERRIDE || '').trim()
+    || new Date().toISOString().replace(/[:.]/g, '-');
   const rootDir = path.join(automationRoot, 'artifacts', runId);
   const screenshotDir = path.join(rootDir, 'screenshots');
   const sourceDir = path.join(rootDir, 'sources');

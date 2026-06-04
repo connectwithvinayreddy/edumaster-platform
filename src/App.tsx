@@ -7478,8 +7478,18 @@ const TestsTab = ({ overview, onRefresh }: { overview: PlatformOverview; onRefre
           <SectionHeader title="Scorecard" caption="Post-test analytics" />
           <div className="mt-6 grid gap-4 md:grid-cols-4">
             <MetricCard title="Score" value={`${lastResult.score}`} hint="Final score after negative marking" icon={Trophy} />
-            <MetricCard title="Rank" value={`#${lastResult.rank}`} hint="All India style mock ranking" icon={Target} />
-            <MetricCard title="Percentile" value={`${lastResult.percentile}%`} hint="Relative performance among attempts" icon={Gauge} />
+            <MetricCard
+              title="Rank"
+              value={lastResult.rankStatus === 'ready' && lastResult.rank !== null ? `#${lastResult.rank}` : 'Pending'}
+              hint={lastResult.rankStatus === 'ready' ? 'All India style mock ranking' : 'Ranking is being finalized in the background'}
+              icon={Target}
+            />
+            <MetricCard
+              title="Percentile"
+              value={lastResult.rankStatus === 'ready' && lastResult.percentile !== null ? `${lastResult.percentile}%` : 'Pending'}
+              hint={lastResult.rankStatus === 'ready' ? 'Relative performance among attempts' : 'Percentile will appear once ranking completes'}
+              icon={Gauge}
+            />
             <MetricCard title="Accuracy band" value={`${lastResult.correctCount} correct`} hint={`${lastResult.incorrectCount} incorrect, ${lastResult.unattemptedCount} skipped`} icon={ClipboardCheck} />
           </div>
           <div className="mt-6 grid gap-4 lg:grid-cols-2">
@@ -9250,6 +9260,7 @@ const AppContent = () => {
   const [resumeTarget, setResumeTarget] = useState<{ courseId: string; lessonId?: string | null; doubtThreadId?: string | null; reportId?: string | null; supportPanel?: 'doubts' | 'report' | null } | null>(null);
   const [savedTopicIds, setSavedTopicIds] = useState<string[]>([]);
   const overviewRequestRef = useRef<Promise<PlatformOverview | null> | null>(null);
+  const shouldPollOverviewInBackground = activeTab === 'overview';
 
   const refreshOverview = async (background = true) => {
     if (!background) {
@@ -9332,6 +9343,10 @@ const AppContent = () => {
       return undefined;
     }
 
+    if (!shouldPollOverviewInBackground) {
+      return undefined;
+    }
+
     const intervalId = window.setInterval(() => {
       void refreshOverview(true);
     }, 20000);
@@ -9339,7 +9354,15 @@ const AppContent = () => {
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [user]);
+  }, [shouldPollOverviewInBackground, user]);
+
+  useEffect(() => {
+    if (!user || !shouldPollOverviewInBackground) {
+      return;
+    }
+
+    void refreshOverview(true);
+  }, [shouldPollOverviewInBackground, user]);
 
   useEffect(() => {
     if (!user?._id || typeof window === 'undefined') {

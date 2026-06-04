@@ -13,6 +13,7 @@ export const ProtectedLivePlayback = ({ access }: ProtectedLivePlaybackProps) =>
       <ResilientHlsVideo
         src={access.streamUrl}
         title={access.title}
+        playbackMode="live"
         watermarkText={access.watermarkText}
         className="aspect-video w-full overflow-hidden rounded-[18px] bg-black"
         autoPlay

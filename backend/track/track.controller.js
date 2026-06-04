@@ -98,10 +98,14 @@ const trackHeartbeat = asyncHandler(async (req, res) => {
       video_type: videoType,
       playback_session_id: heartbeatResult.playbackSession?.playbackSessionId || playbackSessionId,
       heartbeat_duration_ms: Date.now() - startedAtMs,
+      current_position_seconds: currentPositionSeconds,
+      previous_position_seconds: previousPositionSeconds,
       accepted: heartbeatResult.outcome.accepted,
       reason: heartbeatResult.outcome.reason,
       session_status: heartbeatResult.playbackSession?.status || 'active',
       conflict_reason: heartbeatResult.outcome.conflictReason || null,
+      previous_watch_summary: heartbeatResult.previousWatchSummary || null,
+      next_watch_summary: heartbeatResult.watchSummary || null,
     }))}`);
 
     return ok(res, {

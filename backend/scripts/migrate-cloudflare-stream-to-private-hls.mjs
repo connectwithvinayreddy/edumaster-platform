@@ -12,6 +12,7 @@ const crypto = require('crypto');
 const { connectDatabase } = require('../lib/database.js');
 const { appConfig } = require('../lib/config.js');
 const { coursesRepository } = require('../lib/repositories.js');
+const { transcodeToHls: sharedTranscodeToHls } = require('../lib/video-processing.js');
 const {
   resolveVideoDownloadUrl,
   syncCloudflareStreamVideoStatus,
@@ -42,11 +43,13 @@ const ENV_TARGET_QUALITIES = String(process.env.MIGRATE_TARGET_QUALITIES || '')
   .split(',')
   .map((entry) => String(entry || '').trim())
   .filter(Boolean);
-const MIGRATE_UPLOAD_CONCURRENCY = Math.max(Number(process.env.MIGRATE_UPLOAD_CONCURRENCY || 8), 1);
+const MIGRATE_UPLOAD_CONCURRENCY = Math.max(Number(process.env.MIGRATE_UPLOAD_CONCURRENCY || 4), 1);
+const MIGRATE_UPLOAD_RETRY_ATTEMPTS = Math.max(Number(process.env.MIGRATE_UPLOAD_RETRY_ATTEMPTS || 5), 1);
 const SUPPORTED_QUALITIES = ['240p', '360p', '480p', '720p'];
 const DOWNLOAD_TYPE = String(process.env.MIGRATE_DOWNLOAD_TYPE || 'default').trim().toLowerCase() || 'default';
 const DOWNLOAD_READY_MAX_ATTEMPTS = Math.max(Number(process.env.MIGRATE_DOWNLOAD_READY_MAX_ATTEMPTS || 12), 1);
 const DOWNLOAD_READY_DELAY_MS = Math.max(Number(process.env.MIGRATE_DOWNLOAD_READY_DELAY_MS || 5000), 1000);
+const DOWNLOAD_PROBE_BYTES = Math.max(Number(process.env.MIGRATE_DOWNLOAD_PROBE_BYTES || 1024), 256);
 
 const cloudflareHostPattern = /cloudflarestream\.com|videodelivery\.net/i;
 
@@ -153,6 +156,29 @@ const cleanupDirectory = (directoryPath) => {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const withRetries = async (operation, {
+  attempts = MIGRATE_UPLOAD_RETRY_ATTEMPTS,
+  baseDelayMs = 500,
+  onRetry = null,
+} = {}) => {
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts) {
+        break;
+      }
+      if (typeof onRetry === 'function') {
+        onRetry(error, attempt);
+      }
+      await sleep(baseDelayMs * attempt);
+    }
+  }
+  throw lastError;
+};
+
 const createHlsKeyInfoFile = (variantDir) => {
   if (!appConfig.privateVideoHlsAesEncryptionEnabled) {
     return null;
@@ -177,62 +203,8 @@ const writeMasterManifest = ({ outputDirectory, variants }) => {
   fs.writeFileSync(path.join(outputDirectory, 'master.m3u8'), `${lines.join('\n')}\n`);
 };
 
-const transcodeToHls = async ({ sourcePath, outputDirectory, qualities }) => {
-  cleanupDirectory(outputDirectory);
-  fs.mkdirSync(outputDirectory, { recursive: true });
-  const variants = [];
-
-  for (const quality of qualities) {
-    const profile = renditionProfiles[quality];
-    if (!profile) {
-      continue;
-    }
-
-    const variantDir = path.join(outputDirectory, quality);
-    fs.mkdirSync(variantDir, { recursive: true });
-    const playlistPath = path.join(variantDir, 'index.m3u8');
-    const segmentPattern = path.join(variantDir, 'segment_%03d.ts');
-    const keyInfoPath = createHlsKeyInfoFile(variantDir);
-
-    const args = [
-      '-y',
-      '-i', sourcePath,
-      '-vf', `scale=w=${profile.width}:h=${profile.height}:force_original_aspect_ratio=decrease,pad=${profile.width}:${profile.height}:(ow-iw)/2:(oh-ih)/2`,
-      '-ac', '2',
-      '-c:a', 'aac',
-      '-ar', '48000',
-      '-b:a', '128k',
-      '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      '-profile:v', 'main',
-      '-crf', '23',
-      '-sc_threshold', '0',
-      '-g', '48',
-      '-keyint_min', '48',
-      '-b:v', profile.videoBitrate,
-      '-maxrate', profile.maxRate,
-      '-bufsize', profile.bufferSize,
-      '-hls_time', String(appConfig.videoHlsSegmentDurationSeconds),
-      '-hls_flags', 'independent_segments',
-      '-hls_playlist_type', 'vod',
-      ...(keyInfoPath ? ['-hls_key_info_file', keyInfoPath] : []),
-      '-hls_segment_filename', segmentPattern,
-      playlistPath,
-    ];
-
-    await waitForFfmpeg(args);
-    if (keyInfoPath && fs.existsSync(keyInfoPath)) {
-      fs.unlinkSync(keyInfoPath);
-    }
-    variants.push({
-      name: quality,
-      bandwidth: profile.bandwidth,
-      resolution: profile.resolution,
-    });
-  }
-
-  writeMasterManifest({ outputDirectory, variants });
-};
+const transcodeToHls = async ({ sourcePath, outputDirectory, qualities }) =>
+  sharedTranscodeToHls({ sourcePath, outputDirectory, qualities });
 
 const uploadProcessedHlsDirectory = async ({ outputDirectory, manifestKey }) => {
   const prefix = path.posix.dirname(manifestKey);
@@ -267,12 +239,16 @@ const uploadProcessedHlsDirectory = async ({ outputDirectory, manifestKey }) => 
       const currentIndex = nextIndex;
       nextIndex += 1;
       const task = uploadTasks[currentIndex];
-      await uploadPrivateStorageFile({
+      await withRetries(() => uploadPrivateStorageFile({
         storageProvider: 's3',
         storagePath: task.storagePath,
         localFilePath: task.localFilePath,
         contentType: task.contentType,
         cacheControl: task.cacheControl,
+      }), {
+        onRetry: (error, attempt) => {
+          console.warn(`[stream-migrate] retrying upload for ${task.storagePath} after attempt ${attempt}: ${error instanceof Error ? error.message : String(error)}`);
+        },
       });
     }
   };
@@ -306,6 +282,35 @@ const downloadStreamMp4ToFile = async ({ downloadUrl, destinationPath }) => {
   fs.renameSync(tempPath, destinationPath);
 };
 
+const probeDownloadUrl = async (downloadUrl) => {
+  if (!downloadUrl) {
+    return false;
+  }
+
+  try {
+    const response = await fetch(downloadUrl, {
+      headers: {
+        Range: `bytes=0-${Math.max(DOWNLOAD_PROBE_BYTES - 1, 0)}`,
+      },
+    });
+    if (!response.ok || !response.body) {
+      return false;
+    }
+
+    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (buffer.length === 0) {
+      return false;
+    }
+
+    return response.status === 200
+      || response.status === 206
+      || contentType.startsWith('video/');
+  } catch {
+    return false;
+  }
+};
+
 const resolveLegacyStreamManifestUrl = async (lesson) => {
   const candidateUrls = [
     lesson?.hlsPlaybackPath,
@@ -324,13 +329,29 @@ const resolveLegacyStreamManifestUrl = async (lesson) => {
 const resolveMigrationSource = async ({ lesson, workspaceDirectory }) => {
   const downloadUrl = await resolveStreamDownloadUrl(lesson);
   if (downloadUrl) {
+    try {
+      const reachable = await probeDownloadUrl(downloadUrl);
+      if (reachable) {
+        return {
+          sourcePath: downloadUrl,
+          downloadUrl,
+          sourceType: 'downloadable-mp4-url',
+        };
+      }
+    } catch (error) {
+      const manifestUrl = await resolveLegacyStreamManifestUrl(lesson);
+      if (!manifestUrl) {
+        throw error;
+      }
+    }
+
     const downloadedSourcePath = path.join(workspaceDirectory, 'source.mp4');
     try {
       await downloadStreamMp4ToFile({ downloadUrl, destinationPath: downloadedSourcePath });
       return {
         sourcePath: downloadedSourcePath,
         downloadUrl,
-        sourceType: 'downloadable-mp4',
+        sourceType: 'downloadable-mp4-file',
       };
     } catch (error) {
       const manifestUrl = await resolveLegacyStreamManifestUrl(lesson);
@@ -413,7 +434,7 @@ const updateLessonToPrivateHls = async ({
     },
     deliveryProfile: DESIRED_DELIVERY_PROFILE,
     deliveryStrategy: 'hls',
-    sourceFallbackAllowed: true,
+    sourceFallbackAllowed: false,
     targetQualities,
     hlsStorageProvider: 's3',
     hlsProcessingStatus: 'ready',

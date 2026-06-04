@@ -2,9 +2,9 @@ const fs = require('fs');
 const crypto = require('crypto');
 const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const { appConfig } = require('./config.js');
-const { resolveFfmpegPath } = require('./ffmpeg.js');
+const { resolveFfmpegPath, resolveFfprobePath } = require('./ffmpeg.js');
 const {
   addRedisSetMember,
   removeRedisSetMember,
@@ -95,7 +95,7 @@ const getTargetQualities = () => {
 const createInitialVideoDeliveryState = () => ({
   deliveryProfile: appConfig.videoDeliveryProfile,
   deliveryStrategy: 'hls',
-  sourceFallbackAllowed: true,
+  sourceFallbackAllowed: false,
   targetQualities: getTargetQualities(),
   playbackReady: false,
   hlsStorageProvider: null,
@@ -115,6 +115,52 @@ const cleanupDirectory = (directoryPath) => {
   if (directoryPath && fs.existsSync(directoryPath)) {
     fs.rmSync(directoryPath, { recursive: true, force: true });
   }
+};
+
+const probeSourceDurationSeconds = (sourcePath) => {
+  const ffprobePath = resolveFfprobePath();
+  if (ffprobePath) {
+    try {
+      const result = spawnSync(ffprobePath, [
+        '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        sourcePath,
+      ], {
+        encoding: 'utf8',
+        timeout: 30_000,
+      });
+      if (!result.error && result.status === 0) {
+        const parsed = Number.parseFloat(String(result.stdout || '').trim());
+        if (Number.isFinite(parsed) && parsed > 0) {
+          return parsed;
+        }
+      }
+    } catch {
+      // Fall through to the configured baseline timeout.
+    }
+  }
+
+  return null;
+};
+
+const resolveVideoTranscodingTimeoutMs = ({ sourcePath }) => {
+  const baselineTimeoutMs = Math.max(Number(appConfig.videoTranscodingJobTimeoutMs || 0), 60_000);
+  const durationSeconds = probeSourceDurationSeconds(sourcePath);
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+    return baselineTimeoutMs;
+  }
+
+  const durationBasedTimeoutMs = Math.ceil(durationSeconds * 1.5 * 1000);
+  const hardCapTimeoutMs = Math.max(
+    Number(process.env.VIDEO_TRANSCODING_JOB_TIMEOUT_MAX_MS || 0),
+    6 * 60 * 60 * 1000,
+  );
+
+  return Math.min(
+    Math.max(baselineTimeoutMs, durationBasedTimeoutMs),
+    hardCapTimeoutMs,
+  );
 };
 
 const deleteProcessedHlsAssets = async (manifestPath, storageProvider = null) => {
@@ -139,7 +185,7 @@ const trimFfmpegErrorOutput = (value) => String(value || '')
   .trim()
   .slice(-600);
 
-const waitForFfmpeg = (args) =>
+const waitForFfmpeg = (args, options = {}) =>
   new Promise((resolve, reject) => {
     const ffmpegPath = getFfmpegRuntimePath();
     if (!ffmpegPath) {
@@ -150,7 +196,9 @@ const waitForFfmpeg = (args) =>
     const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let settled = false;
     let stderrTail = '';
-    const timeoutMs = Math.max(Number(appConfig.videoTranscodingJobTimeoutMs || 0), 60_000);
+    const timeoutMs = resolveVideoTranscodingTimeoutMs({
+      sourcePath: options.sourcePath,
+    });
     const timeout = setTimeout(() => {
       if (settled) {
         return;
@@ -206,6 +254,21 @@ const createHlsKeyInfoFile = (variantDir) => {
   return keyInfoPath;
 };
 
+const createSharedHlsKeyInfoFile = (outputDirectory) => {
+  if (!appConfig.privateVideoHlsAesEncryptionEnabled) {
+    return null;
+  }
+
+  const keyFilePath = path.join(outputDirectory, 'enc.key');
+  const keyInfoPath = path.join(outputDirectory, 'enc.keyinfo');
+  const iv = crypto.randomBytes(16).toString('hex');
+
+  fs.writeFileSync(keyFilePath, crypto.randomBytes(16));
+  fs.writeFileSync(keyInfoPath, `../enc.key\n${keyFilePath}\n${iv}\n`);
+
+  return keyInfoPath;
+};
+
 const writeMasterManifest = ({ outputDirectory, variants }) => {
   const lines = ['#EXTM3U', '#EXT-X-VERSION:3'];
   variants.forEach((variant) => {
@@ -213,6 +276,45 @@ const writeMasterManifest = ({ outputDirectory, variants }) => {
     lines.push(`${variant.name}/index.m3u8`);
   });
   fs.writeFileSync(path.join(outputDirectory, 'master.m3u8'), `${lines.join('\n')}\n`);
+};
+
+const hasAudioStream = (sourcePath) => {
+  const ffprobePath = resolveFfprobePath();
+  if (ffprobePath) {
+    try {
+      const result = spawnSync(ffprobePath, [
+        '-v', 'error',
+        '-select_streams', 'a:0',
+        '-show_entries', 'stream=codec_type',
+        '-of', 'csv=p=0',
+        sourcePath,
+      ], {
+        encoding: 'utf8',
+        timeout: 15_000,
+      });
+      if (!result.error && result.status === 0) {
+        return String(result.stdout || '').trim().includes('audio');
+      }
+    } catch {
+      // Fall through to ffmpeg-based probe.
+    }
+  }
+
+  const ffmpegPath = getFfmpegRuntimePath();
+  if (!ffmpegPath) {
+    return true;
+  }
+
+  try {
+    const result = spawnSync(ffmpegPath, ['-i', sourcePath], {
+      encoding: 'utf8',
+      timeout: 15_000,
+    });
+    const output = `${result.stdout || ''}\n${result.stderr || ''}`;
+    return /Stream #\d+:\d+(?:\[[^\]]+\])?(?:\([^)]+\))?: Audio:/i.test(output);
+  } catch {
+    return true;
+  }
 };
 
 const renditionProfiles = {
@@ -572,15 +674,20 @@ const repairExistingHlsOutputs = async ({
 const transcodeToHls = async ({ sourcePath, outputDirectory, qualities }) => {
   cleanupDirectory(outputDirectory);
   fs.mkdirSync(outputDirectory, { recursive: true });
-  const variants = [];
+  const variants = qualities
+    .map((quality) => ({
+      name: quality,
+      profile: renditionProfiles[quality],
+    }))
+    .filter((entry) => entry.profile);
 
-  for (const quality of qualities) {
-    const profile = renditionProfiles[quality];
-    if (!profile) {
-      continue;
-    }
+  if (variants.length === 0) {
+    throw new Error('No supported target renditions were requested for HLS packaging.');
+  }
 
-    const variantDir = path.join(outputDirectory, quality);
+  if (variants.length === 1) {
+    const [{ name, profile }] = variants;
+    const variantDir = path.join(outputDirectory, name);
     fs.mkdirSync(variantDir, { recursive: true });
     const playlistPath = path.join(variantDir, 'index.m3u8');
     const segmentPattern = path.join(variantDir, 'segment_%03d.ts');
@@ -612,18 +719,91 @@ const transcodeToHls = async ({ sourcePath, outputDirectory, qualities }) => {
       playlistPath,
     ];
 
-    await waitForFfmpeg(args);
+    await waitForFfmpeg(args, { sourcePath });
     if (keyInfoPath && fs.existsSync(keyInfoPath)) {
       fs.unlinkSync(keyInfoPath);
     }
-    variants.push({
-      name: quality,
-      bandwidth: profile.bandwidth,
-      resolution: profile.resolution,
+    writeMasterManifest({
+      outputDirectory,
+      variants: [{
+        name,
+        bandwidth: profile.bandwidth,
+        resolution: profile.resolution,
+      }],
     });
+    return;
   }
 
-  writeMasterManifest({ outputDirectory, variants });
+  const audioPresent = hasAudioStream(sourcePath);
+  const splitOutputs = variants.map((_, index) => `[video_${index}]`).join('');
+  const filterGraph = [
+    `[0:v]split=${variants.length}${splitOutputs}`,
+    ...variants.map(({ profile }, index) =>
+      `[video_${index}]scale=w=${profile.width}:h=${profile.height}:force_original_aspect_ratio=decrease,pad=${profile.width}:${profile.height}:(ow-iw)/2:(oh-ih)/2[scaled_${index}]`),
+  ].join(';');
+
+  const keyInfoPath = createSharedHlsKeyInfoFile(outputDirectory);
+  const args = [
+    '-y',
+    '-i', sourcePath,
+    '-filter_complex', filterGraph,
+  ];
+
+  variants.forEach((_, index) => {
+    args.push('-map', `[scaled_${index}]`);
+    if (audioPresent) {
+      args.push('-map', '0:a:0');
+    }
+  });
+
+  variants.forEach(({ profile }, index) => {
+    args.push(`-c:v:${index}`, 'libx264');
+    args.push(`-preset:v:${index}`, 'veryfast');
+    args.push(`-profile:v:${index}`, 'main');
+    args.push(`-crf:v:${index}`, '23');
+    args.push(`-sc_threshold:v:${index}`, '0');
+    args.push(`-g:v:${index}`, '48');
+    args.push(`-keyint_min:v:${index}`, '48');
+    args.push(`-b:v:${index}`, profile.videoBitrate);
+    args.push(`-maxrate:v:${index}`, profile.maxRate);
+    args.push(`-bufsize:v:${index}`, profile.bufferSize);
+    if (audioPresent) {
+      args.push(`-c:a:${index}`, 'aac');
+      args.push(`-ar:a:${index}`, '48000');
+      args.push(`-b:a:${index}`, '128k');
+      args.push(`-ac:a:${index}`, '2');
+    }
+  });
+
+  const variantStreamMap = variants.map((entry, index) =>
+    audioPresent
+      ? `v:${index},a:${index},name:${entry.name}`
+      : `v:${index},name:${entry.name}`).join(' ');
+
+  args.push(
+    '-f', 'hls',
+    '-hls_time', String(appConfig.videoHlsSegmentDurationSeconds),
+    '-hls_flags', 'independent_segments',
+    '-hls_playlist_type', 'vod',
+    ...(keyInfoPath ? ['-hls_key_info_file', keyInfoPath] : []),
+    '-var_stream_map', variantStreamMap,
+    '-hls_segment_filename', path.join(outputDirectory, '%v', 'segment_%03d.ts'),
+    path.join(outputDirectory, '%v', 'index.m3u8'),
+  );
+
+  await waitForFfmpeg(args, { sourcePath });
+  if (keyInfoPath && fs.existsSync(keyInfoPath)) {
+    fs.unlinkSync(keyInfoPath);
+  }
+
+  writeMasterManifest({
+    outputDirectory,
+    variants: variants.map(({ name, profile }) => ({
+      name,
+      bandwidth: profile.bandwidth,
+      resolution: profile.resolution,
+    })),
+  });
 };
 
 const markActiveJobQueued = ({ jobId, courseId, lessonId, source }) => {
@@ -877,7 +1057,7 @@ const scheduleVideoProcessing = async ({
 
       await coursesRepository.updateLesson(courseId, lessonId, (current) => ({
         ...current,
-        sourceFallbackAllowed: true,
+        sourceFallbackAllowed: false,
         playbackReady: false,
         hlsProcessingStatus: 'processing',
         hlsProcessingStartedAt: new Date().toISOString(),
@@ -919,7 +1099,7 @@ const scheduleVideoProcessing = async ({
           await coursesRepository.updateLesson(courseId, lessonId, (current) => ({
             ...current,
             deliveryStrategy: 'hls',
-            sourceFallbackAllowed: true,
+            sourceFallbackAllowed: false,
             playbackReady: true,
             hlsStorageProvider: repaired.outputStorageProvider,
             hlsProcessingStatus: 'ready',
@@ -987,7 +1167,7 @@ const scheduleVideoProcessing = async ({
         ...current,
         storagePath: appConfig.videoKeepSourceAfterProcessing ? current.storagePath : null,
         deliveryStrategy: 'hls',
-        sourceFallbackAllowed: true,
+        sourceFallbackAllowed: false,
         playbackReady: true,
         hlsStorageProvider: outputStorageProvider,
         hlsProcessingStatus: 'ready',
@@ -1031,7 +1211,7 @@ const scheduleVideoProcessing = async ({
       const { coursesRepository } = require('./repositories.js');
       await coursesRepository.updateLesson(courseId, lessonId, (current) => ({
         ...current,
-        sourceFallbackAllowed: true,
+        sourceFallbackAllowed: false,
         playbackReady: false,
         hlsProcessingStatus: 'failed',
         hlsProcessingCompletedAt: new Date().toISOString(),
@@ -1116,7 +1296,7 @@ const recoverPendingCourseVideoProcessingJobs = async ({ forceRestartRecovery = 
 
         const requeuedLesson = await coursesRepository.updateLesson(course._id, lesson.id, (current) => ({
           ...current,
-          sourceFallbackAllowed: true,
+          sourceFallbackAllowed: false,
           playbackReady: false,
           hlsProcessingStatus: 'queued',
           hlsProcessingQueuedAt: new Date().toISOString(),
@@ -1158,7 +1338,7 @@ const maybeRecoverStaleCourseVideoProcessingJob = async ({ courseId, lesson }) =
   const { coursesRepository } = require('./repositories.js');
   const updatedLesson = await coursesRepository.updateLesson(courseId, lesson.id, (current) => ({
     ...current,
-    sourceFallbackAllowed: true,
+    sourceFallbackAllowed: false,
     playbackReady: false,
     hlsProcessingStatus: 'queued',
     hlsProcessingQueuedAt: new Date().toISOString(),
@@ -1194,7 +1374,7 @@ const repairCourseLessonHlsOutputs = async ({ courseId, lessonId }) => {
     await coursesRepository.updateLesson(courseId, lessonId, (current) => ({
       ...current,
       deliveryStrategy: 'hls',
-      sourceFallbackAllowed: true,
+      sourceFallbackAllowed: false,
       playbackReady: true,
       hlsStorageProvider: repaired.outputStorageProvider,
       hlsProcessingStatus: 'ready',
@@ -1217,7 +1397,7 @@ const repairCourseLessonHlsOutputs = async ({ courseId, lessonId }) => {
   if (lesson.storagePath) {
     const updatedLesson = await coursesRepository.updateLesson(courseId, lessonId, (current) => ({
       ...current,
-      sourceFallbackAllowed: true,
+      sourceFallbackAllowed: false,
       playbackReady: false,
       hlsProcessingStatus: 'queued',
       hlsProcessingQueuedAt: new Date().toISOString(),
@@ -1237,7 +1417,7 @@ const repairCourseLessonHlsOutputs = async ({ courseId, lessonId }) => {
 
   await coursesRepository.updateLesson(courseId, lessonId, (current) => ({
     ...current,
-    sourceFallbackAllowed: true,
+    sourceFallbackAllowed: false,
     playbackReady: false,
     hlsProcessingStatus: 'failed',
     hlsProcessingCompletedAt: new Date().toISOString(),
@@ -1465,4 +1645,5 @@ module.exports = {
   repairCourseLessonHlsOutputs,
   startVideoProcessingRecoveryLoop,
   deleteProcessedHlsAssets,
+  transcodeToHls,
 };

@@ -64,6 +64,17 @@ const normalizeVideoType = (value) => {
   return COURSE_VIDEO_TYPE;
 };
 
+const getPolicyOptionsFromState = (state, options = {}) => ({
+  ...options,
+  allowedFullWatches: state?.allowedFullWatches ?? options.allowedFullWatches,
+  fullWatchThresholdPercentage: hasFiniteNumber(state?.fullWatchThresholdPercentage)
+    ? Number(state.fullWatchThresholdPercentage)
+    : options.fullWatchThresholdPercentage,
+  stateFullWatchThresholdPercentage: hasFiniteNumber(state?.fullWatchThresholdPercentage)
+    ? Number(state.fullWatchThresholdPercentage)
+    : options.stateFullWatchThresholdPercentage,
+});
+
 const resolveStoredThresholdPercentage = ({ normalizedVideoType, value, baseThresholdPercentage }) => {
   if (!hasFiniteNumber(value)) {
     return null;
@@ -280,15 +291,21 @@ const normalizeVideoWatchState = (state, options = {}) => {
   });
 
   const watchedSegments = sanitizeChunkIndexes(base.watchedSegments, policy.videoDurationSeconds, policy.chunkSeconds);
-  const currentCycleUniqueWatchedSeconds = computeCoveredSecondsFromChunks(
-    watchedSegments,
-    policy.videoDurationSeconds,
-    policy.chunkSeconds,
-  );
   const completedFullWatches = Math.max(0, Math.floor(Number(base.completedFullWatches || 0)));
   const revisionBufferUsedSeconds = clamp(base.revisionBufferUsedSeconds, 0, policy.revisionBufferSeconds);
   const remainingRevisionBufferSeconds = roundSeconds(policy.revisionBufferSeconds - revisionBufferUsedSeconds);
-  const stableEndWindowWatchedSeconds = getStableEndWindowWatchedSeconds(base, policy);
+  const graceCycleReached = completedFullWatches >= policy.allowedFullWatches;
+  const canonicalWatchedSegments = graceCycleReached ? [] : watchedSegments;
+  const currentCycleUniqueWatchedSeconds = graceCycleReached
+    ? 0
+    : computeCoveredSecondsFromChunks(
+      canonicalWatchedSegments,
+      policy.videoDurationSeconds,
+      policy.chunkSeconds,
+    );
+  const stableEndWindowWatchedSeconds = graceCycleReached
+    ? 0
+    : getStableEndWindowWatchedSeconds(base, policy);
   const locked = (
     completedFullWatches >= policy.allowedFullWatches
     && remainingRevisionBufferSeconds <= 0
@@ -300,7 +317,7 @@ const normalizeVideoWatchState = (state, options = {}) => {
     videoDurationSeconds: policy.videoDurationSeconds,
     allowedFullWatches: policy.allowedFullWatches,
     fullWatchThresholdPercentage: policy.fullWatchThresholdPercentage,
-    watchedSegments,
+    watchedSegments: canonicalWatchedSegments,
     currentCycleUniqueWatchedSeconds,
     totalUniqueWatchedSeconds: Math.max(Number(base.totalUniqueWatchedSeconds || 0), currentCycleUniqueWatchedSeconds),
     repeatWatchedSeconds: Math.max(Number(base.repeatWatchedSeconds || 0), 0),
@@ -370,7 +387,11 @@ const normalizeHeartbeatPayload = (payload, state, options = {}) => {
 };
 
 const validatePlaybackHeartbeat = (state, payload, options = {}) => {
-  const policy = getVideoWatchPolicy(state.videoType, state.videoDurationSeconds, options);
+  const policy = getVideoWatchPolicy(
+    state.videoType,
+    state.videoDurationSeconds,
+    getPolicyOptionsFromState(state, options),
+  );
   const heartbeat = normalizeHeartbeatPayload(payload, state, options);
   const suspiciousReasons = [];
 
@@ -456,15 +477,17 @@ const validatePlaybackHeartbeat = (state, payload, options = {}) => {
 
 const applyPlaybackHeartbeat = (stateInput, payload, options = {}) => {
   const state = normalizeVideoWatchState(stateInput, options);
-  const policy = getVideoWatchPolicy(state.videoType, state.videoDurationSeconds, options);
-  const heartbeat = validatePlaybackHeartbeat(state, payload, options);
+  const policyOptions = getPolicyOptionsFromState(state, options);
+  const policy = getVideoWatchPolicy(state.videoType, state.videoDurationSeconds, policyOptions);
+  const heartbeat = validatePlaybackHeartbeat(state, payload, policyOptions);
   const completionWindow = getCompletionWindow(policy);
   const playbackSessionChanged = Boolean(
     state.playbackSessionId
     && heartbeat.playbackSessionId
     && String(state.playbackSessionId) !== String(heartbeat.playbackSessionId),
   );
-  const shouldPersistHeartbeatPosition = heartbeat.reason !== 'seek-forward';
+  const shouldPersistHeartbeatPosition = heartbeat.accepted
+    && !['seek-forward', 'no-progress', 'buffering', 'paused', 'not-playing', 'warmup-heartbeat'].includes(String(heartbeat.reason || ''));
   const nextState = {
     ...state,
     lastPositionSeconds: shouldPersistHeartbeatPosition
@@ -514,12 +537,14 @@ const applyPlaybackHeartbeat = (stateInput, payload, options = {}) => {
   }
 
   if (nextState.completedFullWatches >= policy.allowedFullWatches) {
+    nextState.watchedSegments = [];
+    nextState.currentCycleUniqueWatchedSeconds = 0;
+    nextState.stableEndWindowWatchedSeconds = 0;
     const remainingRevisionBufferSeconds = Math.max(policy.revisionBufferSeconds - nextState.revisionBufferUsedSeconds, 0);
     const consumedRevisionSeconds = roundSeconds(Math.min(remainingRevisionBufferSeconds, heartbeat.countableSeconds));
     nextState.revisionBufferUsedSeconds = roundSeconds(nextState.revisionBufferUsedSeconds + consumedRevisionSeconds);
     nextState.remainingRevisionBufferSeconds = roundSeconds(Math.max(policy.revisionBufferSeconds - nextState.revisionBufferUsedSeconds, 0));
     nextState.repeatWatchedSeconds = roundSeconds(nextState.repeatWatchedSeconds + heartbeat.countableSeconds);
-    nextState.stableEndWindowWatchedSeconds = 0;
     outcome.repeatSecondsAdded = heartbeat.countableSeconds;
     outcome.revisionBufferSecondsAdded = consumedRevisionSeconds;
   } else {

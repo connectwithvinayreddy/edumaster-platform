@@ -50,6 +50,21 @@ resolve_remote_env_file() {
   printf '%s\n' "$(basename "${ENV_FILE}")"
 }
 
+resolve_remote_project_path() {
+  local local_path="$1"
+  if [[ -z "${local_path}" ]]; then
+    printf '%s\n' ""
+    return
+  fi
+
+  if [[ "${local_path}" == "${ROOT_DIR}/"* ]]; then
+    printf '%s\n' "${REMOTE_DIR}/${local_path#"${ROOT_DIR}/"}"
+    return
+  fi
+
+  printf '%s\n' "${local_path}"
+}
+
 ENVIRONMENT_LABEL_VALUE="${ENVIRONMENT_LABEL:-$(read_env_value ENVIRONMENT_LABEL)}"
 APP_DOMAIN_VALUE="${APP_DOMAIN:-$(read_env_value APP_DOMAIN)}"
 PRIVATE_VIDEO_STORAGE_PROVIDER_VALUE="${PRIVATE_VIDEO_STORAGE_PROVIDER:-$(read_env_value PRIVATE_VIDEO_STORAGE_PROVIDER)}"
@@ -142,6 +157,7 @@ ssh "${REMOTE_TARGET}" "mkdir -p '$(dirname "${remote_env_destination}")'"
 rsync -az "${ENV_FILE}" "${REMOTE_TARGET}:${remote_env_destination}"
 
 echo "[deploy] starting safe rolling deploy on remote host"
-ssh "${REMOTE_TARGET}" "chmod +x '${REMOTE_DIR}/infra/lowcost/safe-production-deploy.sh' && cd '${REMOTE_DIR}/infra/lowcost' && ENV_FILE='${remote_env_destination}' ./safe-production-deploy.sh"
+remote_playback_gate_summary="$(resolve_remote_project_path "${PLAYBACK_DEPLOY_GATE_SUMMARY:-}")"
+ssh "${REMOTE_TARGET}" "chmod +x '${REMOTE_DIR}/infra/lowcost/safe-production-deploy.sh' && cd '${REMOTE_DIR}/infra/lowcost' && ENV_FILE='${remote_env_destination}' PLAYBACK_DEPLOY_GATE_ENFORCED='${PLAYBACK_DEPLOY_GATE_ENFORCED:-0}' PLAYBACK_DEPLOY_GATE_SUMMARY='${remote_playback_gate_summary}' PLAYBACK_DEPLOY_GATE_MANUAL_APPROVAL='${PLAYBACK_DEPLOY_GATE_MANUAL_APPROVAL:-}' PLAYBACK_DEPLOY_REQUIRED_STAGE='${PLAYBACK_DEPLOY_REQUIRED_STAGE:-2000}' ./safe-production-deploy.sh"
 
 echo "[deploy] deployment complete"

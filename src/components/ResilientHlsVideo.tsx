@@ -8,7 +8,7 @@ import {
   type RecordedVideoDeliveryPath,
 } from '../lib/recordedVideoDelivery';
 import { cn } from '../lib/utils';
-import { type ProtectedPlaybackDrmConfig } from '../types';
+import { type ProtectedLessonPlayback, type ProtectedPlaybackDrmConfig } from '../types';
 import {
   applyPreferredStartupLevel,
   createProtectedVodHlsConfig,
@@ -20,10 +20,12 @@ import {
   shouldFallbackToSourceFromHlsError,
   type RecordedVideoQualityOption,
 } from '../lib/hlsPlaybackTuning';
+import { shouldTreatProtectedHlsPauseAsUnexpected } from '../lib/unexpectedPauseRecovery.js';
 
 type ResilientHlsVideoProps = {
   src: string;
   title: string;
+  playbackMode?: 'recorded' | 'live';
   watermarkText?: string | null;
   streamFormat?: 'source' | 'hls' | string | null;
   deliveryProfile?: string | null;
@@ -118,7 +120,18 @@ const STARTUP_FIRST_FRAME_THRESHOLD_SECONDS = 0.35;
 const MAX_AUTO_RETRIES = 3;
 const MAX_HLS_NATIVE_RECOVERY_ATTEMPTS = 2;
 const MAX_PROTECTED_SESSION_REBOOTSTRAPS = 1;
+const MAX_UNEXPECTED_PAUSE_AUTO_RESUME_ATTEMPTS = 2;
 const PROTECTED_HLS_WARMUP_MS = 15_000;
+const EXPECTED_PAUSE_GRACE_MS = 2_500;
+const USER_PLAYBACK_INTENT_WINDOW_MS = 1_500;
+const UNEXPECTED_PAUSE_RECOVERY_VERIFY_MS = 1_800;
+const LIVE_RETRY_DELAY_MS = 4_500;
+const LIVE_STALL_THRESHOLD_MS = 45_000;
+const LIVE_STARTUP_TIMEOUT_MS = 45_000;
+const LIVE_STARTUP_TIMEOUT_PROGRESS_GRACE_MS = 18_000;
+const LIVE_STARTUP_TIMEOUT_DEFER_MS = 15_000;
+const LIVE_MAX_AUTO_RETRIES = 6;
+const LIVE_MAX_HLS_NATIVE_RECOVERY_ATTEMPTS = 4;
 const READY_STATE_HAVE_FUTURE_DATA = 3;
 const LIVE_RESUME_PERSIST_EPSILON_SECONDS = 1;
 const LIVE_RESUME_PERSIST_STEP_SECONDS = 5;
@@ -234,6 +247,7 @@ const getBufferedAheadSeconds = (video: HTMLVideoElement | null) => {
 export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHlsVideoProps>(({
   src,
   title,
+  playbackMode = 'recorded',
   watermarkText: _watermarkText = null,
   streamFormat = null,
   deliveryProfile = null,
@@ -266,6 +280,7 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
   const heartbeatTimerRef = useRef<number | null>(null);
   const watchdogTimerRef = useRef<number | null>(null);
   const startupTimeoutRef = useRef<number | null>(null);
+  const unexpectedPauseRecoveryTimerRef = useRef<number | null>(null);
   const attachGenerationRef = useRef(0);
   const isMountedRef = useRef(false);
   const isPlayingRef = useRef(false);
@@ -296,6 +311,7 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
   const onReadyRef = useRef(onReady);
   const onPlaybackStateChangeRef = useRef(onPlaybackStateChange);
   const onQualityOptionsChangeRef = useRef(onQualityOptionsChange);
+  const onProtectedPlaybackRefreshedRef = useRef(onProtectedPlaybackRefreshed);
   const pendingResumeRef = useRef<number>(Math.max(Number(resumeSeconds || 0), 0));
   const autoRetryCountRef = useRef(0);
   const qualityOptionsRef = useRef<RecordedVideoQualityOption[]>([]);
@@ -307,6 +323,11 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
   const hlsNetworkRecoveryCountRef = useRef(0);
   const hlsMediaRecoveryCountRef = useRef(0);
   const protectedSessionRebootstrapCountRef = useRef(0);
+  const unexpectedPauseResumeAttemptsRef = useRef(0);
+  const expectedPauseUntilRef = useRef(0);
+  const expectedPauseReasonRef = useRef<string | null>(null);
+  const lastUserPlaybackIntentAtRef = useRef(0);
+  const lastUserPlaybackIntentReasonRef = useRef<string | null>(null);
   const stablePlaybackSnapshotRef = useRef<StablePlaybackSnapshot>({
     currentTime: Math.max(Number(resumeSeconds || 0), 0),
     durationSeconds: 0,
@@ -330,8 +351,24 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
     drmEnabled: Boolean(drmConfig?.enabled),
   });
   const normalizedStreamFormat = String(drmConfig?.manifestFormat || streamFormat || '').trim().toLowerCase();
+  const isLivePlayback = playbackMode === 'live' || String(trackVideoType || '').toLowerCase() === 'live';
   const protectedHlsStabilityMode = activeDeliveryPath === 'protected_hls_gateway'
     && (normalizedStreamFormat === 'hls' || /\.m3u8(\?|$)/.test(String(src || '').toLowerCase()));
+  const reconnectRetryDelayMs = isLivePlayback ? LIVE_RETRY_DELAY_MS : RETRY_DELAY_MS;
+  const stallThresholdMs = isLivePlayback ? LIVE_STALL_THRESHOLD_MS : STALL_THRESHOLD_MS;
+  const startupTimeoutMs = isLivePlayback ? LIVE_STARTUP_TIMEOUT_MS : STARTUP_TIMEOUT_MS;
+  const startupTimeoutProgressGraceMs = isLivePlayback ? LIVE_STARTUP_TIMEOUT_PROGRESS_GRACE_MS : STARTUP_TIMEOUT_PROGRESS_GRACE_MS;
+  const startupTimeoutDeferMs = isLivePlayback ? LIVE_STARTUP_TIMEOUT_DEFER_MS : STARTUP_TIMEOUT_DEFER_MS;
+  const maxAutoRetries = isLivePlayback ? LIVE_MAX_AUTO_RETRIES : MAX_AUTO_RETRIES;
+  const maxHlsNativeRecoveryAttempts = isLivePlayback ? LIVE_MAX_HLS_NATIVE_RECOVERY_ATTEMPTS : MAX_HLS_NATIVE_RECOVERY_ATTEMPTS;
+
+  const getReconnectMessage = (reason: string, fallback = 'Reconnecting…') => {
+    const normalizedReason = String(reason || '').trim();
+    if (normalizedReason) {
+      return normalizedReason;
+    }
+    return isLivePlayback ? 'Reconnecting live stream…' : fallback;
+  };
 
   const emitPlaybackMetric = (type: string, detail: Record<string, unknown> = {}) => {
     if (typeof window === 'undefined') {
@@ -349,6 +386,10 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
         src,
         title,
         trackVideoId,
+        trackCourseId,
+        trackLessonId,
+        trackVideoType,
+        playbackSessionId: playbackSessionIdRef.current,
         at: Date.now(),
         currentTimeSeconds: video ? Math.max(Number(video.currentTime || 0), 0) : 0,
         durationSeconds: video ? Math.max(Number(video.duration || 0), 0) : 0,
@@ -359,6 +400,7 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
         usedJSHeapSize: performanceWithMemory.memory?.usedJSHeapSize || null,
         totalJSHeapSize: performanceWithMemory.memory?.totalJSHeapSize || null,
         jsHeapSizeLimit: performanceWithMemory.memory?.jsHeapSizeLimit || null,
+        playbackMode,
         ...detail,
       },
     }));
@@ -447,6 +489,9 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
     if (detail.reasonCode === 'PLAYBACK_SESSION_INVALID') {
       return 'midstream_session_rebootstrap';
     }
+    if (detail.reasonCode === 'PLAYBACK_GRANT_INVALID') {
+      return 'midstream_grant_expiry';
+    }
 
     const normalizedDetails = String(detail.details || '').toLowerCase();
     const normalizedType = String(detail.type || '').toLowerCase();
@@ -477,6 +522,51 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
       window.clearTimeout(timerRef.current);
       timerRef.current = null;
     }
+  };
+
+  const markUserPlaybackIntent = (reason: string) => {
+    lastUserPlaybackIntentAtRef.current = Date.now();
+    lastUserPlaybackIntentReasonRef.current = reason;
+    emitPlaybackMetric('playback_user_intent', {
+      reason,
+    });
+  };
+
+  const hasRecentUserPlaybackIntent = () => (
+    lastUserPlaybackIntentAtRef.current > 0
+    && Date.now() - lastUserPlaybackIntentAtRef.current <= USER_PLAYBACK_INTENT_WINDOW_MS
+  );
+
+  const markExpectedPause = (reason: string, durationMs = EXPECTED_PAUSE_GRACE_MS) => {
+    expectedPauseUntilRef.current = Date.now() + Math.max(durationMs, 0);
+    expectedPauseReasonRef.current = reason;
+    markUserPlaybackIntent(reason);
+    emitPlaybackMetric('expected_pause_marked', {
+      reason,
+      durationMs,
+    });
+  };
+
+  const clearExpectedPause = (reason: string) => {
+    if (expectedPauseUntilRef.current <= 0 && !expectedPauseReasonRef.current) {
+      return;
+    }
+    emitPlaybackMetric('expected_pause_cleared', {
+      reason,
+      previousReason: expectedPauseReasonRef.current,
+    });
+    expectedPauseUntilRef.current = 0;
+    expectedPauseReasonRef.current = null;
+  };
+
+  const isExpectedPauseActive = () => expectedPauseUntilRef.current > Date.now();
+
+  const resetUnexpectedPauseRecovery = (reason: string) => {
+    clearTimer(unexpectedPauseRecoveryTimerRef);
+    unexpectedPauseResumeAttemptsRef.current = 0;
+    emitPlaybackMetric('unexpected_pause_recovery_reset', {
+      reason,
+    });
   };
 
   const readStoredResumeFloor = () => {
@@ -638,8 +728,10 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
     stopWatchdog();
     clearTimer(startupTimeoutRef);
     clearTimer(retryTimerRef);
+    clearTimer(unexpectedPauseRecoveryTimerRef);
     scheduledRetryReasonRef.current = null;
     retryPreservesPlayerRef.current = false;
+    unexpectedPauseResumeAttemptsRef.current = 0;
     mediaCleanupRef.current?.();
     mediaCleanupRef.current = null;
 
@@ -658,14 +750,17 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
     const video = videoRef.current;
     preserveLiveResumePoint('playback-blocked');
     clearTimer(retryTimerRef);
+    clearTimer(unexpectedPauseRecoveryTimerRef);
     scheduledRetryReasonRef.current = null;
     retryPreservesPlayerRef.current = false;
+    unexpectedPauseResumeAttemptsRef.current = 0;
     setPlaybackBlockedMessage(message);
     setIsReconnecting(false);
     setLoadMessage(message);
     isPlayingRef.current = false;
     stopHeartbeat();
     stopWatchdog();
+    markExpectedPause('playback-blocked');
     emitPlaybackMetric('playback_stopped_banner_visible', {
       message,
       playbackSessionId: playbackSessionIdRef.current,
@@ -754,6 +849,7 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
           Number(lastHeartbeatPositionRef.current || 0),
           0,
         );
+        onProtectedPlaybackRefreshedRef.current?.(refreshed);
         emitPlaybackMetric('playback_session_recovered', {
           reasonCode,
           previousPlaybackSessionId,
@@ -763,6 +859,33 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
         cancelScheduledRetry('playback-session-recovered', {
           reasonCode,
         });
+        const currentSource = String(drmConfig?.manifestUrl || src || '').trim();
+        const sameProtectedSource = Boolean(
+          refreshedSource
+          && currentSource
+          && refreshedSource === currentSource,
+        );
+        if (protectedHlsStabilityMode && reasonCode === 'PLAYBACK_SESSION_INVALID' && sameProtectedSource) {
+          const video = videoRef.current;
+          if (video && autoPlay && !video.ended && video.paused) {
+            try {
+              await video.play();
+              emitPlaybackMetric('playback_session_recovery_resumed', {
+                reasonCode,
+                recoveryMode: 'silent_session_rollover',
+              });
+            } catch (resumeError) {
+              emitPlaybackMetric('playback_session_recovery_resume_failed', {
+                reasonCode,
+                recoveryMode: 'silent_session_rollover',
+                failure: resumeError instanceof Error ? resumeError.message : 'unknown_resume_error',
+              });
+            }
+          }
+          setIsReconnecting(false);
+          setLoadMessage('Stream ready');
+          return true;
+        }
         if (
           protectedHlsStabilityMode
           && firstFrameReachedRef.current
@@ -917,7 +1040,7 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
     const phase = options.phase ?? 'general';
     if (phase === 'startup' && !firstFrameReachedRef.current) {
       if (startupFullReconnectCountRef.current >= 1) {
-        failPlayback(`${reason} Please tap Retry to try again.`, {
+        failPlayback(`${getReconnectMessage(reason)} Please tap Retry to try again.`, {
           phase,
           retryCount: autoRetryCountRef.current,
           startupReconnectCount: startupFullReconnectCountRef.current,
@@ -927,16 +1050,18 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
       startupFullReconnectCountRef.current += 1;
     }
     autoRetryCountRef.current += 1;
-    if (autoRetryCountRef.current > MAX_AUTO_RETRIES) {
-      failPlayback(`${reason} Please tap Retry to try again.`, {
+    if (autoRetryCountRef.current > maxAutoRetries) {
+      failPlayback(`${getReconnectMessage(reason)} Please tap Retry to try again.`, {
         retryCount: autoRetryCountRef.current,
       });
       return;
     }
 
     clearTimer(retryTimerRef);
+    clearTimer(unexpectedPauseRecoveryTimerRef);
     scheduledRetryReasonRef.current = reason;
     retryPreservesPlayerRef.current = !destroyImmediately;
+    unexpectedPauseResumeAttemptsRef.current = 0;
     emitPlaybackMetric('playback_failure_classified', {
       failureClass: classifyPlaybackFailure({
         details: reason,
@@ -948,7 +1073,7 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
     });
     emitPlaybackMetric('reconnect_scheduled', {
       reason,
-      retryDelayMs: RETRY_DELAY_MS,
+      retryDelayMs: reconnectRetryDelayMs,
       destroyImmediately,
     });
     if (destroyImmediately) {
@@ -967,10 +1092,153 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
 
       preserveLiveResumePoint('retry-timer-fired');
       destroyPlayer();
-      setLoadMessage('Reconnecting…');
+      setLoadMessage(getReconnectMessage('', 'Reconnecting…'));
       setIsReconnecting(true);
       attachPlayer('retry-timer');
-    }, RETRY_DELAY_MS);
+    }, reconnectRetryDelayMs);
+  };
+
+  const shouldTreatCurrentPauseAsUnexpected = (video: HTMLVideoElement | null) => {
+    if (!video) {
+      return false;
+    }
+
+    const stableSnapshot = stablePlaybackSnapshotRef.current;
+    const currentTimeSeconds = Math.max(Number(video.currentTime || 0), 0);
+    const shouldBeActivelyPlaying = Boolean(
+      isPlayingRef.current
+      || bufferingStartedAtRef.current !== null
+      || (autoPlay && (
+        firstFrameReachedRef.current
+        || stableSnapshot.firstFrameReached
+        || currentTimeSeconds >= STARTUP_FIRST_FRAME_THRESHOLD_SECONDS
+      )),
+    );
+
+    return shouldTreatProtectedHlsPauseAsUnexpected({
+      protectedHlsStabilityMode,
+      activeDeliveryPath,
+      firstFrameReached: firstFrameReachedRef.current,
+      stableFirstFrameReached: stableSnapshot.firstFrameReached,
+      currentTimeSeconds,
+      stableCurrentTimeSeconds: stableSnapshot.currentTime,
+      ended: Boolean(video.ended),
+      bufferedAheadSeconds: getBufferedAheadSeconds(video),
+      readyState: Number(video.readyState || 0),
+      hasHlsRuntime: Boolean(hlsRef.current),
+      playbackBlocked: Boolean(playbackBlockedMessage),
+      terminalPlaybackError: Boolean(terminalPlaybackError),
+      shouldBeActivelyPlaying,
+      expectedPauseActive: isExpectedPauseActive(),
+      recentUserPlaybackIntent: hasRecentUserPlaybackIntent(),
+    });
+  };
+
+  const attemptUnexpectedPauseRecovery = (reason: string) => {
+    const video = videoRef.current;
+    if (!video || !shouldTreatCurrentPauseAsUnexpected(video)) {
+      return false;
+    }
+
+    if (retryTimerRef.current !== null || unexpectedPauseRecoveryTimerRef.current !== null) {
+      emitPlaybackMetric('unexpected_pause_recovery_already_in_flight', {
+        reason,
+        retryScheduled: retryTimerRef.current !== null,
+      });
+      return true;
+    }
+
+    const attempt = unexpectedPauseResumeAttemptsRef.current + 1;
+    unexpectedPauseResumeAttemptsRef.current = attempt;
+    onPlaybackStateChangeRef.current?.({ playing: false, ended: false, waiting: true });
+    emitPlaybackMetric('unexpected_pause_detected', {
+      reason,
+      attempt,
+      ...getStallDiagnostic({
+        bufferedAheadSeconds: getBufferedAheadSeconds(video),
+        readyState: Number(video.readyState || 0),
+        networkState: Number(video.networkState || 0),
+        expectedPauseActive: isExpectedPauseActive(),
+        recentUserPlaybackIntent: hasRecentUserPlaybackIntent(),
+      }),
+    });
+
+    const verifyRecovery = () => {
+      unexpectedPauseRecoveryTimerRef.current = null;
+      const activeVideo = videoRef.current;
+      if (!activeVideo) {
+        return;
+      }
+
+      const recovered = Boolean(
+        !activeVideo.paused
+        && !activeVideo.ended
+        && Math.max(Number(activeVideo.currentTime || 0), 0) > Math.max(Number(lastCurrentTimeRef.current || 0) - 0.1, 0),
+      );
+      if (recovered) {
+        emitPlaybackMetric('unexpected_pause_recovery_resolved', {
+          reason,
+          attempt,
+          currentTimeSeconds: Math.max(Number(activeVideo.currentTime || 0), 0),
+        });
+        unexpectedPauseResumeAttemptsRef.current = 0;
+        return;
+      }
+
+      if (
+        attempt < MAX_UNEXPECTED_PAUSE_AUTO_RESUME_ATTEMPTS
+        && shouldTreatCurrentPauseAsUnexpected(activeVideo)
+      ) {
+        emitPlaybackMetric('unexpected_pause_recovery_retrying', {
+          reason,
+          attempt,
+        });
+        attemptUnexpectedPauseRecovery(`${reason}:retry`);
+        return;
+      }
+
+      emitPlaybackMetric('unexpected_pause_recovery_escalated', {
+        reason,
+        attempt,
+        ...getStallDiagnostic({
+          bufferedAheadSeconds: getBufferedAheadSeconds(activeVideo),
+          readyState: Number(activeVideo.readyState || 0),
+          networkState: Number(activeVideo.networkState || 0),
+        }),
+      });
+      unexpectedPauseResumeAttemptsRef.current = 0;
+      scheduleRetry('Playback paused unexpectedly. Reconnecting…', {
+        phase: firstFrameReachedRef.current ? 'general' : 'startup',
+      });
+    };
+
+    void (async () => {
+      try {
+        const playPromise = video.play();
+        if (playPromise && typeof playPromise.then === 'function') {
+          await playPromise;
+        }
+        emitPlaybackMetric('unexpected_pause_resume_attempted', {
+          reason,
+          attempt,
+          currentTimeSeconds: Math.max(Number(video.currentTime || 0), 0),
+        });
+      } catch (error) {
+        emitPlaybackMetric('unexpected_pause_resume_rejected', {
+          reason,
+          attempt,
+          message: error instanceof Error ? error.message : 'unknown_resume_rejection',
+        });
+      } finally {
+        clearTimer(unexpectedPauseRecoveryTimerRef);
+        unexpectedPauseRecoveryTimerRef.current = window.setTimeout(
+          verifyRecovery,
+          UNEXPECTED_PAUSE_RECOVERY_VERIFY_MS,
+        );
+      }
+    })();
+
+    return true;
   };
 
   const attachPlayer = (reason: string = 'manual') => {
@@ -1057,6 +1325,8 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
     lastAttachedConfigSignatureRef.current = configSignature;
     firstFrameReachedRef.current = false;
     startupNativeRecoveryInFlightRef.current = false;
+    clearExpectedPause('attach-player');
+    resetUnexpectedPauseRecovery('attach-player');
     const shouldResetStartupRecoveryBudget = sourceChangedSinceLastAttach
       || reason === 'manual'
       || reason === 'imperative-retry'
@@ -1150,7 +1420,7 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
         const hasRecentStartupProgress = Boolean(
           startupProgressAgeMs !== null
           && startupProgressPhaseRef.current !== 'attach_started'
-          && startupProgressAgeMs < STARTUP_TIMEOUT_PROGRESS_GRACE_MS
+          && startupProgressAgeMs < startupTimeoutProgressGraceMs
         );
 
         if (hasRecentStartupProgress) {
@@ -1160,14 +1430,14 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
             bufferedAheadSeconds,
             startupProgressAgeMs,
             startupProgressPhase: startupProgressPhaseRef.current,
-            nextDelayMs: STARTUP_TIMEOUT_DEFER_MS,
+            nextDelayMs: startupTimeoutDeferMs,
           });
-          scheduleStartupTimeoutCheck(STARTUP_TIMEOUT_DEFER_MS);
+          scheduleStartupTimeoutCheck(startupTimeoutDeferMs);
           return;
         }
 
         const hls = hlsRef.current;
-        if (hls && !firstFrameReachedRef.current && !startupNativeRecoveryInFlightRef.current && startupNativeRecoveryCountRef.current < MAX_HLS_NATIVE_RECOVERY_ATTEMPTS) {
+        if (hls && !firstFrameReachedRef.current && !startupNativeRecoveryInFlightRef.current && startupNativeRecoveryCountRef.current < maxHlsNativeRecoveryAttempts) {
           const restartPositionSeconds = Math.max(
             currentTime,
             Number(lastObservedPlaybackPositionRef.current || 0),
@@ -1182,13 +1452,13 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
             attempt: startupNativeRecoveryCountRef.current,
             restartPositionSeconds,
             startupProgressPhase: startupProgressPhaseRef.current,
-          });
-          try {
-            hls.startLoad(restartPositionSeconds);
-            setLoadMessage('Reconnecting to stream…');
-            scheduleStartupTimeoutCheck(STARTUP_TIMEOUT_DEFER_MS);
-            return;
-          } catch (nativeRecoveryError) {
+            });
+            try {
+              hls.startLoad(restartPositionSeconds);
+              setLoadMessage(isLivePlayback ? 'Reconnecting live stream…' : 'Reconnecting to stream…');
+              scheduleStartupTimeoutCheck(startupTimeoutDeferMs);
+              return;
+            } catch (nativeRecoveryError) {
             startupNativeRecoveryInFlightRef.current = false;
             emitPlaybackMetric('startup_native_recovery_failed', {
               reason: 'startup-timeout',
@@ -1210,7 +1480,7 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
         });
       }, delayMs);
     };
-    scheduleStartupTimeoutCheck(STARTUP_TIMEOUT_MS);
+    scheduleStartupTimeoutCheck(startupTimeoutMs);
 
     const setupMediaEvents = () => {
       const applyPendingResume = () => {
@@ -1243,7 +1513,13 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
         }
       };
 
+      const handleUserPlaybackIntent = (event: Event) => {
+        markUserPlaybackIntent(`media-${event.type}`);
+      };
+
       const handlePlay = () => {
+        clearExpectedPause('play-event');
+        resetUnexpectedPauseRecovery('play-event');
         if (retryPreservesPlayerRef.current) {
           cancelScheduledRetry('playback-resumed-on-play', {
             currentTimeSeconds: Math.max(Number(video.currentTime || 0), 0),
@@ -1279,6 +1555,23 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
         const { currentTime, durationSeconds } = getPlaybackSnapshot();
         captureStablePlaybackSnapshot();
         rememberResumeFloor(currentTime, 'pause', { forcePersist: true });
+        if (shouldTreatCurrentPauseAsUnexpected(video)) {
+          emitPlaybackMetric('playback_failure_classified', {
+            failureClass: 'unexpected_runtime_pause',
+            ...getStallDiagnostic({
+              currentTimeSeconds: currentTime,
+              durationSeconds,
+              bufferedAheadSeconds: getBufferedAheadSeconds(video),
+              readyState: Number(video.readyState || 0),
+              networkState: Number(video.networkState || 0),
+              expectedPauseReason: expectedPauseReasonRef.current,
+              recentUserPlaybackIntentReason: lastUserPlaybackIntentReasonRef.current,
+            }),
+          });
+          if (attemptUnexpectedPauseRecovery('pause-event')) {
+            return;
+          }
+        }
         void sendHeartbeat(
           currentTime,
           durationSeconds,
@@ -1533,6 +1826,10 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
 
       video.addEventListener('play', handlePlay);
       video.addEventListener('pause', handlePause);
+      video.addEventListener('pointerdown', handleUserPlaybackIntent, { passive: true });
+      video.addEventListener('touchstart', handleUserPlaybackIntent, { passive: true });
+      video.addEventListener('click', handleUserPlaybackIntent, { passive: true });
+      video.addEventListener('keydown', handleUserPlaybackIntent);
       video.addEventListener('timeupdate', handleTimeUpdate);
       video.addEventListener('ended', handleEnded);
       video.addEventListener('error', handleError);
@@ -1549,7 +1846,24 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
       video.addEventListener('stalled', handleStalled);
 
       watchdogTimerRef.current = window.setInterval(() => {
-        if (!isPlayingRef.current || video.paused || video.ended) {
+        if (video.ended) {
+          return;
+        }
+
+        if (video.paused) {
+          if (shouldTreatCurrentPauseAsUnexpected(video)) {
+            emitPlaybackMetric('watchdog_unexpected_pause', {
+              currentTimeSeconds: Math.max(Number(video.currentTime || 0), 0),
+              bufferedAheadSeconds: getBufferedAheadSeconds(video),
+              readyState: Number(video.readyState || 0),
+              networkState: Number(video.networkState || 0),
+            });
+            void attemptUnexpectedPauseRecovery('watchdog-paused-playback');
+          }
+          return;
+        }
+
+        if (!isPlayingRef.current) {
           return;
         }
 
@@ -1559,7 +1873,7 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
         const bufferedAheadSeconds = getBufferedAheadSeconds(video);
 
         if (
-          stalledFor >= STALL_THRESHOLD_MS
+          stalledFor >= stallThresholdMs
           && currentTime === lastCurrentTimeRef.current
           && durationSeconds > 0
           && Number(video.readyState || 0) < READY_STATE_HAVE_FUTURE_DATA
@@ -1571,7 +1885,7 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
             readyState: Number(video.readyState || 0),
             networkState: Number(video.networkState || 0),
           });
-          scheduleRetry('Playback stalled. Reconnecting…', {
+          scheduleRetry(isLivePlayback ? 'Live stream stalled. Reconnecting…' : 'Playback stalled. Reconnecting…', {
             phase: 'general',
           });
         }
@@ -1580,6 +1894,10 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
       return () => {
         video.removeEventListener('play', handlePlay);
         video.removeEventListener('pause', handlePause);
+        video.removeEventListener('pointerdown', handleUserPlaybackIntent);
+        video.removeEventListener('touchstart', handleUserPlaybackIntent);
+        video.removeEventListener('click', handleUserPlaybackIntent);
+        video.removeEventListener('keydown', handleUserPlaybackIntent);
         video.removeEventListener('timeupdate', handleTimeUpdate);
         video.removeEventListener('ended', handleEnded);
         video.removeEventListener('error', handleError);
@@ -1940,7 +2258,7 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
               });
               return;
             }
-            if (startupNativeRecoveryCountRef.current < MAX_HLS_NATIVE_RECOVERY_ATTEMPTS) {
+            if (startupNativeRecoveryCountRef.current < maxHlsNativeRecoveryAttempts) {
               startupNativeRecoveryCountRef.current += 1;
               startupNativeRecoveryInFlightRef.current = true;
               const restartPositionSeconds = Math.max(
@@ -1957,8 +2275,8 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
               });
               try {
                 hls.startLoad(restartPositionSeconds);
-                setLoadMessage('Reconnecting to stream…');
-                scheduleStartupTimeoutCheck(STARTUP_TIMEOUT_DEFER_MS);
+                setLoadMessage(isLivePlayback ? 'Reconnecting live stream…' : 'Reconnecting to stream…');
+                scheduleStartupTimeoutCheck(startupTimeoutDeferMs);
                 return;
               } catch (nativeRecoveryError) {
                 startupNativeRecoveryInFlightRef.current = false;
@@ -1971,7 +2289,7 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
             }
           }
 
-          if (Boolean(data?.fatal) && data?.type === HLS_NETWORK_ERROR && hlsNetworkRecoveryCountRef.current < MAX_HLS_NATIVE_RECOVERY_ATTEMPTS) {
+          if (Boolean(data?.fatal) && data?.type === HLS_NETWORK_ERROR && hlsNetworkRecoveryCountRef.current < maxHlsNativeRecoveryAttempts) {
             hlsNetworkRecoveryCountRef.current += 1;
             const restartPositionSeconds = Math.max(
               Number(video.currentTime || 0),
@@ -1993,7 +2311,7 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
             }
           }
 
-          if (Boolean(data?.fatal) && data?.type === HLS_MEDIA_ERROR && hlsMediaRecoveryCountRef.current < MAX_HLS_NATIVE_RECOVERY_ATTEMPTS) {
+          if (Boolean(data?.fatal) && data?.type === HLS_MEDIA_ERROR && hlsMediaRecoveryCountRef.current < maxHlsNativeRecoveryAttempts) {
             hlsMediaRecoveryCountRef.current += 1;
             emitPlaybackMetric('hls_native_media_recovery', {
               attempt: hlsMediaRecoveryCountRef.current,
@@ -2010,12 +2328,32 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
             }
           }
 
+          const shouldSoftRetryLiveHls = isLivePlayback && (
+            Boolean(data?.fatal)
+            || [
+              'manifestLoadError',
+              'manifestLoadTimeOut',
+              'levelLoadError',
+              'levelLoadTimeOut',
+              'fragLoadError',
+              'fragLoadTimeOut',
+              'bufferNudgeOnStall',
+            ].includes(String(data?.details || ''))
+          );
+
+          if (shouldSoftRetryLiveHls) {
+            scheduleRetry('Live stream interrupted. Reconnecting…', {
+              phase: firstFrameReachedRef.current ? 'general' : 'startup',
+            });
+            return;
+          }
+
           if (shouldFallbackToSourceFromHlsError({
             fatal: Boolean(data?.fatal),
             type: data?.type || null,
             details: data?.details || null,
           })) {
-            scheduleRetry('Reconnecting…', {
+            scheduleRetry(getReconnectMessage('', 'Reconnecting…'), {
               phase: firstFrameReachedRef.current ? 'general' : 'startup',
             });
           }
@@ -2066,6 +2404,9 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
     }
 
     try {
+      markUserPlaybackIntent('imperative-play');
+      clearExpectedPause('imperative-play');
+      resetUnexpectedPauseRecovery('imperative-play');
       const promise = video.play();
       if (promise && typeof promise.then === 'function') {
         await promise;
@@ -2093,6 +2434,7 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
       return;
     }
     try {
+      markExpectedPause('imperative-pause');
       video.pause();
     } catch {
       // Ignore pause races during teardown.
@@ -2104,6 +2446,8 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
     pause: pauseVideo,
     retry: () => {
       autoRetryCountRef.current = 0;
+      clearExpectedPause('imperative-retry');
+      resetUnexpectedPauseRecovery('imperative-retry');
       attachPlayer('imperative-retry');
     },
     seekTo: (seconds: number) => {
@@ -2146,6 +2490,7 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
       destroyPlayer();
       const video = videoRef.current;
       if (video) {
+        markExpectedPause('unmount-teardown', 10_000);
         video.pause();
         video.removeAttribute('src');
         video.load();
@@ -2392,7 +2737,7 @@ export const ResilientHlsVideo = forwardRef<ResilientHlsVideoHandle, ResilientHl
       {(playbackBlockedMessage || terminalPlaybackError) && (
         <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/92 text-white">
           <div className="flex max-w-[420px] flex-col items-center gap-3 px-6 text-center">
-            <p className="text-lg font-semibold">Playback stopped</p>
+            <p className="text-lg font-semibold">{isLivePlayback ? 'Live stream interrupted' : 'Playback stopped'}</p>
             <p className="text-sm text-white/72">{playbackBlockedMessage || terminalPlaybackError}</p>
             {terminalPlaybackError && !playbackBlockedMessage ? (
               <button

@@ -279,8 +279,10 @@ export interface TestAttemptResult {
   correctCount: number;
   incorrectCount: number;
   unattemptedCount: number;
-  percentile: number;
-  rank: number;
+  percentile: number | null;
+  rank: number | null;
+  rankStatus: 'pending' | 'ready' | 'failed';
+  rankComputedAt?: string | null;
   weakTopics: string[];
   strongTopics: string[];
   solutions: {

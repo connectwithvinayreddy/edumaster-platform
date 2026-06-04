@@ -1,3 +1,4 @@
+import dotenv from 'dotenv';
 import path from 'node:path';
 import puppeteer from 'puppeteer-core';
 import { config } from './config.js';
@@ -5,13 +6,23 @@ import { chromeHostResolverRule, qaFetch } from './network.js';
 import { artifactPath, createRunContext, sleep, writeJson, writeText } from './utils.js';
 import { maybeStartLiveTestPublisher } from './live-publisher.js';
 
+const rootDir = path.resolve(process.cwd(), path.basename(process.cwd()) === 'qa-automation' ? '..' : '.');
+const requestedEnvFile = String(process.env.ENV_FILE || '').trim();
+const resolvedEnvPath = requestedEnvFile
+  ? (path.isAbsolute(requestedEnvFile) ? requestedEnvFile : path.resolve(rootDir, requestedEnvFile))
+  : path.join(rootDir, '.env');
+dotenv.config({ path: resolvedEnvPath });
+
 const chromeExecutable = process.env.QA_CHROME_EXECUTABLE || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-const adminEmail = process.env.QA_ADMIN_EMAIL || 'admin@local.edumaster';
-const adminPassword = process.env.QA_ADMIN_PASSWORD || 'AdminChangeMe_2026';
+const adminEmail = process.env.QA_ADMIN_EMAIL || process.env.ADMIN_EMAIL || 'admin@local.edumaster';
+const adminPassword = process.env.QA_ADMIN_PASSWORD || process.env.ADMIN_PASSWORD || 'AdminChangeMe_2026';
 const studentEmail = process.env.QA_LOGIN_EMAIL || `qa.live.cert.student+${Date.now()}@local.test`;
 const studentPassword = process.env.QA_LOGIN_PASSWORD || 'Student@12345';
 const apiOrigin = new URL(config.baseUrl).origin;
 const browserHostResolverRule = chromeHostResolverRule(config.baseUrl);
+const livePlaybackMode = String(process.env.QA_LIVE_CERT_PLAYBACK_MODE || 'live-stream').trim().toLowerCase() === 'livekit'
+  ? 'livekit'
+  : 'live-stream';
 
 const desktopViewport = { width: 1440, height: 1080, deviceScaleFactor: 1 };
 const mobileViewport = { width: 390, height: 844, deviceScaleFactor: 2, isMobile: true, hasTouch: true };
@@ -76,7 +87,7 @@ const takeScreenshot = async (page: puppeteer.Page, ctx: Awaited<ReturnType<type
 
 const isInvalidTokenError = (value: unknown) => {
   const message = value instanceof Error ? value.message : String(value || '');
-  return /invalid token/i.test(message);
+  return /invalid token|session was replaced by a newer login|token expired|unauthorized/i.test(message);
 };
 
 const loginToken = async (email: string, password: string, device: string) => {
@@ -173,6 +184,7 @@ const createLiveClass = async (token: string, title: string, startTime: string) 
       startTime,
       durationMinutes: 90,
       maxAttendees: 2500,
+      livePlaybackType: livePlaybackMode,
       requiresEnrollment: false,
       chatEnabled: true,
       doubtSolving: true,
@@ -429,6 +441,16 @@ const tryJoinAndCapture = async (
   studioUrl: string | null = null,
   sessionToken: string | null = null,
 ) => {
+  if (accessType === 'jitsi-room' && studioUrl) {
+    logStage(`${label}:teacher-studio-direct-open-start`);
+    const studioPage = await page.browserContext().newPage();
+    await studioPage.setViewport(desktopViewport);
+    await studioPage.goto(studioUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await studioPage.waitForSelector('body', { timeout: 45000 }).catch(() => undefined);
+    logStage(`${label}:teacher-studio-direct-opened`);
+    return takeScreenshot(studioPage, ctx, prefix, label);
+  }
+
   logStage(`${label}:wait-join-button`);
   await waitForJoinButton(page);
   logStage(`${label}:join-button-ready`);
@@ -635,6 +657,12 @@ const main = async () => {
     const adminAccess = await waitForLiveAccess(adminTokenManager.get(), liveClass._id, 'admin-access');
     const studentAccess = await waitForLiveAccess(studentToken, liveClass._id, 'student-access');
     logStage(`access-types:admin=${adminAccess.accessType || 'unknown'} student=${studentAccess.accessType || 'unknown'}`);
+    if (
+      livePlaybackMode === 'live-stream'
+      && (!studentAccess.streamUrl || /\/backend\/api\/live-classes\/stream\//.test(String(studentAccess.streamUrl)))
+    ) {
+      throw new Error(`Broadcast live-stream certification requires a public live-domain HLS URL, received: ${String(studentAccess.streamUrl || 'none')}`);
+    }
     stopPublisher = await maybeStartLiveTestPublisher({
       ingestServerUrl: liveClass.ingestServerUrl || null,
       ingestStreamKey: liveClass.ingestStreamKey || null,
@@ -657,6 +685,8 @@ const main = async () => {
       screenshots: [await takeScreenshot(adminPage, ctx, 'live-cert', 'admin-started')],
     });
 
+    await gotoLiveClass(adminPage, liveClass._id);
+    logStage('admin-live-detail-opened');
     await gotoLiveClass(studentDesktopPage, liveClass._id);
     logStage('student-desktop-live-detail-opened');
     await gotoLiveClass(studentMobilePage, liveClass._id);
@@ -719,7 +749,11 @@ const main = async () => {
       screenshots: [await takeScreenshot(studentDesktopPage, ctx, 'live-cert', 'student-desktop-runtime-controls')],
     });
 
-    if (adminAccess.accessType !== 'jitsi-room' && studentAccess.accessType !== 'live-stream') {
+    if (livePlaybackMode === 'live-stream') {
+      notes.push(studentAccess.accessType === 'live-stream'
+        ? 'Broadcast HLS classroom verified: student playback rendered successfully.'
+        : `Expected broadcast live-stream access but received ${studentAccess.accessType || 'unknown'}.`);
+    } else if (adminAccess.accessType !== 'jitsi-room' && studentAccess.accessType !== 'live-stream') {
       notes.push('Live classroom is not using the expected hybrid playback modes.');
     } else {
       notes.push('Hybrid classroom verified: teacher studio and student playback rendered successfully.');

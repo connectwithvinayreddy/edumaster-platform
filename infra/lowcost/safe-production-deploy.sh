@@ -10,6 +10,10 @@ CHECK_INTERVAL_SECONDS="${CHECK_INTERVAL_SECONDS:-2}"
 HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-240}"
 PUBLIC_MONITOR_LOG="${PUBLIC_MONITOR_LOG:-/tmp/edumaster-safe-deploy-public-checks.log}"
 SCRIPT_START_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+PLAYBACK_DEPLOY_GATE_ENFORCED="${PLAYBACK_DEPLOY_GATE_ENFORCED:-0}"
+PLAYBACK_DEPLOY_GATE_SUMMARY="${PLAYBACK_DEPLOY_GATE_SUMMARY:-}"
+PLAYBACK_DEPLOY_GATE_MANUAL_APPROVAL="${PLAYBACK_DEPLOY_GATE_MANUAL_APPROVAL:-}"
+PLAYBACK_DEPLOY_REQUIRED_STAGE="${PLAYBACK_DEPLOY_REQUIRED_STAGE:-2000}"
 
 if [[ ! -f "${ENV_FILE}" ]]; then
   echo "[deploy] missing env file: ${ENV_FILE}" >&2
@@ -145,6 +149,21 @@ build_images() {
   "${COMPOSE[@]}" build app app-2 manifest-app manifest-app-2 watch-worker replay-importer
 }
 
+verify_playback_deploy_gate() {
+  if [[ ! "${PLAYBACK_DEPLOY_GATE_ENFORCED}" =~ ^(1|true|yes|on)$ ]]; then
+    return 0
+  fi
+
+  echo "[deploy] enforcing protected-HLS playback deploy gate"
+  (
+    cd "${ROOT_DIR}"
+    PLAYBACK_DEPLOY_GATE_SUMMARY="${PLAYBACK_DEPLOY_GATE_SUMMARY}" \
+    PLAYBACK_DEPLOY_REQUIRED_STAGE="${PLAYBACK_DEPLOY_REQUIRED_STAGE}" \
+    PLAYBACK_DEPLOY_GATE_MANUAL_APPROVAL="${PLAYBACK_DEPLOY_GATE_MANUAL_APPROVAL}" \
+    node ./scripts/verify-playback-deploy-gate.mjs
+  )
+}
+
 service_container_id() {
   local service="$1"
   "${COMPOSE[@]}" ps -q "${service}"
@@ -268,6 +287,7 @@ check_logs_clean() {
 }
 
 main() {
+  verify_playback_deploy_gate
   print_status
   write_app_upstreams "app:5000 app-2:5000"
   build_images

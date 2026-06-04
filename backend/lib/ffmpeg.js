@@ -6,13 +6,13 @@ const normalizeCandidate = (value) => {
   return normalized ? normalized : null;
 };
 
-const canExecuteFfmpeg = (candidate) => {
+const canExecuteBinary = (candidate, args = ['-version']) => {
   if (!candidate) {
     return false;
   }
 
   try {
-    const result = spawnSync(candidate, ['-version'], {
+    const result = spawnSync(candidate, args, {
       stdio: 'ignore',
       timeout: 10_000,
     });
@@ -30,7 +30,27 @@ const resolveFfmpegPath = () => {
   ].filter(Boolean);
 
   for (const candidate of candidates) {
-    if (canExecuteFfmpeg(candidate)) {
+    if (canExecuteBinary(candidate, ['-version'])) {
+      return candidate;
+    }
+  }
+
+  return null;
+};
+
+const resolveFfprobePath = () => {
+  const staticCandidate = ffmpegStaticPath
+    ? normalizeCandidate(ffmpegStaticPath.replace(/ffmpeg(?:(?:\.exe)?)$/i, (match) => match.toLowerCase().includes('.exe') ? 'ffprobe.exe' : 'ffprobe'))
+    : null;
+
+  const candidates = [
+    normalizeCandidate(process.env.FFPROBE_PATH),
+    'ffprobe',
+    staticCandidate,
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    if (canExecuteBinary(candidate, ['-version'])) {
       return candidate;
     }
   }
@@ -40,4 +60,5 @@ const resolveFfmpegPath = () => {
 
 module.exports = {
   resolveFfmpegPath,
+  resolveFfprobePath,
 };

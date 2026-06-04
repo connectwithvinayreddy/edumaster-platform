@@ -17,6 +17,10 @@ const { appConfig, getProductionConfigDiagnostics } = require("./backend/lib/con
 const { connectDatabase } = require("./backend/lib/database.js");
 const { paymentRepository, coursesRepository } = require("./backend/lib/repositories.js");
 const { verifyRazorpayWebhookSignature } = require("./backend/payment/razorpay-client.js");
+const { startLiveEventBus } = require("./backend/live/live-event-bus.js");
+const { ensureReplayImporterWorker } = require("./backend/live/live-replay.worker.js");
+const { startMockTestRankingWorker, recoverPendingMockTestRankJobs } = require("./backend/test/mock-test-ranking.worker.js");
+const { recoverPendingCourseVideoProcessingJobs, startVideoProcessingRecoveryLoop } = require("./backend/lib/video-processing.js");
 
 const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || "";
 const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || "";
@@ -161,6 +165,38 @@ async function startServer() {
     }
 
     console.warn(`Database unavailable, starting in memory mode: ${databaseState.reason}`);
+  }
+
+  const enableBackgroundWorkers = String(process.env.ENABLE_BACKGROUND_WORKERS || "true").toLowerCase() !== "false";
+  if (enableBackgroundWorkers) {
+    startLiveEventBus();
+    ensureReplayImporterWorker();
+    startMockTestRankingWorker();
+    recoverPendingCourseVideoProcessingJobs({ forceRestartRecovery: true })
+      .then((result: { scanned: number; scheduled: number }) => {
+        console.log(`[video-processing] ${JSON.stringify({
+          event: "startup-recovery-complete",
+          scannedLessons: result.scanned,
+          scheduledJobs: result.scheduled,
+          at: new Date().toISOString(),
+        })}`);
+      })
+      .catch((error: unknown) => {
+        console.error("[video-processing] failed to recover pending course video jobs", error);
+      });
+    recoverPendingMockTestRankJobs()
+      .then((result: { scanned: number; scheduled: number }) => {
+        console.log(`[mock-test-ranking] ${JSON.stringify({
+          event: "startup-recovery-complete",
+          scannedTests: result.scanned,
+          scheduledJobs: result.scheduled,
+          at: new Date().toISOString(),
+        })}`);
+      })
+      .catch((error: unknown) => {
+        console.error("[mock-test-ranking] failed to recover pending rank jobs", error);
+      });
+    startVideoProcessingRecoveryLoop();
   }
 
   const app = express();

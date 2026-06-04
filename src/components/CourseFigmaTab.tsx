@@ -1260,6 +1260,7 @@ export const CourseFigmaTab = ({
   const protectedPlaybackTimeoutRetryCountRef = useRef(0);
   const protectedPlaybackRetryTimerRef = useRef<number | null>(null);
   const replayFromStartLessonIdRef = useRef<string | null>(null);
+  const protectedPlaybackRequestSeqRef = useRef(0);
   const playerControlsHideTimerRef = useRef<number | null>(null);
   const hlsRef = useRef<HlsRuntimeInstance | null>(null);
 
@@ -1931,6 +1932,8 @@ export const CourseFigmaTab = ({
 
       return {
         ...current,
+        sourceUrl: nextBinding.sourceUrl || current.sourceUrl,
+        drmManifestUrl: nextBinding.drmManifestUrl || current.drmManifestUrl,
         playbackSessionId: nextBinding.playbackSessionId || current.playbackSessionId || null,
         streamFormat: nextBinding.streamFormat || current.streamFormat || null,
         videoType: nextBinding.videoType || current.videoType || 'course',
@@ -1944,6 +1947,102 @@ export const CourseFigmaTab = ({
       };
     });
   }, [protectedLessonPlayback, selectedLesson?.id]);
+
+  const applyProtectedLessonPlaybackPayload = useCallback((payload: ProtectedLessonPlayback, options: {
+    invalidateInFlight?: boolean;
+  } = {}) => {
+    const selectedLessonId = String(selectedLesson?.id || '').trim();
+    if (!selectedLessonId) {
+      return;
+    }
+
+    if (options.invalidateInFlight) {
+      protectedPlaybackRequestSeqRef.current += 1;
+    }
+
+    setProtectedLessonPlayback((current) => {
+      const currentVideoId = String(current?.videoId || '').trim();
+      const payloadVideoId = String(payload?.videoId || selectedLesson.id || '').trim();
+      const sameVideo = Boolean(current && currentVideoId && payloadVideoId && currentVideoId === payloadVideoId);
+      if (!sameVideo) {
+        return payload;
+      }
+
+      return {
+        ...current,
+        ...payload,
+        streamUrl: payload.streamUrl || current.streamUrl || null,
+        drmConfig: payload.drmConfig?.manifestUrl
+          ? payload.drmConfig
+          : payload.drmConfig || current.drmConfig || null,
+        fallbackStreamUrl: payload.fallbackStreamUrl || current.fallbackStreamUrl || null,
+        fallbackStreamFormat: payload.fallbackStreamFormat || current.fallbackStreamFormat || null,
+        deliveryProfile: payload.deliveryProfile || current.deliveryProfile || null,
+        streamFormat: payload.streamFormat || current.streamFormat || null,
+        statusMessage: payload.statusMessage || current.statusMessage || null,
+        resumeSeconds: Math.max(Number(payload.resumeSeconds || current.resumeSeconds || 0), 0),
+        watchState: payload.watchState || current.watchState || null,
+      };
+    });
+
+    const sourceUrl = String(
+      payload.drmConfig?.manifestUrl
+      || payload.streamUrl
+      || '',
+    ).trim();
+    if (!sourceUrl) {
+      return;
+    }
+
+    const nextBinding: StableProtectedPlaybackBinding = {
+      lessonId: selectedLessonId,
+      videoId: String(payload.videoId || selectedLesson.id || '').trim() || null,
+      sourceUrl,
+      drmManifestUrl: String(payload.drmConfig?.manifestUrl || '').trim() || null,
+      drmConfig: payload.drmConfig || null,
+      streamFormat: payload.streamFormat || null,
+      playbackSessionId: String(payload.playbackSessionId || '').trim() || null,
+      videoType: payload.videoType || 'course',
+      deliveryProfile: payload.deliveryProfile || null,
+      resumeSeconds: Math.max(Number(payload.resumeSeconds || 0), 0),
+      watchState: payload.watchState || null,
+      replayState: payload.watchState?.replayState || null,
+    };
+
+    setActiveProtectedPlaybackBinding((current) => {
+      if (!current) {
+        return nextBinding;
+      }
+
+      const sameLesson = String(current.lessonId || '') === selectedLessonId;
+      const sameVideo = String(current.videoId || '') === String(nextBinding.videoId || '');
+      if (!sameLesson || !sameVideo) {
+        return nextBinding;
+      }
+
+      return {
+        ...current,
+        sourceUrl: nextBinding.sourceUrl || current.sourceUrl,
+        drmManifestUrl: nextBinding.drmManifestUrl || current.drmManifestUrl,
+        playbackSessionId: nextBinding.playbackSessionId || current.playbackSessionId || null,
+        streamFormat: nextBinding.streamFormat || current.streamFormat || null,
+        videoType: nextBinding.videoType || current.videoType || 'course',
+        deliveryProfile: nextBinding.deliveryProfile || current.deliveryProfile || null,
+        drmConfig: nextBinding.drmConfig || current.drmConfig || null,
+        resumeSeconds: Math.max(
+          Number(nextBinding.resumeSeconds || 0),
+          Number(current.resumeSeconds || 0),
+          0,
+        ),
+        watchState: nextBinding.watchState || current.watchState || null,
+        replayState: nextBinding.replayState || current.replayState || null,
+      };
+    });
+  }, [selectedLesson?.id]);
+
+  const handleProtectedPlaybackRefreshed = useCallback((payload: ProtectedLessonPlayback) => {
+    applyProtectedLessonPlaybackPayload(payload, { invalidateInFlight: true });
+  }, [applyProtectedLessonPlaybackPayload]);
 
   useEffect(() => {
     if (!shouldLoadLessonDoubts) {
@@ -1967,9 +2066,11 @@ export const CourseFigmaTab = ({
       protectedPlaybackRetryTimerRef.current = null;
     }
 
+    const requestSeq = protectedPlaybackRequestSeqRef.current + 1;
+    protectedPlaybackRequestSeqRef.current = requestSeq;
     let settled = false;
     const timeoutId = window.setTimeout(() => {
-      if (settled) {
+      if (settled || requestSeq !== protectedPlaybackRequestSeqRef.current) {
         return;
       }
       settled = true;
@@ -2007,7 +2108,7 @@ export const CourseFigmaTab = ({
 
     void EduService.getProtectedLessonPlayback(selectedCourse._id, selectedLesson.id, { forceRefresh })
       .then((payload) => {
-        if (settled) {
+        if (settled || requestSeq !== protectedPlaybackRequestSeqRef.current) {
           return;
         }
         settled = true;
@@ -2054,7 +2155,7 @@ export const CourseFigmaTab = ({
         });
       })
       .catch((error) => {
-        if (settled) {
+        if (settled || requestSeq !== protectedPlaybackRequestSeqRef.current) {
           return;
         }
         settled = true;
@@ -2069,6 +2170,9 @@ export const CourseFigmaTab = ({
         setProtectedLessonError(error instanceof Error ? error.message : 'Unable to prepare lesson playback.');
       })
       .finally(() => {
+        if (requestSeq !== protectedPlaybackRequestSeqRef.current) {
+          return;
+        }
         if (!settled) {
           settled = true;
           window.clearTimeout(timeoutId);
@@ -2084,7 +2188,7 @@ export const CourseFigmaTab = ({
       settled = true;
       window.clearTimeout(timeoutId);
     };
-  }, [selectedCourse?._id, selectedLesson?.id, user?._id]);
+  }, [applyProtectedLessonPlaybackPayload, selectedCourse?._id, selectedLesson?.id, user?._id]);
 
   useEffect(() => {
     const shouldLoadProtectedLesson = Boolean(
@@ -4126,7 +4230,7 @@ export const CourseFigmaTab = ({
           {shouldUseHlsPlayer ? (
             <ResilientHlsVideo
               ref={protectedLessonVideoRef}
-              key={`secure-player:${selectedLesson.id}:${activeProtectedPlaybackBinding?.playbackSessionId || protectedLessonPlayback?.playbackSessionId || 'sessionless'}`}
+              key={`secure-player:${selectedLesson.id}:${activeProtectedPlaybackBinding?.videoId || protectedLessonPlayback?.videoId || 'video'}`}
               src={drmManifestUrl || playerUrl || ''}
               drmConfig={playerDrmConfig}
               title={selectedLesson.title}
@@ -4139,6 +4243,7 @@ export const CourseFigmaTab = ({
               deliveryProfile={activeProtectedPlaybackBinding?.deliveryProfile || protectedLessonPlayback?.deliveryProfile || null}
               deliveryPathHint={playerDeliveryPath}
               resetResumeCounter={lessonReplayResetCounter}
+              autoPlay={activeLessonTab === 'Video'}
               resumeSeconds={activeProtectedPlaybackBinding?.resumeSeconds ?? protectedLessonPlayback?.resumeSeconds ?? 0}
               playbackSpeed={playbackSpeed}
               defaultQualityHeight={480}
@@ -4152,6 +4257,7 @@ export const CourseFigmaTab = ({
                 setIsPlayerBuffering(Boolean(state.waiting));
               }}
               onVideoClick={() => void toggleCurrentLessonPlayback()}
+              onProtectedPlaybackRefreshed={handleProtectedPlaybackRefreshed}
               className={cn(
                 'w-full bg-black',
                 isFullscreen
@@ -4178,10 +4284,11 @@ export const CourseFigmaTab = ({
             />
           ) : (
             <video
-              key={`source-player:${selectedLesson.id}:${activeProtectedPlaybackBinding?.playbackSessionId || protectedLessonPlayback?.playbackSessionId || 'sessionless'}`}
+              key={`source-player:${selectedLesson.id}:${activeProtectedPlaybackBinding?.videoId || protectedLessonPlayback?.videoId || 'video'}`}
               ref={lessonVideoRef}
               data-testid="course-player-video"
               src={playerFormat === 'source' || isHostedVideo ? playerUrl : undefined}
+              autoPlay={activeLessonTab === 'Video'}
               controlsList="nodownload noremoteplayback"
               playsInline
               disablePictureInPicture

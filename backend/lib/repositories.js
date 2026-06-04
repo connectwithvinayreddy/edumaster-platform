@@ -15,6 +15,13 @@ const {
   setRedisJson,
 } = require('./redis.js');
 const { state, clone, nextId, nowIso } = require('./store.js');
+const {
+  normalizeSubmittedAnswers,
+  scoreMockTestAttempt,
+  buildAttemptSolutions,
+  deriveTopicStrengths,
+} = require('../test/mock-test-attempts.js');
+const { queueMockTestRankRecompute } = require('../test/mock-test-ranking.worker.js');
 const { decryptVideoId, normalizeYouTubeVideoId, buildSecureYouTubeEmbedUrl } = require('./video-security.js');
 const { issuePlaybackToken, buildManifestBundleUrl, buildCompactAssetUrl } = require('./private-video.js');
 const { appConfig } = require('./config.js');
@@ -68,6 +75,11 @@ const toNumber = (value, fallback = 0) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
 };
+const toNullableNumber = (value) => (
+  value === null || value === undefined || value === ''
+    ? null
+    : toNumber(value)
+);
 const asArray = (value) => (Array.isArray(value) ? clone(value) : []);
 const asObject = (value) => (value && typeof value === 'object' ? clone(value) : {});
 const createPersistentId = (prefix) => `${prefix}_${randomUUID().replace(/-/g, '')}`;
@@ -79,6 +91,7 @@ const replayRetentionDays = Math.max(1, Number(appConfig.videoReplayRetentionDay
 const replayViewLimitEnabled = Boolean(appConfig.videoReplayViewLimitEnabled);
 const replayMaxViews = Math.max(0, Number(appConfig.videoReplayMaxViews || 0));
 const replayRetentionMs = replayRetentionDays * 24 * 60 * 60 * 1000;
+const mockAttemptSubmissionLocks = new Map();
 const liveReplayRetentionDays = replayRetentionDays;
 const liveReplayMaxViews = replayMaxViews;
 const liveReplayRetentionMs = liveReplayRetentionDays * 24 * 60 * 60 * 1000;
@@ -138,6 +151,25 @@ const normalizeLessonStage = (stage) => {
 const shouldUseManifestBundlePlaybackRoute = () =>
   appConfig.nodeEnv === 'production' && Boolean(appConfig.privateVideoHlsCacheWarmBaseUrl);
 const trimTrailingSlash = (value) => String(value || '').replace(/\/+$/, '');
+const withMockAttemptLock = async (testId, userId, handler) => {
+  const key = `${String(userId || 'guest')}:${String(testId || '')}`;
+  while (mockAttemptSubmissionLocks.has(key)) {
+    await mockAttemptSubmissionLocks.get(key);
+  }
+
+  let releaseLock = null;
+  const lockPromise = new Promise((resolve) => {
+    releaseLock = resolve;
+  });
+  mockAttemptSubmissionLocks.set(key, lockPromise);
+
+  try {
+    return await handler();
+  } finally {
+    mockAttemptSubmissionLocks.delete(key);
+    releaseLock();
+  }
+};
 const trimSlashes = (value) => String(value || '').replace(/^\/+|\/+$/g, '');
 const buildPlaybackWatermarkText = (user) => [
   user?.name,
@@ -1215,9 +1247,7 @@ const isPrivateLessonStreamReady = (lesson) => {
 
   const provider = getPrivateLessonPlaybackProvider(lesson);
   const status = String(lesson.hlsProcessingStatus || '').toLowerCase();
-  const sourceReady = Boolean(lesson.storagePath);
-  const sourceFallbackAllowed = Boolean(lesson.sourceFallbackAllowed ?? appConfig.sourcePlaybackFallbackEnabled)
-    || ['queued', 'processing', 'failed'].includes(status);
+  const sourceReady = Boolean(lesson?.storagePath);
   if (provider === 'cloudflare-stream') {
     return Boolean(
       lesson.playbackReady !== false
@@ -1228,8 +1258,9 @@ const isPrivateLessonStreamReady = (lesson) => {
 
   if (lesson.deliveryStrategy === 'hls') {
     return Boolean(
-      (status === 'ready' && lesson.hlsPlaybackPath)
-      || (sourceReady && sourceFallbackAllowed),
+      lesson.playbackReady !== false
+      && status === 'ready'
+      && lesson.hlsPlaybackPath,
     );
   }
 
@@ -1469,7 +1500,7 @@ const sanitizeTestVideoForViewer = (video) => {
     deliveryStrategy: video.deliveryStrategy || 'source',
     hlsProcessingStatus: video.hlsProcessingStatus || 'ready',
     hlsProcessingError: video.hlsProcessingError || null,
-    sourceFallbackAllowed: Boolean(video.sourceFallbackAllowed ?? true),
+    sourceFallbackAllowed: Boolean(video.sourceFallbackAllowed ?? false),
     targetQualities: asArray(video.targetQualities),
     available: Boolean(video.storagePath || video.hlsPlaybackPath),
   };
@@ -2237,8 +2268,10 @@ const mapTestAttemptRow = (row) => {
     correctCount: Number(row.correct_count || 0),
     incorrectCount: Number(row.incorrect_count || 0),
     unattemptedCount: Number(row.unattempted_count || 0),
-    percentile: toNumber(row.percentile),
-    rank: Number(row.all_india_rank || 0),
+    percentile: toNullableNumber(row.percentile),
+    rank: row.all_india_rank === null || row.all_india_rank === undefined ? null : Number(row.all_india_rank || 0),
+    rankStatus: row.rank_status || 'pending',
+    rankComputedAt: toIso(row.rank_computed_at) || null,
     answers: asObject(row.answers),
     weakTopics: asArray(row.weak_topics),
     strongTopics: asArray(row.strong_topics),
@@ -3738,7 +3771,7 @@ const upsertPgVideoWatchState = async (payload, client = null) => {
         $8, $9, $10,
         $11::jsonb, $12, $13,
         $14, $15, $16,
-        COALESCE($17, 0), $18,
+        COALESCE($17::numeric, 0::numeric), $18,
         $19, $20, $21, $22,
         $23, $24, $25, $26, $27, $28, $29
       )
@@ -4077,8 +4110,10 @@ const insertPgTestAttempt = async (payload, client = null) => {
     correctCount: Number(payload.correctCount || 0),
     incorrectCount: Number(payload.incorrectCount || 0),
     unattemptedCount: Number(payload.unattemptedCount || 0),
-    percentile: Number(payload.percentile || 0),
-    rank: Number(payload.rank || 0),
+    percentile: payload.percentile === null || payload.percentile === undefined ? null : Number(payload.percentile || 0),
+    rank: payload.rank === null || payload.rank === undefined ? null : Number(payload.rank || 0),
+    rankStatus: payload.rankStatus || 'pending',
+    rankComputedAt: payload.rankComputedAt || null,
     answers: asObject(payload.answers),
     weakTopics: asArray(payload.weakTopics),
     strongTopics: asArray(payload.strongTopics),
@@ -4087,12 +4122,15 @@ const insertPgTestAttempt = async (payload, client = null) => {
     completedAt: payload.completedAt || nowIso(),
   };
 
-  await pgExec(
+  return pgOne(
     `
       INSERT INTO test_attempts (
         id, user_id, test_id, score, total_marks, correct_count, incorrect_count, unattempted_count,
-        percentile, all_india_rank, answers, weak_topics, strong_topics, solutions, started_at, completed_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14::jsonb, $15, $16)
+        percentile, all_india_rank, answers, weak_topics, strong_topics, solutions,
+        rank_status, rank_computed_at, started_at, completed_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14::jsonb, $15, $16, $17, $18)
+      ON CONFLICT (user_id, test_id) DO NOTHING
+      RETURNING *
     `,
     [
       attempt._id,
@@ -4109,13 +4147,14 @@ const insertPgTestAttempt = async (payload, client = null) => {
       JSON.stringify(attempt.weakTopics || []),
       JSON.stringify(attempt.strongTopics || []),
       JSON.stringify(attempt.solutions || []),
+      attempt.rankStatus,
+      attempt.rankComputedAt,
       attempt.startedAt,
       attempt.completedAt,
     ],
+    mapTestAttemptRow,
     client,
   );
-
-  return attempt;
 };
 
 const upsertPgQuizAttempt = async (payload, client = null) => {
@@ -4751,7 +4790,16 @@ const getPlaybackSessionAgeSeconds = (session) => {
   return Math.max(0, Math.floor((Date.now() - lastActivityMs) / 1000));
 };
 
-const isFreshActivePlaybackSession = (session) => {
+const isStoredActivePlaybackSessionFresh = (session) => {
+  const ageSeconds = getPlaybackSessionAgeSeconds(session);
+  if (ageSeconds === null) {
+    return false;
+  }
+
+  return ageSeconds <= videoPlaybackSessionTtlSeconds;
+};
+
+const isReconnectableActivePlaybackSession = (session) => {
   const ageSeconds = getPlaybackSessionAgeSeconds(session);
   if (ageSeconds === null) {
     return false;
@@ -4869,7 +4917,7 @@ const describePlaybackSessionDecision = ({
     )
   );
 
-  if (!isFreshActivePlaybackSession(activeSession)) {
+  if (!isReconnectableActivePlaybackSession(activeSession)) {
     return {
       decision: 'expire',
       reason: 'reconnect_grace_expired',
@@ -5062,6 +5110,7 @@ const videoPlaybackRepository = {
     videoId,
     videoType = COURSE_VIDEO_TYPE,
     videoDurationSeconds = 0,
+    lockForUpdate = false,
   }, client = null) {
     const identity = buildVideoWatchStateRecordIdentity({ userId, courseId, videoId, videoType });
     let effectiveWatchSettings = null;
@@ -5086,6 +5135,7 @@ const videoPlaybackRepository = {
         `
           SELECT * FROM video_watch_states
           WHERE user_id = $1 AND course_id = $2 AND video_id = $3 AND video_type = $4
+          ${lockForUpdate ? 'FOR UPDATE' : ''}
         `,
         [identity.userId, identity.courseId, identity.videoId, identity.videoType],
         mapVideoWatchStateRow,
@@ -5135,7 +5185,7 @@ const videoPlaybackRepository = {
     if (!active) {
       return null;
     }
-    if (!isFreshActivePlaybackSession(active)) {
+    if (!isStoredActivePlaybackSessionFresh(active)) {
       await deleteRedisKey(buildActivePlaybackSessionKey(userId));
       return null;
     }
@@ -5249,24 +5299,6 @@ const videoPlaybackRepository = {
     ipAddress = null,
     userAgent = null,
   }) {
-    const watchState = await videoPlaybackRepository.getWatchState({
-      userId,
-      courseId,
-      lessonId,
-      videoId,
-      videoType,
-      videoDurationSeconds,
-    });
-
-    if (watchState.isLocked) {
-      throw new ApiError(403, 'Video watch limit reached', {
-        code: 'VIDEO_WATCH_LIMIT_REACHED',
-        details: {
-          watchState: buildVideoWatchStateSummary(watchState),
-        },
-      });
-    }
-
     const activePlaybackSessionKey = buildActivePlaybackSessionKey(userId);
     const rawActiveSession = await getRedisJson(activePlaybackSessionKey);
     const sessionDecision = describePlaybackSessionDecision({
@@ -5370,21 +5402,44 @@ const videoPlaybackRepository = {
       issuedAt: sessionDecision.reuseExistingSession ? activeSession?.issuedAt || issuedAt : issuedAt,
       lastHeartbeatAt: sessionDecision.reuseExistingSession ? activeSession?.lastHeartbeatAt || null : null,
       updatedAt: issuedAt,
-      status: watchState.isLocked ? 'locked' : 'active',
+      status: 'active',
     };
 
-    await videoPlaybackRepository.setActivePlaybackSession(userId, nextSession);
-    const savedState = await videoPlaybackRepository.saveWatchState({
-      ...watchState,
-      lessonId: lessonId || watchState.lessonId || null,
-      playbackSessionId,
-      activeSessionStatus: nextSession.status,
-      deviceId: nextSession.deviceId || watchState.deviceId || null,
-      ipAddress: nextSession.ipAddress || watchState.ipAddress || null,
-      userAgent: nextSession.userAgent || watchState.userAgent || null,
-      updatedAt: issuedAt,
-      createdAt: watchState.createdAt || issuedAt,
+    const savedState = await runInTransaction(async (client) => {
+      const lockedWatchState = await videoPlaybackRepository.getWatchState({
+        userId,
+        courseId,
+        lessonId,
+        videoId,
+        videoType,
+        videoDurationSeconds,
+        lockForUpdate: true,
+      }, client);
+
+      if (lockedWatchState.isLocked) {
+        throw new ApiError(403, 'Video watch limit reached', {
+          code: 'VIDEO_WATCH_LIMIT_REACHED',
+          details: {
+            watchState: buildVideoWatchStateSummary(lockedWatchState),
+          },
+        });
+      }
+
+      nextSession.status = lockedWatchState.isLocked ? 'locked' : 'active';
+
+      return videoPlaybackRepository.saveWatchState({
+        ...lockedWatchState,
+        lessonId: lessonId || lockedWatchState.lessonId || null,
+        playbackSessionId,
+        activeSessionStatus: nextSession.status,
+        deviceId: nextSession.deviceId || lockedWatchState.deviceId || null,
+        ipAddress: nextSession.ipAddress || lockedWatchState.ipAddress || null,
+        userAgent: nextSession.userAgent || lockedWatchState.userAgent || null,
+        updatedAt: issuedAt,
+        createdAt: lockedWatchState.createdAt || issuedAt,
+      }, client);
     });
+    await videoPlaybackRepository.setActivePlaybackSession(userId, nextSession);
     logPlaybackSessionDecision({
       userId,
       courseId,
@@ -5418,54 +5473,73 @@ const videoPlaybackRepository = {
     userAgent = null,
     heartbeatPayload,
   }) {
-    const activeSession = await videoPlaybackRepository.validatePlaybackSession({
-      userId,
-      playbackSessionId,
-      authSessionId,
-      courseId,
-      videoId,
-      videoType,
-      requestContext,
-    });
-
-    if (!activeSession) {
-      throw new ApiError(409, 'Playback session is no longer valid', {
-        code: 'PLAYBACK_SESSION_INVALID',
+    const {
+      activeSession,
+      effectivePlaybackSessionId,
+      nextState,
+      outcome,
+      heartbeat,
+      previousWatchSummary,
+    } = await runInTransaction(async (client) => {
+      const currentActiveSession = await videoPlaybackRepository.validatePlaybackSession({
+        userId,
+        playbackSessionId,
+        authSessionId,
+        courseId,
+        videoId,
+        videoType,
+        requestContext,
       });
-    }
 
-    const effectivePlaybackSessionId = String(activeSession.playbackSessionId || playbackSessionId || '');
+      if (!currentActiveSession) {
+        throw new ApiError(409, 'Playback session is no longer valid', {
+          code: 'PLAYBACK_SESSION_INVALID',
+        });
+      }
 
-    const existingState = await videoPlaybackRepository.getWatchState({
-      userId,
-      courseId,
-      lessonId,
-      videoId,
-      videoType,
-      videoDurationSeconds,
-    });
+      const resolvedPlaybackSessionId = String(currentActiveSession.playbackSessionId || playbackSessionId || '');
 
-    const serverNowMs = Date.now();
-    const { state: nextStateRaw, outcome, heartbeat } = applyPlaybackHeartbeat(existingState, {
-      ...heartbeatPayload,
-      videoId,
-      videoType,
-      playbackSessionId: effectivePlaybackSessionId,
-      deviceId: requestContext?.deviceId || heartbeatPayload?.deviceId || null,
-      userAgent: userAgent || requestContext?.userAgent || heartbeatPayload?.userAgent || null,
-      ipAddress: ipAddress || heartbeatPayload?.ipAddress || null,
-    }, {
-      chunkSeconds: videoWatchChunkSeconds,
-      maxPlaybackRate: videoPlaybackMaxRate,
-      heartbeatGraceSeconds: videoPlaybackHeartbeatGraceSeconds,
-      maxHeartbeatGapSeconds: videoPlaybackMaxHeartbeatGapSeconds,
-      serverNowMs,
-      videoDurationSeconds,
-    });
+      const existingState = await videoPlaybackRepository.getWatchState({
+        userId,
+        courseId,
+        lessonId,
+        videoId,
+        videoType,
+        videoDurationSeconds,
+        lockForUpdate: true,
+      }, client);
 
-    const nextState = await videoPlaybackRepository.saveWatchState({
-      ...nextStateRaw,
-      lessonId: lessonId || nextStateRaw.lessonId || null,
+      const serverNowMs = Date.now();
+      const { state: nextStateRaw, outcome: nextOutcome, heartbeat: nextHeartbeat } = applyPlaybackHeartbeat(existingState, {
+        ...heartbeatPayload,
+        videoId,
+        videoType,
+        playbackSessionId: resolvedPlaybackSessionId,
+        deviceId: requestContext?.deviceId || heartbeatPayload?.deviceId || null,
+        userAgent: userAgent || requestContext?.userAgent || heartbeatPayload?.userAgent || null,
+        ipAddress: ipAddress || heartbeatPayload?.ipAddress || null,
+      }, {
+        chunkSeconds: videoWatchChunkSeconds,
+        maxPlaybackRate: videoPlaybackMaxRate,
+        heartbeatGraceSeconds: videoPlaybackHeartbeatGraceSeconds,
+        maxHeartbeatGapSeconds: videoPlaybackMaxHeartbeatGapSeconds,
+        serverNowMs,
+        videoDurationSeconds,
+      });
+
+      const persistedState = await videoPlaybackRepository.saveWatchState({
+        ...nextStateRaw,
+        lessonId: lessonId || nextStateRaw.lessonId || null,
+      }, client);
+
+      return {
+        activeSession: currentActiveSession,
+        effectivePlaybackSessionId: resolvedPlaybackSessionId,
+        nextState: persistedState,
+        outcome: nextOutcome,
+        heartbeat: nextHeartbeat,
+        previousWatchSummary: buildVideoWatchStateSummary(existingState),
+      };
     });
 
     const nextActiveSession = {
@@ -5564,6 +5638,7 @@ const videoPlaybackRepository = {
     return {
       watchState: nextState,
       watchSummary: buildVideoWatchStateSummary(nextState),
+      previousWatchSummary,
       playbackSession: nextActiveSession,
       outcome,
     };
@@ -7451,9 +7526,6 @@ const coursesRepository = {
         && lesson.hlsPlaybackPath;
       const sourceReady = Boolean(lesson.storagePath);
       const hlsProcessingStatus = String(lesson.hlsProcessingStatus || '').toLowerCase();
-      const sourceFallbackAllowed = Boolean(lesson.sourceFallbackAllowed)
-        || Boolean(appConfig.sourcePlaybackFallbackEnabled)
-        || ['queued', 'processing', 'failed'].includes(hlsProcessingStatus);
 
       if (!hlsReady && !sourceReady && !isCloudflareStreamLesson) {
         throw new ApiError(isAdmin ? 500 : 404, isAdmin
@@ -7464,79 +7536,6 @@ const coursesRepository = {
       }
 
       if (!hlsReady) {
-        if (sourceReady && sourceFallbackAllowed) {
-          const { playbackSession, watchState } = await videoPlaybackRepository.startPlaybackSession({
-            userId,
-            courseId,
-            lessonId,
-            videoId: lesson._id || lesson.id || lessonId,
-            videoType: COURSE_VIDEO_TYPE,
-            videoDurationSeconds: Number(lesson.durationMinutes || 0) * 60,
-            authSessionId: resolvedUser.session || null,
-            requestContext,
-            ipAddress: requestContext?.ipAddress || null,
-            userAgent: requestContext?.userAgent || null,
-          });
-          const issuedToken = issuePlaybackToken({
-            kind: 'course-private-source',
-            userId: String(userId),
-            sessionId: resolvedUser.session || null,
-            courseId: String(courseId),
-            lessonId: String(lessonId),
-            videoId: String(lesson._id || lesson.id || lessonId),
-            videoType: COURSE_VIDEO_TYPE,
-            playbackSessionId: playbackSession.playbackSessionId,
-            userAgentHash: requestContext?.userAgentHash || null,
-            storageProvider: lesson.storageProvider || 'local',
-            storagePath: String(lesson.storagePath),
-            mimeType: lesson.mimeType || 'video/mp4',
-            assetKind: 'source',
-          });
-
-          accessDecision.video_watch_limit_status = watchState.isLocked ? 'reached' : 'within_limit';
-          return finalizePlayer({
-            playerType: 'private-video',
-            embedUrl: null,
-            streamUrl: `/backend/api/courses/stream/${issuedToken.token}`,
-            drmConfig: null,
-            fallbackStreamUrl: null,
-            fallbackStreamFormat: null,
-            fallbackReason: hlsProcessingStatus === 'queued' || hlsProcessingStatus === 'processing'
-              ? 'Protected source playback is active while adaptive HLS packaging finishes.'
-              : hlsProcessingStatus === 'failed' || lesson.hlsProcessingError
-                ? 'Protected source playback is active because adaptive HLS is temporarily unavailable.'
-                : 'Protected source playback is active for this lesson.',
-            streamFormat: 'source',
-            playbackStatus: lesson.hlsProcessingStatus || 'ready',
-            deliveryProfile: lesson.deliveryProfile || 'r2-private-hls',
-            availableQualities: Array.isArray(lesson.targetQualities) ? lesson.targetQualities : [],
-            statusMessage: hlsProcessingStatus === 'queued' || hlsProcessingStatus === 'processing'
-              ? 'Adaptive HLS processing is running. Protected source playback is temporarily available.'
-              : hlsProcessingStatus === 'failed' || lesson.hlsProcessingError
-                ? 'Adaptive HLS processing failed. Protected source playback is temporarily available.'
-                : 'Protected lesson video ready.',
-            watermarkText: buildPlaybackWatermarkText(resolvedUser),
-            resumeSeconds: resolveProtectedLessonResumeSeconds({
-              watchState,
-              lessonProgress,
-              durationSeconds: protectedLessonDurationSeconds,
-            }),
-            completed: Boolean(lessonProgress?.completed),
-            tokenExpiresAt: issuedToken.expiresAt,
-            drmEnabled: false,
-            courseId: String(courseId),
-            videoId: String(lesson._id || lesson.id || lessonId),
-            playbackSessionId: playbackSession.playbackSessionId,
-            videoType: COURSE_VIDEO_TYPE,
-            watchLimit: watchState.allowedFullWatches,
-            watchCompletionPercent: watchState.fullWatchThresholdPercentage,
-            watchState: buildVideoWatchStateSummary(watchState),
-            playbackGrantExpiresAt: null,
-            playbackGrantRemainingViews: null,
-            courseVideoAccessMode: accessDecision.course_video_access_mode,
-          });
-        }
-
         if (hlsProcessingStatus === 'queued' || hlsProcessingStatus === 'processing') {
           try {
             const { maybeRecoverStaleCourseVideoProcessingJob } = require('./video-processing.js');
@@ -7678,34 +7677,14 @@ const coursesRepository = {
         });
 
       accessDecision.video_watch_limit_status = watchState.isLocked ? 'reached' : 'within_limit';
-      const sourceIssuedToken = sourceReady && sourceFallbackAllowed
-        ? issuePlaybackToken({
-          kind: 'course-private-source',
-          userId: String(userId),
-          sessionId: resolvedUser.session || null,
-          courseId: String(courseId),
-          lessonId: String(lessonId),
-          videoId: String(lesson._id || lesson.id || lessonId),
-          videoType: COURSE_VIDEO_TYPE,
-          playbackSessionId: playbackSession.playbackSessionId,
-          userAgentHash: requestContext?.userAgentHash || null,
-          storageProvider: lesson.storageProvider || 'local',
-          storagePath: String(lesson.storagePath),
-          mimeType: lesson.mimeType || 'video/mp4',
-          assetKind: 'source',
-        })
-        : null;
-
       return finalizePlayer({
         playerType: 'private-video',
         embedUrl: null,
         streamUrl: issuedToken.url,
         drmConfig,
-        fallbackStreamUrl: sourceIssuedToken ? `/backend/api/courses/stream/${sourceIssuedToken.token}` : null,
-        fallbackStreamFormat: sourceIssuedToken ? 'source' : null,
-        fallbackReason: sourceIssuedToken
-          ? 'Protected source playback is available if adaptive HLS needs to recover.'
-          : null,
+        fallbackStreamUrl: null,
+        fallbackStreamFormat: null,
+        fallbackReason: null,
         streamFormat: 'hls',
         playbackStatus: 'ready',
         deliveryProfile: lesson.deliveryProfile || (cloudflarePlayback ? 'cloudflare-stream' : 'r2-private-hls'),
@@ -8276,112 +8255,50 @@ const testsRepository = {
       }
     }
 
-    const answers = payload.answers || {};
-    let score = 0;
-    let correctCount = 0;
-    let incorrectCount = 0;
-    let unattemptedCount = 0;
-    const topicStats = new Map();
-
-    test.questions.forEach((question) => {
-      const submittedAnswer = answers[question.id];
-      const submittedOptionIndexes = Array.isArray(submittedAnswer)
-        ? [...new Set(submittedAnswer.map((option) => Number(option)).filter((option) => Number.isInteger(option) && option >= 0))].sort((left, right) => left - right)
-        : submittedAnswer === undefined || submittedAnswer === null
-          ? []
-          : [Number(submittedAnswer)].filter((option) => Number.isInteger(option) && option >= 0);
-      const correctOptionIndexes = Array.isArray(question.correctOptions) && question.correctOptions.length > 0
-        ? [...new Set(question.correctOptions.map((option) => Number(option)).filter((option) => Number.isInteger(option) && option >= 0))].sort((left, right) => left - right)
-        : Number.isFinite(Number(question.correctOption ?? question.answer))
-          ? [Number(question.correctOption ?? question.answer)]
-          : [0];
-      const topic = question.topic || 'General Practice';
-      const currentStats = topicStats.get(topic) || { correct: 0, incorrect: 0 };
-
-      if (submittedOptionIndexes.length === 0) {
-        unattemptedCount += 1;
-      } else if (
-        submittedOptionIndexes.length === correctOptionIndexes.length
-        && submittedOptionIndexes.every((option, optionIndex) => option === correctOptionIndexes[optionIndex])
-      ) {
-        correctCount += 1;
-        score += Number(question.marks || 1);
-        currentStats.correct += 1;
-      } else {
-        incorrectCount += 1;
-        score -= Number(test.negativeMarking || 0);
-        currentStats.incorrect += 1;
-      }
-
-      topicStats.set(topic, currentStats);
-    });
-
-    const solutions = test.questions.map((question) => ({
-      questionId: question.id,
-      questionText: question.questionText,
-      selectedOption: Array.isArray(answers[question.id]) ? null : answers[question.id] ?? null,
-      selectedOptions: Array.isArray(answers[question.id])
-        ? [...new Set(answers[question.id].map((option) => Number(option)).filter((option) => Number.isInteger(option) && option >= 0))].sort((left, right) => left - right)
-        : answers[question.id] === undefined || answers[question.id] === null
-          ? []
-          : [Number(answers[question.id])].filter((option) => Number.isInteger(option) && option >= 0),
-      correctOption: Array.isArray(question.correctOptions) && question.correctOptions.length > 0
-        ? Number(question.correctOptions[0])
-        : Number(question.correctOption ?? question.answer),
-      correctOptions: Array.isArray(question.correctOptions) && question.correctOptions.length > 0
-        ? [...new Set(question.correctOptions.map((option) => Number(option)).filter((option) => Number.isInteger(option) && option >= 0))].sort((left, right) => left - right)
-        : Number.isFinite(Number(question.correctOption ?? question.answer))
-          ? [Number(question.correctOption ?? question.answer)]
-          : [0],
-      explanation: question.explanation || '',
-      topic: question.topic || 'General Practice',
-    }));
-
-    const weakTopics = [];
-    const strongTopics = [];
-    topicStats.forEach((stats, topic) => {
-      if (stats.incorrect > stats.correct) {
-        weakTopics.push(topic);
-      } else if (stats.correct > 0) {
-        strongTopics.push(topic);
-      }
-    });
+    const normalizedAnswers = normalizeSubmittedAnswers(payload.answers || {});
+    const {
+      score,
+      correctCount,
+      incorrectCount,
+      unattemptedCount,
+      topicStats,
+    } = scoreMockTestAttempt(test, normalizedAnswers);
+    const solutions = buildAttemptSolutions(test, normalizedAnswers);
+    const { weakTopics, strongTopics } = deriveTopicStrengths(topicStats);
+    const attemptPayload = {
+      userId: payload.userId,
+      testId: test._id,
+      score,
+      totalMarks: Number(test.totalMarks || 0),
+      correctCount,
+      incorrectCount,
+      unattemptedCount,
+      percentile: null,
+      rank: null,
+      rankStatus: 'pending',
+      answers: payload.answers || {},
+      weakTopics,
+      strongTopics,
+      solutions,
+      startedAt: payload.startedAt || nowIso(),
+      completedAt: nowIso(),
+    };
 
     if (isPostgresMode()) {
-      return runInTransaction(async (client) => {
-        const ranking = await pgOne(
-          'SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE score > $1)::int AS higher FROM test_attempts',
-          [Number(score)],
-          (row) => ({
-            total: Number(row.total || 0),
-            higher: Number(row.higher || 0),
-          }),
-          client,
-        );
-        const totalAttempts = Number(ranking?.total || 0) + 1;
-        const higherAttempts = Number(ranking?.higher || 0);
-        const rank = higherAttempts + 1;
-        const percentile = totalAttempts === 0
-          ? 0
-          : Number((((totalAttempts - rank) / totalAttempts) * 100).toFixed(2));
-
-        const attempt = await insertPgTestAttempt({
-          userId: payload.userId,
-          testId: test._id,
-          score: Number(score.toFixed(2)),
-          totalMarks: Number(test.totalMarks || 0),
-          correctCount,
-          incorrectCount,
-          unattemptedCount,
-          percentile,
-          rank,
-          answers,
-          weakTopics,
-          strongTopics,
-          solutions,
-          startedAt: payload.startedAt || nowIso(),
-          completedAt: nowIso(),
-        }, client);
+      const outcome = await runInTransaction(async (client) => {
+        const insertedAttempt = await insertPgTestAttempt(attemptPayload, client);
+        if (!insertedAttempt) {
+          const existingAttempt = await pgOne(
+            'SELECT * FROM test_attempts WHERE user_id = $1 AND test_id = $2',
+            [String(payload.userId), String(test._id)],
+            mapTestAttemptRow,
+            client,
+          );
+          return {
+            attempt: existingAttempt,
+            inserted: false,
+          };
+        }
 
         const user = await pgOne('SELECT * FROM users WHERE id = $1', [String(payload.userId)], mapUserRow, client);
         if (user) {
@@ -8391,66 +8308,137 @@ const testsRepository = {
           }, client);
         }
 
+        invalidateGlobalPlatformCaches();
+        invalidateUserPlatformCaches(payload.userId);
+        return {
+          attempt: insertedAttempt,
+          inserted: true,
+        };
+      });
+
+      if (outcome.inserted) {
         queueBestEffortDeviceActivity({
           userId: payload.userId,
           eventType: 'mock_test_submitted',
           meta: {
             testId: test._id,
-            score: attempt.score,
-            percentile: attempt.percentile,
+            score: outcome.attempt.score,
+            percentile: outcome.attempt.percentile,
+            rankStatus: outcome.attempt.rankStatus,
           },
         });
+        console.log(`[mock-test-submit] ${JSON.stringify({
+          event: 'submit-accepted',
+          testId: String(test._id),
+          userId: String(payload.userId || ''),
+          score: outcome.attempt.score,
+          rankStatus: outcome.attempt.rankStatus,
+          at: nowIso(),
+        })}`);
+        const queueResult = await queueMockTestRankRecompute({
+          testId: test._id,
+          reason: 'attempt-submitted',
+        }).catch(() => ({ queued: false, degraded: !appConfig.redisUrl }));
+        console.log(`[mock-test-submit] ${JSON.stringify({
+          event: 'rank-job-schedule-attempt',
+          testId: String(test._id),
+          userId: String(payload.userId || ''),
+          queued: Boolean(queueResult?.queued),
+          degraded: Boolean(queueResult?.degraded),
+          at: nowIso(),
+        })}`);
+      } else {
+        console.log(`[mock-test-submit] ${JSON.stringify({
+          event: 'duplicate-submit-deduped',
+          testId: String(test._id),
+          userId: String(payload.userId || ''),
+          attemptId: outcome.attempt?._id || null,
+          at: nowIso(),
+        })}`);
+      }
 
-        invalidateGlobalPlatformCaches();
-        invalidateUserPlatformCaches(payload.userId);
-        return attempt;
-      });
+      return outcome.attempt;
     }
 
-    const rankedAttempts = [...state.testAttempts, { score }].sort((left, right) => Number(right.score) - Number(left.score));
-    const rank = rankedAttempts.findIndex((attempt) => Number(attempt.score) === score) + 1;
-    const percentile = rankedAttempts.length === 0
-      ? 0
-      : Number((((rankedAttempts.length - rank) / rankedAttempts.length) * 100).toFixed(2));
+    return withMockAttemptLock(test._id, payload.userId, async () => {
+      const existingAttempt = state.testAttempts
+        .filter((attempt) => attempt.userId === String(payload.userId) && attempt.testId === String(test._id))
+        .sort((left, right) => sortRecentFirst(left, right, 'completedAt'))[0];
+      if (existingAttempt) {
+        console.log(`[mock-test-submit] ${JSON.stringify({
+          event: 'duplicate-submit-deduped',
+          testId: String(test._id),
+          userId: String(payload.userId || ''),
+          attemptId: existingAttempt._id,
+          at: nowIso(),
+        })}`);
+        return clone(existingAttempt);
+      }
 
-    const attempt = {
-      _id: nextId('attempt'),
-      userId: String(payload.userId),
-      testId: test._id,
-      score: Number(score.toFixed(2)),
-      totalMarks: Number(test.totalMarks || 0),
-      correctCount,
-      incorrectCount,
-      unattemptedCount,
-      percentile,
-      rank,
-      answers: clone(answers),
-      weakTopics,
-      strongTopics,
-      solutions,
-      startedAt: payload.startedAt || nowIso(),
-      completedAt: nowIso(),
-    };
-
-    state.testAttempts.push(attempt);
-    invalidateGlobalPlatformCaches();
-
-    const user = state.users.find((item) => item._id === String(payload.userId));
-    if (user) {
-      user.points += Math.max(Math.round(score), 0);
-    }
-
-    queueBestEffortDeviceActivity({
-      userId: payload.userId,
-      eventType: 'mock_test_submitted',
-      meta: {
+      const attempt = {
+        _id: nextId('attempt'),
+        userId: String(payload.userId),
         testId: test._id,
-        score: attempt.score,
-        percentile: attempt.percentile,
-      },
-    });
+        score,
+        totalMarks: Number(test.totalMarks || 0),
+        correctCount,
+        incorrectCount,
+        unattemptedCount,
+        percentile: null,
+        rank: null,
+        rankStatus: 'pending',
+        rankComputedAt: null,
+        answers: clone(payload.answers || {}),
+        weakTopics,
+        strongTopics,
+        solutions,
+        startedAt: attemptPayload.startedAt,
+        completedAt: attemptPayload.completedAt,
+      };
 
-    return clone(attempt);
+      state.testAttempts.push(attempt);
+      invalidateGlobalPlatformCaches();
+      invalidateUserPlatformCaches(payload.userId);
+
+      const user = state.users.find((item) => item._id === String(payload.userId));
+      if (user) {
+        user.points += Math.max(Math.round(score), 0);
+      }
+
+      queueBestEffortDeviceActivity({
+        userId: payload.userId,
+        eventType: 'mock_test_submitted',
+        meta: {
+          testId: test._id,
+          score: attempt.score,
+          percentile: attempt.percentile,
+          rankStatus: attempt.rankStatus,
+        },
+      });
+
+      console.log(`[mock-test-submit] ${JSON.stringify({
+        event: 'submit-accepted',
+        testId: String(test._id),
+        userId: String(payload.userId || ''),
+        score: attempt.score,
+        rankStatus: attempt.rankStatus,
+        at: nowIso(),
+      })}`);
+      const queueResult = await queueMockTestRankRecompute({
+        testId: test._id,
+        reason: 'attempt-submitted',
+      }).catch(() => ({ queued: false, degraded: true }));
+      console.log(`[mock-test-submit] ${JSON.stringify({
+        event: 'rank-job-schedule-attempt',
+        testId: String(test._id),
+        userId: String(payload.userId || ''),
+        queued: Boolean(queueResult?.queued),
+        degraded: Boolean(queueResult?.degraded),
+        at: nowIso(),
+      })}`);
+
+      return clone(attempt);
+    });
   },
 
   async listAttempts(userId) {

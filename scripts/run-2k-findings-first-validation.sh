@@ -9,21 +9,56 @@ STAGING_SSH_TARGET_VALUE="${STAGING_SSH_TARGET:-root@46.225.218.53}"
 PROD_SSH_TARGET_VALUE="${PROD_SSH_TARGET:-root@178.105.48.179}"
 STAGING_BASE_URL_VALUE="${QA_BASE_URL:-${STAGING_BASE_URL:-}}"
 PROD_BASE_URL_VALUE="${PRODUCTION_QA_BASE_URL:-https://app.varonenglishapp.in}"
-STAGING_BROWSER_STAGES_VALUE="${STAGING_BROWSER_STAGES:-50,100,250}"
-STAGING_SYNTHETIC_STAGES_VALUE="${STAGING_SYNTHETIC_STAGES:-250,500,750,1000}"
-STAGING_MIXED_STAGES_VALUE="${STAGING_MIXED_STAGES:-500,1000,1500,2000}"
+STAGING_VIDEO_BROWSER_STAGES_VALUE="${STAGING_VIDEO_BROWSER_STAGES:-1,3,10,25,50,100,250,500,1000,2000}"
+STAGING_MIXED_BROWSER_STAGES_VALUE="${STAGING_MIXED_BROWSER_STAGES:-250,500,1000,1500,2000}"
+PRODUCTION_BROWSER_SOAK_STAGES_VALUE="${PRODUCTION_BROWSER_SOAK_STAGES:-100,250}"
+BROWSER_FARM_WORKERS_VALUE="${QA_BROWSER_FARM_WORKERS:-local}"
+BROWSER_FARM_REMOTE_ROOTS_VALUE="${QA_BROWSER_FARM_REMOTE_ROOTS:-}"
+BROWSER_FARM_REMOTE_ROOT_VALUE="${QA_BROWSER_FARM_REMOTE_ROOT:-/opt/edumaster-staging}"
+BROWSER_FARM_RUN_CALIBRATION_VALUE="${BROWSER_FARM_RUN_CALIBRATION:-1}"
+BROWSER_FARM_CALIBRATION_STAGES_VALUE="${BROWSER_FARM_CALIBRATION_STAGES:-50,100,150}"
+BROWSER_FARM_MOBILE_RATIO_VALUE="${QA_BROWSER_FARM_MOBILE_RATIO:-0.4}"
 RUN_PRODUCTION_SMOKE_VALUE="${RUN_PRODUCTION_SMOKE:-1}"
+RUN_PRODUCTION_BROWSER_SOAK_VALUE="${RUN_PRODUCTION_BROWSER_SOAK:-1}"
 RUN_ID="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
 REPORT_DIR="${ROOT_DIR}/reports/2k-findings-first-validation-${RUN_ID}"
 STAGE_JSONL="${REPORT_DIR}/stages.jsonl"
 NOTES_PATH="${REPORT_DIR}/notes.md"
+STAGING_VIDEO_BROWSER_RUN_ID="browser-farm-video-2k-findings-${RUN_ID}"
+STAGING_VIDEO_BROWSER_REPORT_DIR="${ROOT_DIR}/reports/${STAGING_VIDEO_BROWSER_RUN_ID}"
+STAGING_VIDEO_BROWSER_SUMMARY_PATH="${STAGING_VIDEO_BROWSER_REPORT_DIR}/browser-farm-certification-summary.json"
+STAGING_MIXED_BROWSER_RUN_ID="browser-farm-mixed-2k-findings-${RUN_ID}"
+STAGING_MIXED_BROWSER_REPORT_DIR="${ROOT_DIR}/reports/${STAGING_MIXED_BROWSER_RUN_ID}"
+STAGING_MIXED_BROWSER_SUMMARY_PATH="${STAGING_MIXED_BROWSER_REPORT_DIR}/browser-farm-certification-summary.json"
+PRODUCTION_BROWSER_SOAK_RUN_ID="browser-farm-prod-soak-2k-findings-${RUN_ID}"
+PRODUCTION_BROWSER_SOAK_REPORT_DIR="${ROOT_DIR}/reports/${PRODUCTION_BROWSER_SOAK_RUN_ID}"
+PRODUCTION_BROWSER_SOAK_SUMMARY_PATH="${PRODUCTION_BROWSER_SOAK_REPORT_DIR}/browser-farm-certification-summary.json"
 
 mkdir -p "${REPORT_DIR}"
+
+latest_report_dir() {
+  local pattern="$1"
+  find "${ROOT_DIR}/reports" -maxdepth 1 -type d -name "${pattern}" -print0 \
+    | xargs -0 ls -1dt 2>/dev/null \
+    | head -n 1
+}
 
 read_env_value() {
   local env_file="$1"
   local key="$2"
   grep -E "^${key}=" "${env_file}" | tail -n 1 | cut -d= -f2- || true
+}
+
+max_stage_from_csv() {
+  local csv="$1"
+  node - "${csv}" <<'NODE'
+const values = String(process.argv[2] || '')
+  .split(',')
+  .map((value) => Number(value.trim()))
+  .filter((value) => Number.isFinite(value) && value > 0);
+const max = values.length ? Math.max(...values) : 0;
+process.stdout.write(`${max}\n`);
+NODE
 }
 
 if [[ ! -f "${STAGING_ENV_FILE_PATH}" ]]; then
@@ -97,11 +132,11 @@ run_stage() {
   if [[ "${stage_label}" == *"targeted-functional-proof"* ]]; then
     local latest_proof_dir=""
     if [[ "${stage_scope}" == "staging" ]]; then
-      latest_proof_dir="$(find "${ROOT_DIR}/reports" -maxdepth 1 -type d -name "targeted-functional-proof-2k-findings-staging-*" | sort | tail -n 1)"
+      latest_proof_dir="$(latest_report_dir "targeted-functional-proof-2k-findings-staging-*")"
     elif [[ "${stage_scope}" == "production" ]]; then
-      latest_proof_dir="$(find "${ROOT_DIR}/reports" -maxdepth 1 -type d -name "targeted-functional-proof-production-smoke-*" | sort | tail -n 1)"
+      latest_proof_dir="$(latest_report_dir "targeted-functional-proof-production-smoke-*")"
     else
-      latest_proof_dir="$(find "${ROOT_DIR}/reports" -maxdepth 1 -type d -name "targeted-functional-proof-*" | sort | tail -n 1)"
+      latest_proof_dir="$(latest_report_dir "targeted-functional-proof-*")"
     fi
     if [[ -n "${latest_proof_dir}" ]]; then
       evidence_path="${REPORT_DIR}/$(basename "${log_path}" .log)-evidence.log"
@@ -163,19 +198,27 @@ NODE
 prepare_browser_manifest() {
   local target_key="$1"
   local course_id="$2"
+  local manifest_users="$3"
+  local user_prefix="$4"
+  local env_file="$5"
+  local base_url="$6"
   local manifest_path="${REPORT_DIR}/${target_key}-browser-users.json"
   (
     cd "${ROOT_DIR}"
-    ENV_FILE="${STAGING_ENV_FILE_PATH}" \
-    QA_BASE_URL="${STAGING_BASE_URL_VALUE}" \
+    ENV_FILE="${env_file}" \
+    QA_BASE_URL="${base_url}" \
     QA_COURSE_ID="${course_id}" \
-    QA_VIDEO_BROWSER_MANIFEST_USERS=250 \
+    QA_VIDEO_BROWSER_MANIFEST_USERS="${manifest_users}" \
     QA_VIDEO_BROWSER_MANIFEST_PATH="${manifest_path}" \
-    QA_VIDEO_BROWSER_USER_PREFIX="qa.2k.findings.${target_key}." \
+    QA_VIDEO_BROWSER_USER_PREFIX="${user_prefix}" \
     npm --prefix qa-automation run browser:prepare-video-browser-manifest
   ) > "${REPORT_DIR}/${target_key}-prepare-browser-users.log" 2>&1
   printf '%s\n' "${manifest_path}"
 }
+
+STAGING_VIDEO_BROWSER_MAX_STAGE="$(max_stage_from_csv "${STAGING_VIDEO_BROWSER_STAGES_VALUE}")"
+STAGING_MIXED_BROWSER_MAX_STAGE="$(max_stage_from_csv "${STAGING_MIXED_BROWSER_STAGES_VALUE}")"
+PRODUCTION_BROWSER_SOAK_MAX_STAGE="$(max_stage_from_csv "${PRODUCTION_BROWSER_SOAK_STAGES_VALUE}")"
 
 PRIMARY_TARGET_FIELDS=()
 while IFS= read -r line || [[ -n "${line}" ]]; do
@@ -215,6 +258,11 @@ fi
   echo "- staging compose project: ${STAGING_COMPOSE_PROJECT}"
   echo "- prod compose project: ${PROD_COMPOSE_PROJECT}"
   echo "- target manifest: ${TARGETS_FILE_VALUE}"
+  echo "- browser farm workers: ${BROWSER_FARM_WORKERS_VALUE}"
+  echo "- browser farm remote roots: ${BROWSER_FARM_REMOTE_ROOTS_VALUE:-${BROWSER_FARM_REMOTE_ROOT_VALUE}}"
+  echo "- staging video browser stages: ${STAGING_VIDEO_BROWSER_STAGES_VALUE}"
+  echo "- staging mixed browser stages: ${STAGING_MIXED_BROWSER_STAGES_VALUE}"
+  echo "- production browser soak stages: ${PRODUCTION_BROWSER_SOAK_STAGES_VALUE}"
   echo
 } > "${NOTES_PATH}"
 
@@ -246,63 +294,60 @@ run_stage "staging-targeted-functional-proof" "correctness" "staging" \
   PROOF_SCOPE="2k-findings-staging" \
   bash "${ROOT_DIR}/scripts/run-targeted-functional-proof.sh"
 
-TARGET_ROWS=()
-while IFS= read -r line || [[ -n "${line}" ]]; do
-  TARGET_ROWS+=("${line}")
-done < <(node - "${TARGETS_FILE_VALUE}" <<'NODE'
-const fs = require('node:fs');
-const payload = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-for (const entry of payload.slice(0, 2)) {
-  process.stdout.write([
-    entry.key || '',
-    entry.courseId || '',
-    entry.courseText || '',
-    entry.lessonId || '',
-    entry.lessonText || '',
-  ].join('\t') + '\n');
-}
-NODE
-)
+PRIMARY_VIDEO_MANIFEST_PATH="$(prepare_browser_manifest \
+  "${PRIMARY_TARGET_KEY:-primary}-video-2k" \
+  "${PRIMARY_COURSE_ID}" \
+  "${STAGING_VIDEO_BROWSER_MAX_STAGE}" \
+  "qa.2k.video.${PRIMARY_TARGET_KEY:-primary}." \
+  "${STAGING_ENV_FILE_PATH}" \
+  "${STAGING_BASE_URL_VALUE}")"
 
-for row in "${TARGET_ROWS[@]}"; do
-  IFS=$'\t' read -r target_key course_id course_text lesson_id lesson_text <<< "${row}"
-  manifest_path="$(prepare_browser_manifest "${target_key}" "${course_id}")"
-  run_stage "staging-recorded-browser-${target_key}" "browser_ladder" "staging" \
-    env \
-    ENV_FILE="${STAGING_ENV_FILE_PATH}" \
-    QA_BASE_URL="${STAGING_BASE_URL_VALUE}" \
-    QA_COURSE_ID="${course_id}" \
-    QA_COURSE_TEXT="${course_text}" \
-    QA_LESSON_ID="${lesson_id}" \
-    QA_LESSON_TEXT="${lesson_text}" \
-    QA_VIDEO_BROWSER_STAGES="${STAGING_BROWSER_STAGES_VALUE}" \
-    COURSE_LOAD_USERS_FILE="${manifest_path}" \
-    PLATFORM_LOAD_USERS_FILE="${manifest_path}" \
-    bash "${ROOT_DIR}/scripts/run-recorded-browser-ladder.sh" "${STAGING_BASE_URL_VALUE}"
-done
-
-run_stage "staging-recorded-synthetic" "synthetic_video_ladder" "staging" \
+run_stage "staging-distributed-video-browser-ladder" "distributed_video_browser_ladder" "staging" \
   env \
   QA_BASE_URL="${STAGING_BASE_URL_VALUE}" \
   ENV_FILE="${STAGING_ENV_FILE_PATH}" \
-  COURSE_LOAD_COURSE_ID="${PRIMARY_COURSE_ID}" \
-  COURSE_LOAD_LESSON_ID="${PRIMARY_LESSON_ID}" \
-  COURSE_VIDEO_LADDER_STAGES="${STAGING_SYNTHETIC_STAGES_VALUE}" \
-  bash "${ROOT_DIR}/scripts/run-course-video-ladder.sh" "${STAGING_BASE_URL_VALUE}"
+  QA_COURSE_ID="${PRIMARY_COURSE_ID}" \
+  QA_COURSE_TEXT="${PRIMARY_COURSE_TEXT}" \
+  QA_LESSON_ID="${PRIMARY_LESSON_ID}" \
+  QA_LESSON_TEXT="${PRIMARY_LESSON_TEXT}" \
+  QA_BROWSER_FARM_MANIFEST="${PRIMARY_VIDEO_MANIFEST_PATH}" \
+  QA_BROWSER_FARM_STAGES="${STAGING_VIDEO_BROWSER_STAGES_VALUE}" \
+  QA_BROWSER_FARM_WORKERS="${BROWSER_FARM_WORKERS_VALUE}" \
+  QA_BROWSER_FARM_REMOTE_ROOTS="${BROWSER_FARM_REMOTE_ROOTS_VALUE}" \
+  QA_BROWSER_FARM_REMOTE_ROOT="${BROWSER_FARM_REMOTE_ROOT_VALUE}" \
+  QA_BROWSER_FARM_RUN_ID="${STAGING_VIDEO_BROWSER_RUN_ID}" \
+  QA_BROWSER_FARM_MOBILE_RATIO="${BROWSER_FARM_MOBILE_RATIO_VALUE}" \
+  BROWSER_FARM_RUN_CALIBRATION="${BROWSER_FARM_RUN_CALIBRATION_VALUE}" \
+  BROWSER_FARM_CALIBRATION_STAGES="${BROWSER_FARM_CALIBRATION_STAGES_VALUE}" \
+  BROWSER_FARM_MODE="video" \
+  bash "${ROOT_DIR}/scripts/run-distributed-browser-farm-ladder.sh" "${STAGING_BASE_URL_VALUE}"
 
-run_stage "staging-mixed-platform" "mixed_platform_ladder" "staging" \
+STAGING_MIXED_MANIFEST_PATH="$(prepare_browser_manifest \
+  "mixed-2k" \
+  "${PRIMARY_COURSE_ID}" \
+  "${STAGING_MIXED_BROWSER_MAX_STAGE}" \
+  "qa.2k.mixed.primary." \
+  "${STAGING_ENV_FILE_PATH}" \
+  "${STAGING_BASE_URL_VALUE}")"
+
+run_stage "staging-distributed-mixed-browser-ladder" "distributed_mixed_browser_ladder" "staging" \
   env \
   QA_BASE_URL="${STAGING_BASE_URL_VALUE}" \
   ENV_FILE="${STAGING_ENV_FILE_PATH}" \
-  PLATFORM_LADDER_STAGES="${STAGING_MIXED_STAGES_VALUE}" \
-  PLATFORM_LOAD_TRAFFIC_MODEL="5k-mixed" \
-  PLATFORM_LOAD_BROWSE_READ_PERCENT=70 \
-  PLATFORM_LOAD_VIDEO_ACTIVE_PERCENT=15 \
-  PLATFORM_LOAD_AUTH_SESSION_PERCENT=10 \
-  PLATFORM_LOAD_LIGHT_WRITE_PERCENT=5 \
-  PLATFORM_LOAD_COURSE_ID="${PRIMARY_COURSE_ID}" \
-  PLATFORM_LOAD_LESSON_ID="${PRIMARY_LESSON_ID}" \
-  bash "${ROOT_DIR}/scripts/run-platform-scale-ladder.sh" "${STAGING_BASE_URL_VALUE}"
+  QA_COURSE_ID="${PRIMARY_COURSE_ID}" \
+  QA_COURSE_TEXT="${PRIMARY_COURSE_TEXT}" \
+  QA_LESSON_ID="${PRIMARY_LESSON_ID}" \
+  QA_LESSON_TEXT="${PRIMARY_LESSON_TEXT}" \
+  QA_BROWSER_FARM_MANIFEST="${STAGING_MIXED_MANIFEST_PATH}" \
+  QA_BROWSER_FARM_STAGES="${STAGING_MIXED_BROWSER_STAGES_VALUE}" \
+  QA_BROWSER_FARM_WORKERS="${BROWSER_FARM_WORKERS_VALUE}" \
+  QA_BROWSER_FARM_REMOTE_ROOTS="${BROWSER_FARM_REMOTE_ROOTS_VALUE}" \
+  QA_BROWSER_FARM_REMOTE_ROOT="${BROWSER_FARM_REMOTE_ROOT_VALUE}" \
+  QA_BROWSER_FARM_RUN_ID="${STAGING_MIXED_BROWSER_RUN_ID}" \
+  QA_BROWSER_FARM_MOBILE_RATIO="${BROWSER_FARM_MOBILE_RATIO_VALUE}" \
+  BROWSER_FARM_RUN_CALIBRATION="0" \
+  BROWSER_FARM_MODE="mixed" \
+  bash "${ROOT_DIR}/scripts/run-distributed-browser-farm-ladder.sh" "${STAGING_BASE_URL_VALUE}"
 
 if [[ "${RUN_PRODUCTION_SMOKE_VALUE}" == "1" ]]; then
   run_stage "production-targeted-video-smoke" "production_smoke" "production" \
@@ -330,13 +375,44 @@ if [[ "${RUN_PRODUCTION_SMOKE_VALUE}" == "1" ]]; then
     ENV_FILE="${PROD_ENV_FILE_PATH}" \
     QA_BASE_URL="${PROD_BASE_URL_VALUE}" \
     npm --prefix qa-automation run browser:tests
+
+  if [[ "${RUN_PRODUCTION_BROWSER_SOAK_VALUE}" == "1" ]]; then
+    PROD_BROWSER_SOAK_MANIFEST_PATH="$(prepare_browser_manifest \
+      "production-browser-soak" \
+      "${PRIMARY_COURSE_ID}" \
+      "${PRODUCTION_BROWSER_SOAK_MAX_STAGE}" \
+      "qa.2k.prod.soak." \
+      "${PROD_ENV_FILE_PATH}" \
+      "${PROD_BASE_URL_VALUE}")"
+
+    run_stage "production-browser-soak" "production_browser_soak" "production" \
+      env \
+      QA_BASE_URL="${PROD_BASE_URL_VALUE}" \
+      ENV_FILE="${PROD_ENV_FILE_PATH}" \
+      QA_COURSE_ID="${PRIMARY_COURSE_ID}" \
+      QA_COURSE_TEXT="${PRIMARY_COURSE_TEXT}" \
+      QA_LESSON_ID="${PRIMARY_LESSON_ID}" \
+      QA_LESSON_TEXT="${PRIMARY_LESSON_TEXT}" \
+      QA_BROWSER_FARM_MANIFEST="${PROD_BROWSER_SOAK_MANIFEST_PATH}" \
+      QA_BROWSER_FARM_STAGES="${PRODUCTION_BROWSER_SOAK_STAGES_VALUE}" \
+      QA_BROWSER_FARM_WORKERS="${BROWSER_FARM_WORKERS_VALUE}" \
+      QA_BROWSER_FARM_REMOTE_ROOTS="${BROWSER_FARM_REMOTE_ROOTS_VALUE}" \
+      QA_BROWSER_FARM_REMOTE_ROOT="${BROWSER_FARM_REMOTE_ROOT_VALUE}" \
+      QA_BROWSER_FARM_RUN_ID="${PRODUCTION_BROWSER_SOAK_RUN_ID}" \
+      QA_BROWSER_FARM_MOBILE_RATIO="${BROWSER_FARM_MOBILE_RATIO_VALUE}" \
+      BROWSER_FARM_RUN_CALIBRATION="0" \
+      BROWSER_FARM_MODE="mixed" \
+      bash "${ROOT_DIR}/scripts/run-distributed-browser-farm-ladder.sh" "${PROD_BASE_URL_VALUE}"
+  fi
 fi
 
 SUMMARY_PATH="${REPORT_DIR}/2k-findings-first-summary.json"
-node - "${SUMMARY_PATH}" "${REPORT_DIR}" "${STAGING_BASE_URL_VALUE}" "${PROD_BASE_URL_VALUE}" "${TARGETS_FILE_VALUE}" "${STAGING_BASELINE_SNAPSHOT}" "${PROD_BASELINE_SNAPSHOT}" "${STAGE_JSONL}" <<'NODE'
+PLAYBACK_GATE_SUMMARY_PATH="${REPORT_DIR}/protected-hls-playback-deploy-gate-summary.json"
+node - "${SUMMARY_PATH}" "${PLAYBACK_GATE_SUMMARY_PATH}" "${REPORT_DIR}" "${STAGING_BASE_URL_VALUE}" "${PROD_BASE_URL_VALUE}" "${TARGETS_FILE_VALUE}" "${STAGING_BASELINE_SNAPSHOT}" "${PROD_BASELINE_SNAPSHOT}" "${STAGE_JSONL}" "${STAGING_VIDEO_BROWSER_SUMMARY_PATH}" "${STAGING_MIXED_BROWSER_SUMMARY_PATH}" "${PRODUCTION_BROWSER_SOAK_SUMMARY_PATH}" "${STAGING_VIDEO_BROWSER_STAGES_VALUE}" <<'NODE'
 const fs = require('node:fs');
 const [
   outputPath,
+  playbackGateOutputPath,
   reportDir,
   stagingBaseUrl,
   prodBaseUrl,
@@ -344,11 +420,21 @@ const [
   stagingBaselineSnapshot,
   prodBaselineSnapshot,
   stageJsonlPath,
+  videoBrowserSummaryPath,
+  mixedBrowserSummaryPath,
+  productionBrowserSoakSummaryPath,
+  requiredVideoStagesCsv,
 ] = process.argv.slice(2);
 const stages = fs.existsSync(stageJsonlPath)
   ? fs.readFileSync(stageJsonlPath, 'utf8').split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line))
   : [];
 const firstFailure = stages.find((stage) => !stage.ok) || null;
+const readJsonIfExists = (filePath) => (
+  filePath && fs.existsSync(filePath) ? JSON.parse(fs.readFileSync(filePath, 'utf8')) : null
+);
+const videoBrowserSummary = readJsonIfExists(videoBrowserSummaryPath);
+const mixedBrowserSummary = readJsonIfExists(mixedBrowserSummaryPath);
+const productionBrowserSoakSummary = readJsonIfExists(productionBrowserSoakSummaryPath);
 const summary = {
   ok: firstFailure == null,
   reportDir,
@@ -362,9 +448,62 @@ const summary = {
   stageCount: stages.length,
   firstFailure,
   stages,
+  browserFarm: {
+    video: {
+      summaryPath: videoBrowserSummaryPath,
+      summary: videoBrowserSummary,
+    },
+    mixed: {
+      summaryPath: mixedBrowserSummaryPath,
+      summary: mixedBrowserSummary,
+    },
+    productionSoak: {
+      summaryPath: productionBrowserSoakSummaryPath,
+      summary: productionBrowserSoakSummary,
+    },
+  },
 };
 fs.writeFileSync(outputPath, `${JSON.stringify(summary, null, 2)}\n`);
+
+const requiredVideoStages = String(requiredVideoStagesCsv || '')
+  .split(',')
+  .map((value) => Number(value.trim()))
+  .filter((value) => Number.isFinite(value) && value > 0);
+const requiredStage = requiredVideoStages.length ? Math.max(...requiredVideoStages) : 2000;
+const videoBlockingFailures = Array.isArray(videoBrowserSummary?.blockingFailures) ? videoBrowserSummary.blockingFailures : [];
+const playbackGateSummary = {
+  gate: 'protected_hls_playback_production_deploy',
+  reportDir,
+  generatedAt: new Date().toISOString(),
+  sourceSummaryPath: outputPath,
+  requiredVideoStages,
+  requiredStage,
+  exactRealBrowserCount: Number(videoBrowserSummary?.exactRealBrowserCount || 0),
+  exactSyntheticDiagnosticCount: Number(videoBrowserSummary?.exactSyntheticDiagnosticCount || 0),
+  allUsersRealBrowsers: videoBrowserSummary?.allUsersRealBrowsers !== false,
+  requiredStagePassed: Boolean(videoBrowserSummary?.requiredStagePassed),
+  videoBrowserSummaryPath,
+  mixedBrowserSummaryPath,
+  productionBrowserSoakSummaryPath,
+  firstFailure,
+  blockingFailures: [
+    ...(firstFailure ? [`2k_findings_first_failure:${firstFailure.label}`] : []),
+    ...videoBlockingFailures,
+  ],
+  eligibleForManualProductionApproval: Boolean(
+    !firstFailure
+    && videoBrowserSummary
+    && videoBrowserSummary.eligibleForManualProductionApproval
+  ),
+  finalVerdict: !firstFailure && videoBrowserSummary?.eligibleForManualProductionApproval
+    ? 'deploy_blocked_pending_manual_approval'
+    : 'deploy_blocked',
+  deployApproved: false,
+  manualApprovalRequired: true,
+};
+fs.writeFileSync(playbackGateOutputPath, `${JSON.stringify(playbackGateSummary, null, 2)}\n`);
 console.log(JSON.stringify(summary, null, 2));
 NODE
 
 echo "[2k-findings] summary: ${SUMMARY_PATH}"
+echo "[2k-findings] playback deploy gate summary: ${PLAYBACK_GATE_SUMMARY_PATH}"

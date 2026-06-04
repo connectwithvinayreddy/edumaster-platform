@@ -9,6 +9,7 @@
     "manifest:backfill": "node scripts/backfill-hls-manifest-bundles.mjs",
     "hls:repair:lesson": "node scripts/repair-course-hls-lesson.mjs",
     "stream:list:candidates": "node scripts/list-cloudflare-stream-lessons.mjs",
+    "video:list:private-lessons": "node scripts/list-private-video-lessons.mjs",
     "stream:migrate:private-hls": "node scripts/migrate-cloudflare-stream-to-private-hls.mjs",
     "stream:cleanup:legacy": "node scripts/cleanup-legacy-cloudflare-stream-assets.mjs",
     "pdf:export:targets": "node scripts/export-targeted-course-pdfs.mjs",
@@ -17,6 +18,7 @@
     "test": "node test-api.js",
     "test:api": "node test-api.js",
     "test:load": "node load-test.js",
+    "test:mock-submit-load": "node mock-test-submit-load-test.js",
     "test:concurrency-audit": "node concurrency-audit.js",
     "youtube:auth": "node youtube-auth.js"
   },

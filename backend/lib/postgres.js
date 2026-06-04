@@ -117,10 +117,40 @@ const schemaStatements = [
       weak_topics JSONB NOT NULL DEFAULT '[]'::jsonb,
       strong_topics JSONB NOT NULL DEFAULT '[]'::jsonb,
       solutions JSONB NOT NULL DEFAULT '[]'::jsonb,
+      rank_status VARCHAR(20) NOT NULL DEFAULT 'pending',
+      rank_computed_at TIMESTAMPTZ,
       started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      completed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      completed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (user_id, test_id)
     )
   `,
+  'ALTER TABLE test_attempts ADD COLUMN IF NOT EXISTS rank_status VARCHAR(20) NOT NULL DEFAULT \'pending\'',
+  'ALTER TABLE test_attempts ADD COLUMN IF NOT EXISTS rank_computed_at TIMESTAMPTZ',
+  `
+    UPDATE test_attempts
+    SET rank_status = CASE
+      WHEN all_india_rank IS NULL OR percentile IS NULL THEN 'pending'
+      ELSE 'ready'
+    END
+    WHERE rank_status IS NULL OR rank_status NOT IN ('pending', 'ready', 'failed')
+  `,
+  `
+    WITH ranked_test_attempts AS (
+      SELECT
+        id,
+        ROW_NUMBER() OVER (
+          PARTITION BY user_id, test_id
+          ORDER BY completed_at DESC, started_at DESC, id DESC
+        ) AS row_rank
+      FROM test_attempts
+    )
+    DELETE FROM test_attempts
+    WHERE id IN (
+      SELECT id FROM ranked_test_attempts WHERE row_rank > 1
+    )
+  `,
+  'ALTER TABLE test_attempts DROP CONSTRAINT IF EXISTS test_attempts_user_id_test_id_key',
+  'ALTER TABLE test_attempts ADD CONSTRAINT test_attempts_user_id_test_id_key UNIQUE (user_id, test_id)',
   `
     CREATE TABLE IF NOT EXISTS daily_quizzes (
       id TEXT PRIMARY KEY,
@@ -668,6 +698,7 @@ const schemaStatements = [
   'CREATE INDEX IF NOT EXISTS idx_test_attempts_user_id ON test_attempts(user_id)',
   'CREATE INDEX IF NOT EXISTS idx_test_attempts_test_id ON test_attempts(test_id)',
   'CREATE INDEX IF NOT EXISTS idx_test_attempts_user_completed ON test_attempts(user_id, completed_at DESC)',
+  'CREATE INDEX IF NOT EXISTS idx_test_attempts_test_rank_status ON test_attempts(test_id, rank_status, completed_at DESC)',
   'CREATE INDEX IF NOT EXISTS idx_daily_quiz_attempts_user_id ON daily_quiz_attempts(user_id)',
   'CREATE INDEX IF NOT EXISTS idx_daily_quiz_attempts_quiz_submitted ON daily_quiz_attempts(daily_quiz_id, submitted_at DESC)',
   'CREATE INDEX IF NOT EXISTS idx_enrollments_user_course ON enrollments(user_id, course_id)',

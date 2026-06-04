@@ -317,6 +317,9 @@ const getRedisValue = async (key) => {
 const setRedisValue = async (key, value, options = {}) => {
   if (!parseRedisTarget()) {
     const ttlSeconds = Number(options.ttlSeconds || 0);
+    if (options.onlyIfMissing && readMemoryRedisEntry(key)) {
+      return false;
+    }
     memoryRedisValues.set(String(key), {
       value: String(value),
       expiresAtMs: Number.isFinite(ttlSeconds) && ttlSeconds > 0
@@ -330,9 +333,12 @@ const setRedisValue = async (key, value, options = {}) => {
   if (Number.isFinite(options.ttlSeconds) && options.ttlSeconds > 0) {
     command.push('EX', String(options.ttlSeconds));
   }
+  if (options.onlyIfMissing) {
+    command.push('NX');
+  }
 
-  await executeRedisCommand(command);
-  return true;
+  const result = await executeRedisCommand(command);
+  return result === null ? false : true;
 };
 
 const deleteRedisKey = async (key) => {

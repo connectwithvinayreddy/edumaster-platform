@@ -248,6 +248,48 @@ test('seek-forward heartbeats do not become the next protected resume position d
   assert.equal(deriveProtectedReplayState(result.state), 'grace_cycle');
 });
 
+test('one-watch grace replay consumes revision buffer instead of reopening cycle chunks', () => {
+  const graceState = normalizeVideoWatchState({
+    userId: 'user-1',
+    courseId: 'course-1',
+    lessonId: 'lesson-1',
+    videoId: 'video-1',
+    videoType: COURSE_VIDEO_TYPE,
+    videoDurationSeconds: 100,
+    allowedFullWatches: 1,
+    completedFullWatches: 1,
+    watchedSegments: [0],
+    currentCycleUniqueWatchedSeconds: 10,
+    totalUniqueWatchedSeconds: 95,
+    repeatWatchedSeconds: 20,
+    revisionBufferUsedSeconds: 0,
+    stableEndWindowWatchedSeconds: 4,
+    lastPositionSeconds: 0,
+    lastHeartbeatAt: new Date(1_000).toISOString(),
+  });
+
+  assert.equal(graceState.currentCycleUniqueWatchedSeconds, 0);
+  assert.deepEqual(graceState.watchedSegments, []);
+  assert.equal(deriveProtectedReplayState(graceState), 'grace_cycle');
+
+  const result = applyPlaybackHeartbeat(graceState, buildHeartbeat({
+    previousPositionSeconds: 0,
+    currentPositionSeconds: 10,
+    serverNowMs: 7_000,
+    timestamp: new Date(7_000).toISOString(),
+  }), { serverNowMs: 7_000 });
+
+  assert.equal(result.outcome.accepted, true);
+  assert.equal(result.state.completedFullWatches, 1);
+  assert.deepEqual(result.state.watchedSegments, []);
+  assert.equal(result.state.currentCycleUniqueWatchedSeconds, 0);
+  assert.equal(result.state.stableEndWindowWatchedSeconds, 0);
+  assert.equal(result.state.revisionBufferUsedSeconds, 10);
+  assert.equal(result.state.remainingRevisionBufferSeconds, 40);
+  assert.equal(result.state.totalUniqueWatchedSeconds, 95);
+  assert.equal(deriveProtectedReplayState(result.state), 'grace_cycle');
+});
+
 test('course videos lock only after the grace window is exhausted', () => {
   const almostLocked = normalizeVideoWatchState({
     userId: 'user-1',

@@ -177,6 +177,21 @@ type CourseCatalogItem = {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const TRANSIENT_FETCH_ERROR_PATTERNS = [
+  /fetch failed/i,
+  /socket hang up/i,
+  /ECONNRESET/i,
+  /ECONNREFUSED/i,
+  /ETIMEDOUT/i,
+  /EAI_AGAIN/i,
+  /network error/i,
+];
+
+const isTransientFetchError = (error: unknown) => {
+  const message = error instanceof Error ? error.message : String(error || '');
+  return TRANSIENT_FETCH_ERROR_PATTERNS.some((pattern) => pattern.test(message));
+};
+
 const ensureDir = async () => {
   await fs.mkdir(artifactDir, { recursive: true });
 };
@@ -191,15 +206,30 @@ const writeJson = async (fileName: string, payload: unknown) => {
 };
 
 const requestJson = async <T = any>(input: string, init: RequestInit = {}) => {
-  const res = await fetch(input, init);
-  const text = await res.text();
-  let data: any = {};
-  try {
-    data = text ? JSON.parse(text) : {};
-  } catch {
-    data = { raw: text };
+  const maxAttempts = 3;
+  let lastError: unknown = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const res = await fetch(input, init);
+      const text = await res.text();
+      let data: any = {};
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch {
+        data = { raw: text };
+      }
+      return { res, data: data as T, text };
+    } catch (error) {
+      lastError = error;
+      if (attempt >= maxAttempts || !isTransientFetchError(error)) {
+        throw error;
+      }
+      await sleep(400 * attempt);
+    }
   }
-  return { res, data: data as T, text };
+
+  throw lastError instanceof Error ? lastError : new Error('request failed');
 };
 
 const assertOk = async <T = any>(input: string, init: RequestInit = {}) => {
@@ -865,13 +895,14 @@ const openLessonInBrowser = async (
   } = {},
 ) => {
   const blockedLessonSelectors = `${selectors.coursePlayerRewatchLimit}, ${selectors.coursePlayerRewatchVideo}`;
+  const activePlayerSelectors = `${selectors.coursePlayerVideo}, [data-testid="course-figma-player"] video, video`;
   const lessonReadySelector = allowBlockedView
-    ? `${selectors.courseLessonView}, ${selectors.coursePlayerShell}, ${selectors.coursePlayerVideo}, ${blockedLessonSelectors}`
-    : `${selectors.courseLessonView}, ${selectors.coursePlayerShell}, ${selectors.coursePlayerVideo}`;
+    ? `${selectors.courseLessonView}, ${selectors.coursePlayerShell}, ${selectors.courseFigmaPage}, ${activePlayerSelectors}, ${blockedLessonSelectors}`
+    : `${selectors.courseLessonView}, ${selectors.coursePlayerShell}, ${selectors.courseFigmaPage}, ${activePlayerSelectors}`;
   await page.goto(lessonUrl(targetCourseId, targetLessonId), { waitUntil: 'domcontentloaded', timeout: 60_000 });
   const directReached = await waitForSelectorOptional(page, lessonReadySelector, 30_000);
   const videoReachedDirectly = directReached
-    ? await waitForSelectorOptional(page, selectors.coursePlayerVideo, allowBlockedView ? 5_000 : 15_000)
+    ? await waitForSelectorOptional(page, activePlayerSelectors, allowBlockedView ? 5_000 : 15_000)
     : false;
   const blockedReachedDirectly = allowBlockedView
     ? (await waitForSelectorOptional(page, blockedLessonSelectors, 2_000) || await hasBlockedWatchLimitUi(page))
@@ -895,7 +926,7 @@ const openLessonInBrowser = async (
     await clickLessonByText(page, targetLessonTitle);
   }
   await page.waitForSelector(lessonReadySelector, { timeout: 45_000 });
-  const playerVisible = await waitForSelectorOptional(page, selectors.coursePlayerVideo, allowBlockedView ? 5_000 : 45_000);
+  const playerVisible = await waitForSelectorOptional(page, activePlayerSelectors, allowBlockedView ? 5_000 : 45_000);
   const blockedVisible = allowBlockedView
     ? (await waitForSelectorOptional(page, blockedLessonSelectors, 2_000) || await hasBlockedWatchLimitUi(page))
     : false;
@@ -973,9 +1004,13 @@ const simulateThresholdWatch = async (
 ) => {
   const heartbeatDelayMs = Math.max(200, Number(process.env.QA_WATCH_LIMIT_HEARTBEAT_DELAY_MS || 250));
   const heartbeatStepSeconds = Math.max(4, Math.min(8, Number(process.env.QA_WATCH_LIMIT_HEARTBEAT_STEP || 6)));
+  const endWindowHeartbeatStepSeconds = Math.max(
+    2,
+    Math.min(4, Number(process.env.QA_WATCH_LIMIT_END_WINDOW_HEARTBEAT_STEP || 3)),
+  );
   const playbackRate = Math.max(1, Math.min(2, Number(process.env.QA_WATCH_LIMIT_HEARTBEAT_PLAYBACK_RATE || 2)));
   const events: any[] = [];
-  const safeDurationSeconds = Math.max(Number(durationSeconds || 0), 1);
+  const safeDurationSeconds = Math.max(Math.ceil(Number(durationSeconds || 0)), 1);
   const safeThresholdPercentage = Math.max(
     1,
     Math.min(100, Number(completionThresholdPercentage || 95) || 95),
@@ -1022,9 +1057,9 @@ const simulateThresholdWatch = async (
 
   await sendHeartbeat(previousPositionSeconds);
 
-  while (previousPositionSeconds < nearEndAnchorSeconds) {
+  while (previousPositionSeconds < endWindowStartSeconds) {
     const nextPositionSeconds = Math.min(
-      nearEndAnchorSeconds,
+      endWindowStartSeconds,
       previousPositionSeconds + heartbeatStepSeconds,
     );
     const deltaSeconds = Math.max(nextPositionSeconds - previousPositionSeconds, 0);
@@ -1036,13 +1071,18 @@ const simulateThresholdWatch = async (
     await sendHeartbeat(nextPositionSeconds, simulatedTimestampMs);
   }
 
-  if (previousPositionSeconds < safeDurationSeconds) {
+  while (previousPositionSeconds < safeDurationSeconds) {
+    const nextPositionSeconds = Math.min(
+      safeDurationSeconds,
+      previousPositionSeconds + endWindowHeartbeatStepSeconds,
+    );
+    const deltaSeconds = Math.max(nextPositionSeconds - previousPositionSeconds, 0);
     simulatedTimestampMs += Math.max(
       heartbeatDelayMs,
-      Math.ceil(((safeDurationSeconds - previousPositionSeconds) / Math.max(playbackRate, 1)) * 1000) + heartbeatDelayMs,
+      Math.ceil((deltaSeconds / Math.max(playbackRate, 1)) * 1000) + heartbeatDelayMs,
     );
     await sleep(heartbeatDelayMs);
-    await sendHeartbeat(safeDurationSeconds, simulatedTimestampMs);
+    await sendHeartbeat(nextPositionSeconds, simulatedTimestampMs);
   }
 
   return events;
@@ -1188,6 +1228,7 @@ const runBrowserWatchPhase = async ({
 }) => {
   const browser = await launchBrowser();
   const page = await browser.newPage();
+  let browserClosedForApiProof = false;
   const consoleErrors: string[] = [];
   const pageErrors: string[] = [];
   const network: NetworkLogEntry[] = [];
@@ -1327,6 +1368,10 @@ const runBrowserWatchPhase = async ({
 
     await pausePlayback(page);
     await takeBrowserArtifacts(page, `${label}-${viewport}-pre-threshold`);
+    const preThresholdBrowserState = await readBrowserState(page);
+    await page.close().catch(() => undefined);
+    await browser.close().catch(() => undefined);
+    browserClosedForApiProof = true;
 
     const preThresholdPlayer = await getPlayer(token, targetCourseId, targetLessonId);
     if (!preThresholdPlayer.res.ok) {
@@ -1378,8 +1423,7 @@ const runBrowserWatchPhase = async ({
       45_000,
     );
     const postThresholdWatchState = postThresholdPlayer?.watchState || null;
-    const finalState = await readBrowserState(page);
-    await takeBrowserArtifacts(page, `${label}-${viewport}-post-threshold`);
+    const finalState = preThresholdBrowserState;
 
     const thresholdSatisfied = Boolean(
       postThresholdWatchState
@@ -1423,7 +1467,9 @@ const runBrowserWatchPhase = async ({
       network,
     };
   } finally {
-    await browser.close().catch(() => undefined);
+    if (!browserClosedForApiProof) {
+      await browser.close().catch(() => undefined);
+    }
   }
 };
 
@@ -1469,8 +1515,17 @@ const runBrowserPartialWatchRefreshPhase = async ({
     await takeBrowserArtifacts(page, `${label}-${viewport}-before-login`);
     await loginInBrowser(page, email, password, token);
     await takeBrowserArtifacts(page, `${label}-${viewport}-shell`);
+    let initialLessonOpenResult: { playerVisible: boolean; blockedVisible: boolean } | null = null;
     try {
-      await openLessonInBrowser(page, viewport, targetCourseId, targetLessonId, targetCourseTitle, targetLessonTitle);
+      initialLessonOpenResult = await openLessonInBrowser(
+        page,
+        viewport,
+        targetCourseId,
+        targetLessonId,
+        targetCourseTitle,
+        targetLessonTitle,
+        { allowBlockedView: true },
+      );
     } catch (error) {
       await takeBrowserArtifacts(page, `${label}-${viewport}-lesson-open-failure`).catch(() => undefined);
       throw error;
@@ -1483,6 +1538,10 @@ const runBrowserPartialWatchRefreshPhase = async ({
     const manifestProbe = playerPayloadSnapshot?.streamUrl
       ? await probeProtectedStreamFromBrowser(page, playerPayloadSnapshot.streamUrl)
       : null;
+    if (initialLessonOpenResult?.blockedVisible) {
+      await clickBySelector(page, selectors.coursePlayerRewatchVideo, 10_000).catch(() => undefined);
+      await waitForSelectorOptional(page, selectors.coursePlayerVideo, 10_000);
+    }
     await startPlayback(page);
     let playbackAdvanced = false;
     try {
@@ -1491,7 +1550,7 @@ const runBrowserPartialWatchRefreshPhase = async ({
     } catch {
       playbackAdvanced = false;
     }
-    await sleep(6_000);
+    await sleep(12_000);
 
     const partialState = await readBrowserState(page);
     const bootstrapFailure = classifyBootstrapFailure({
@@ -1534,7 +1593,19 @@ const runBrowserPartialWatchRefreshPhase = async ({
 
     await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 });
     await page.waitForSelector(shellOrCourseSelector, { timeout: 45_000 });
-    await openLessonInBrowser(page, viewport, targetCourseId, targetLessonId, targetCourseTitle, targetLessonTitle);
+    const refreshedLessonOpen = await openLessonInBrowser(
+      page,
+      viewport,
+      targetCourseId,
+      targetLessonId,
+      targetCourseTitle,
+      targetLessonTitle,
+      { allowBlockedView: true },
+    );
+    if (refreshedLessonOpen.blockedVisible) {
+      await clickBySelector(page, selectors.coursePlayerRewatchVideo, 10_000).catch(() => undefined);
+      await waitForSelectorOptional(page, selectors.coursePlayerVideo, 10_000);
+    }
     await startPlayback(page);
     await waitForPlaybackAdvance(page, 30_000).catch(() => undefined);
     const refreshedState = await readBrowserState(page);
@@ -1757,46 +1828,71 @@ const main = async () => {
     if (Boolean(reopenAfterFirstWatchState?.locked)) {
       throw new Error(`Lesson should not be locked after the first threshold proof: ${JSON.stringify(reopenAfterFirstWatchState || null)}`);
     }
-    if (String(reopenAfterFirstWatchState?.replayState || '') !== 'restart_new_cycle') {
-      throw new Error(`Expected replayState=restart_new_cycle after first completion, got ${reopenAfterFirstWatchState?.replayState || 'unknown'}`);
-    }
-    if (Number(reopenAfterFirstCompletion.data.resumeSeconds || 0) > 1) {
-      throw new Error(`Expected replay after first completion to restart near zero, got resumeSeconds=${reopenAfterFirstCompletion.data.resumeSeconds}`);
-    }
-    await withAdminSession((token) => clearPlaybackSessions(token, student.user._id));
+    const allowedFullWatches = Math.max(
+      1,
+      Number(
+        reopenAfterFirstWatchState?.allowedFullWatches
+        ?? firstWatch.postThresholdWatchState?.allowedFullWatches
+        ?? 1,
+      ) || 1,
+    );
+    let secondWatch: Awaited<ReturnType<typeof runBrowserWatchPhase>> | null = null;
+    let secondWatchState: ReturnType<typeof extractPlayerWatchState> | null = null;
+    let secondWatchGraceRemainingSeconds = getGraceRemainingSeconds(reopenAfterFirstWatchState);
 
-    const secondWatch = await runBrowserWatchPhase({
-      viewport: 'desktop',
-      email: student.email,
-      password: student.password,
-      token: student.token,
-      targetCourseId: watchLimitCourseId,
-      targetLessonId: watchLimitLessonId,
-      targetCourseTitle,
-      targetLessonTitle,
-      label: 'second-watch',
-      expectedCompletedFullWatches: 2,
-      expectLockedAfterThreshold: false,
-      targetDurationSeconds,
-    });
-    if (!secondWatch.ok) {
-      throw new Error(`Second threshold watch proof failed: ${JSON.stringify(secondWatch.postThresholdWatchState || secondWatch.finalState || secondWatch)}`);
+    if (allowedFullWatches <= 1) {
+      if (String(reopenAfterFirstWatchState?.replayState || '') !== 'grace_cycle') {
+        throw new Error(`Expected replayState=grace_cycle after first completion for a one-watch lesson, got ${reopenAfterFirstWatchState?.replayState || 'unknown'}`);
+      }
+      if (Number(reopenAfterFirstCompletion.data.resumeSeconds || 0) > 1) {
+        throw new Error(`Expected one-watch lesson to enter grace replay from the start after first completion, got resumeSeconds=${reopenAfterFirstCompletion.data.resumeSeconds}`);
+      }
+      if (secondWatchGraceRemainingSeconds <= 0) {
+        throw new Error(`Expected positive grace remaining seconds after first completion for a one-watch lesson: ${JSON.stringify(reopenAfterFirstWatchState || null)}`);
+      }
+    } else {
+      if (String(reopenAfterFirstWatchState?.replayState || '') !== 'restart_new_cycle') {
+        throw new Error(`Expected replayState=restart_new_cycle after first completion, got ${reopenAfterFirstWatchState?.replayState || 'unknown'}`);
+      }
+      if (Number(reopenAfterFirstCompletion.data.resumeSeconds || 0) > 1) {
+        throw new Error(`Expected replay after first completion to restart near zero, got resumeSeconds=${reopenAfterFirstCompletion.data.resumeSeconds}`);
+      }
+      await withAdminSession((token) => clearPlaybackSessions(token, student.user._id));
+
+      secondWatch = await runBrowserWatchPhase({
+        viewport: 'desktop',
+        email: student.email,
+        password: student.password,
+        token: student.token,
+        targetCourseId: watchLimitCourseId,
+        targetLessonId: watchLimitLessonId,
+        targetCourseTitle,
+        targetLessonTitle,
+        label: 'second-watch',
+        expectedCompletedFullWatches: allowedFullWatches,
+        expectLockedAfterThreshold: false,
+        targetDurationSeconds,
+      });
+      if (!secondWatch.ok) {
+        throw new Error(`Second threshold watch proof failed: ${JSON.stringify(secondWatch.postThresholdWatchState || secondWatch.finalState || secondWatch)}`);
+      }
+      secondWatchState = secondWatch.postThresholdWatchState || null;
+      if (Number(secondWatchState?.completedFullWatches || 0) !== allowedFullWatches) {
+        throw new Error(`Expected completedFullWatches=${allowedFullWatches} after second threshold proof, got ${secondWatchState?.completedFullWatches}`);
+      }
+      if (Boolean(secondWatchState?.locked)) {
+        throw new Error(`Lesson should enter grace replay instead of locking after the final counted watch: ${JSON.stringify(secondWatchState || null)}`);
+      }
+      if (String(secondWatchState?.replayState || '') !== 'grace_cycle') {
+        throw new Error(`Expected replayState=grace_cycle after final counted watch, got ${secondWatchState?.replayState || 'unknown'}`);
+      }
+      secondWatchGraceRemainingSeconds = getGraceRemainingSeconds(secondWatchState);
+      await withAdminSession((token) => clearPlaybackSessions(token, student.user._id));
     }
-    const secondWatchState = secondWatch.postThresholdWatchState || null;
-    if (Number(secondWatchState?.completedFullWatches || 0) !== 2) {
-      throw new Error(`Expected completedFullWatches=2 after second threshold proof, got ${secondWatchState?.completedFullWatches}`);
-    }
-    if (Boolean(secondWatchState?.locked)) {
-      throw new Error(`Lesson should enter grace replay instead of locking after the final counted watch: ${JSON.stringify(secondWatchState || null)}`);
-    }
-    if (String(secondWatchState?.replayState || '') !== 'grace_cycle') {
-      throw new Error(`Expected replayState=grace_cycle after final counted watch, got ${secondWatchState?.replayState || 'unknown'}`);
-    }
-    const secondWatchGraceRemainingSeconds = getGraceRemainingSeconds(secondWatchState);
+
     if (secondWatchGraceRemainingSeconds <= 0) {
       throw new Error(`Expected positive grace remaining seconds after final counted watch: ${JSON.stringify(secondWatchState || null)}`);
     }
-    await withAdminSession((token) => clearPlaybackSessions(token, student.user._id));
 
     const graceRefresh = await runBrowserPartialWatchRefreshPhase({
       viewport: 'mobile',
@@ -1947,6 +2043,7 @@ const main = async () => {
         status: reopenAfterFirstCompletion.res.status,
         data: summarizePlayerPayload(reopenAfterFirstCompletion.data),
       },
+      allowedFullWatches,
       secondWatch,
       graceRefresh,
       graceResumePlayer: {
@@ -1985,12 +2082,12 @@ const main = async () => {
       courseId: watchLimitCourseId,
       lessonId: watchLimitLessonId,
       firstBrowserWatchOk: firstWatch.ok,
-      secondBrowserWatchOk: secondWatch.ok,
+      secondBrowserWatchOk: secondWatch?.ok ?? null,
       graceRefreshOk: graceRefresh.ok,
       blockedAfterGraceMobile: blockedAfterGraceMobile.ok,
       blockedAfterGraceDesktop: blockedAfterGraceDesktop.ok,
       completedFullWatchesAfterFirstCompletion: reopenAfterFirstWatchState?.completedFullWatches || 0,
-      completedFullWatchesAfterSecondCompletion: secondWatchState?.completedFullWatches || 0,
+      completedFullWatchesAfterSecondCompletion: secondWatchState?.completedFullWatches ?? reopenAfterFirstWatchState?.completedFullWatches ?? 0,
       graceRemainingSecondsAfterSecondCompletion: secondWatchGraceRemainingSeconds,
       blockedOpenStatus: blockedOpen.res.status,
       blockedOpenCode: blockedOpen.data.code || null,

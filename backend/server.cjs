@@ -27,6 +27,7 @@ const platformRoutes = require('./platform/platform.routes.js');
 const liveRoutes = require('./live/live.routes.js');
 const { startLiveEventBus } = require('./live/live-event-bus.js');
 const { ensureReplayImporterWorker } = require('./live/live-replay.worker.js');
+const { startMockTestRankingWorker, recoverPendingMockTestRankJobs } = require('./test/mock-test-ranking.worker.js');
 const { connectDatabase, getDatabaseMode } = require('./lib/database.js');
 const { isFirestoreStateEnabled, getStateDocumentRef } = require('./lib/firebase-state.js');
 const { resetState, serializeState } = require('./lib/store.js');
@@ -166,6 +167,7 @@ const startServer = async (options = {}) => {
   if (enableBackgroundWorkers) {
     startLiveEventBus();
     ensureReplayImporterWorker();
+    startMockTestRankingWorker();
     recoverPendingCourseVideoProcessingJobs({ forceRestartRecovery: true })
       .then((result) => {
         console.log(`[video-processing] ${JSON.stringify({
@@ -177,6 +179,18 @@ const startServer = async (options = {}) => {
       })
       .catch((error) => {
         console.error('[video-processing] failed to recover pending course video jobs', error);
+      });
+    recoverPendingMockTestRankJobs()
+      .then((result) => {
+        console.log(`[mock-test-ranking] ${JSON.stringify({
+          event: 'startup-recovery-complete',
+          scannedTests: result.scanned,
+          scheduledJobs: result.scheduled,
+          at: new Date().toISOString(),
+        })}`);
+      })
+      .catch((error) => {
+        console.error('[mock-test-ranking] failed to recover pending rank jobs', error);
       });
     startVideoProcessingRecoveryLoop();
   }

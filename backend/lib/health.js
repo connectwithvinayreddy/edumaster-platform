@@ -3,6 +3,7 @@ const { checkPostgresHealth } = require('./postgres.js');
 const { checkRedisHealth } = require('./redis.js');
 const { getMongoUri, isMongoConnected, getDatabaseMode } = require('./database.js');
 const { isFirestoreStateEnabled } = require('./firebase-state.js');
+const { getMockTestRankingWorkerSnapshot } = require('../test/mock-test-ranking.worker.js');
 
 const startedAt = Date.now();
 
@@ -70,6 +71,9 @@ const getHealthSnapshot = async () => {
     config: getConfigSummary(),
     diagnostics: getProductionConfigDiagnostics(),
     dependencies,
+    workers: {
+      mockTestRanking: getMockTestRankingWorkerSnapshot(),
+    },
     timestamp: new Date().toISOString(),
   };
 };

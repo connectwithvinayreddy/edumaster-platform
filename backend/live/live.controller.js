@@ -209,6 +209,22 @@ const shouldUseLocalDevHlsOrigin = () => (
 );
 
 const getLocalDevHlsRootDir = () => path.join(process.cwd(), 'uploads/live-hls');
+const buildManagedHlsStreamName = (liveClass) => (liveClass?.courseId && liveClass?.moduleId
+  ? `${liveClass._id}__${liveClass.courseId}__${liveClass.moduleId}__${liveClass.chapterId || 'root'}`
+  : String(liveClass?._id || ''));
+
+const buildPublicManagedHlsPlaybackUrl = (streamName) => {
+  const publicBaseUrl = String(appConfig.liveHlsPublicBaseUrl || '').replace(/\/+$/, '');
+  if (!publicBaseUrl || !streamName) {
+    return null;
+  }
+
+  if (/\/hls$/i.test(publicBaseUrl)) {
+    return `${publicBaseUrl}/${encodeURIComponent(String(streamName))}.m3u8`;
+  }
+
+  return `${publicBaseUrl}/${encodeURIComponent(String(streamName))}/index.m3u8`;
+};
 const getLocalDevHlsStreamDir = (streamName) => path.join(getLocalDevHlsRootDir(), String(streamName || '').replace(/[^a-zA-Z0-9._-]+/g, '_'));
 const getLocalDevHlsPlaylistPath = (streamName) => path.join(getLocalDevHlsStreamDir(streamName), 'index.m3u8');
 const getLocalDevHlsPidPath = (streamName) => path.join(getLocalDevHlsStreamDir(streamName), 'ffmpeg.pid');
@@ -605,17 +621,28 @@ const buildStateBackedAccess = async ({ liveClass, liveState, user }) => {
   }
 
   const playbackUrl = normalizeOptionalUrl(effectiveState.playbackUrl);
-  if (effectiveState.status === 'live' && effectivePlaybackType === 'live-stream' && playbackUrl) {
-    const extension = playbackUrl.toLowerCase().includes('.m3u8') ? '.m3u8' : '.mp4';
+  const publicPlaybackUrl = buildPublicManagedHlsPlaybackUrl(buildManagedHlsStreamName({
+    _id: liveClass._id,
+    courseId: effectiveState.courseId || liveClass.courseId || null,
+    moduleId: effectiveState.moduleId || liveClass.moduleId || null,
+    chapterId: effectiveState.chapterId || liveClass.chapterId || null,
+  }));
+  if (effectiveState.status === 'live' && effectivePlaybackType === 'live-stream' && (publicPlaybackUrl || playbackUrl)) {
+    const effectivePlaybackUrl = publicPlaybackUrl || playbackUrl;
+    const extension = effectivePlaybackUrl.toLowerCase().includes('.m3u8') ? '.m3u8' : '.mp4';
     const mimeType = extension === '.m3u8' ? 'application/vnd.apple.mpegurl' : 'video/mp4';
-    const issuedToken = issuePlaybackToken({
-      userId: String(user._id),
-      sessionId: user.session || null,
-      liveClassId: String(liveClass._id),
-      upstreamUrl: playbackUrl,
-      mimeType,
-      assetKind: extension === '.m3u8' ? 'live-hls' : 'live-source',
-    });
+    let issuedToken = null;
+    const streamUrl = publicPlaybackUrl || (() => {
+      issuedToken = issuePlaybackToken({
+        userId: String(user._id),
+        sessionId: user.session || null,
+        liveClassId: String(liveClass._id),
+        upstreamUrl: effectivePlaybackUrl,
+        mimeType,
+        assetKind: extension === '.m3u8' ? 'live-hls' : 'live-source',
+      });
+      return `/backend/api/live-classes/stream/${issuedToken.token}`;
+    })();
 
     return {
       liveClassId: String(liveClass._id),
@@ -624,7 +651,7 @@ const buildStateBackedAccess = async ({ liveClass, liveState, user }) => {
       mode: effectiveState.mode || liveClass.mode || 'live',
       status: effectiveState.status,
       accessType: 'live-stream',
-      streamUrl: `/backend/api/live-classes/stream/${issuedToken.token}`,
+      streamUrl,
       streamFormat: extension === '.m3u8' ? 'hls' : 'source',
       embedUrl: null,
       roomUrl: null,
@@ -634,9 +661,11 @@ const buildStateBackedAccess = async ({ liveClass, liveState, user }) => {
       replayLessonId: effectiveState.replayLessonId || null,
       recordingState: effectiveState.recordingState || null,
       replayState: effectiveState.replayState || null,
-      tokenExpiresAt: issuedToken.expiresAt,
+      tokenExpiresAt: issuedToken?.expiresAt || null,
       watermarkText: `${user.email} • ${user._id}`,
-      statusMessage: 'Live class is running with protected in-app playback.',
+      statusMessage: publicPlaybackUrl
+        ? 'Live class is running with public HLS playback through the live domain.'
+        : 'Live class is running with protected in-app playback.',
     };
   }
 
@@ -982,6 +1011,8 @@ const getLiveClassAccess = asyncHandler(async (req, res) => {
       livePlaybackType: liveState.playbackType || null,
       status: liveState.status,
       courseId: liveState.courseId || null,
+      moduleId: liveState.moduleId || null,
+      chapterId: liveState.chapterId || null,
       requiresEnrollment: liveState.requiresEnrollment !== false,
       chatEnabled: liveState.chatEnabled !== false,
       doubtSolving: liveState.doubtSolving !== false,

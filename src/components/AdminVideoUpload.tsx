@@ -635,7 +635,6 @@ export const AdminVideoUpload: React.FC<AdminVideoUploadProps> = ({ courses, onV
             <input
               value={durationMinutes}
               min="0"
-              placeholder="0"
               className="w-full rounded-2xl border border-[var(--line)] bg-white px-4 py-3 text-[var(--ink)] outline-none focus:border-[var(--accent-rust)]"
             />
           </div>
